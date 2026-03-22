@@ -1,0 +1,6 @@
+[submodule "vendor/nexus"]
+	path = vendor/nexus
+	url = https://github.com/zju-abclab/NEXUS
+[submodule "vendor/phantom"]
+	path = vendor/phantom
+	url = https://github.com/encryptorion-lab/phantom-fhe

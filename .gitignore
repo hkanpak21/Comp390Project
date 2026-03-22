@@ -1,0 +1,78 @@
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# CUDA caches
+.nv_cache/
+*.ptx
+*.cubin
+*.fatbin
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+
+# Compiled binaries
+bin/
+*.out
+*.exe
+
+# Profiling outputs
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+*.nvvp
+
+# Large data / model weights
+*.bin
+*.npy
+*.npz
+*.h5
+*.pt
+*.ckpt
+data/
+
+# Experiment outputs (large logs)
+experiments/results/*.log
+experiments/results/*.raw
+
+# Paper build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/*.toc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# AWS credentials / secrets — NEVER commit these
+*.pem
+.aws/credentials

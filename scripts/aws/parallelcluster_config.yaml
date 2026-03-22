@@ -1,0 +1,86 @@
+# AWS ParallelCluster config for 2-node p4d.24xlarge cluster
+# For multi-node NEXUS benchmarks (Weeks 10–11)
+#
+# Prerequisites:
+#   pip install aws-parallelcluster
+#   pcluster configure  (sets VPC, subnet, key pair)
+#
+# Deploy:
+#   pcluster create-cluster --cluster-name nexus-multinode \
+#       --cluster-configuration scripts/aws/parallelcluster_config.yaml
+#
+# Teardown (to stop billing):
+#   pcluster delete-cluster --cluster-name nexus-multinode
+
+Region: us-east-1
+
+Image:
+  Os: ubuntu2204
+  # Deep Learning Base GPU AMI — get latest ID for your region:
+  # aws ec2 describe-images --owners amazon \
+  #   --filters "Name=name,Values=Deep Learning Base GPU AMI (Ubuntu 22.04)*" \
+  #   --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId'
+  CustomAmi: ami-xxxxxxxxxxxxxxxxx  # REPLACE with DL Base GPU AMI ID
+
+HeadNode:
+  InstanceType: c5.2xlarge
+  Networking:
+    SubnetId: subnet-xxxxxxxxxxxxxxxxx  # REPLACE
+    ElasticFabricAdapter:
+      Enabled: false
+  Ssh:
+    KeyName: your-key-pair-name  # REPLACE
+  LocalStorage:
+    RootVolume:
+      Size: 100
+      VolumeType: gp3
+  Iam:
+    AdditionalIamPolicies:
+      - Policy: arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+Scheduling:
+  Scheduler: slurm
+  SlurmSettings:
+    EnableMemoryBasedScheduling: true
+  SlurmQueues:
+    - Name: gpu
+      CapacityType: SPOT
+      Networking:
+        SubnetIds:
+          - subnet-xxxxxxxxxxxxxxxxx  # REPLACE — same AZ for low latency
+        PlacementGroup:
+          Enabled: true              # Critical: ensures NVSwitch + EFA proximity
+        ElasticFabricAdapter:
+          Enabled: true
+      ComputeResources:
+        - Name: p4d-24xlarge
+          InstanceType: p4d.24xlarge
+          MinCount: 0
+          MaxCount: 2               # 2 nodes = 16× A100
+          DisableSimultaneousMultithreading: true
+          Efa:
+            Enabled: true
+            GdrSupport: true        # GPUDirect RDMA for NCCL
+      Iam:
+        AdditionalIamPolicies:
+          - Policy: arn:aws:iam::aws:policy/AmazonS3FullAccess
+      CustomActions:
+        OnNodeConfigured:
+          Script: s3://your-results-bucket/scripts/node_setup.sh  # Optional post-init
+
+SharedStorage:
+  - MountDir: /shared
+    Name: shared-fsx
+    StorageType: FsxLustre
+    FsxLustreSettings:
+      StorageCapacity: 1200        # GB — minimum for FSx Lustre
+      DeploymentType: SCRATCH_2
+      PerUnitStorageThroughput: 200
+
+# To submit multi-node job after cluster is up:
+# srun --nodes=2 --ntasks-per-node=8 --gres=gpu:8 \
+#      --mpi=pmix \
+#      -e NCCL_DEBUG=INFO \
+#      -e FI_PROVIDER=efa \
+#      -e FI_EFA_USE_DEVICE_RDMA=1 \
+#      ./your_fhe_binary
