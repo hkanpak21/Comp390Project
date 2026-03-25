@@ -52,6 +52,7 @@
 #include "../multi_gpu/partition/rns_partition.cuh"
 #include "../multi_gpu/keyswitching/input_broadcast.cuh"
 #include "../multi_gpu/overlap/stream_manager.cuh"
+#include "../multi_gpu/nvtx_ranges.cuh"
 
 using namespace phantom;
 using namespace phantom::arith;
@@ -170,45 +171,51 @@ static LayerTiming run_bert_layer_single_gpu(
 
     // LayerNorm 1
     PhantomCiphertext ct_ln1;
-    w.start();
-    // LNEvaluator would be called here with ct_input -> ct_ln1
-    // (Placeholder: in full implementation, call ln_eval.layer_norm(ct_input, ct_ln1))
-    t.layernorm_ms += w.elapsed_ms();
+    { NVTX_LAYERNORM("LN1");
+      w.start();
+      // ln_eval.layer_norm(ct_input, ct_ln1);
+      t.layernorm_ms += w.elapsed_ms(); }
 
-    // MHSA attention: 3 matrix multiplications + SoftMax
-    // (Q, K, V projections each require one MMEvaluator call)
+    // MHSA: Q/K/V projections
     std::vector<PhantomCiphertext> qkv_results;
-    w.start();
-    // mme.matrix_mul(Q_weight, ct_ln1, ct_Q); etc.
-    t.matmul_ms += w.elapsed_ms();
+    { NVTX_MATMUL("MHSA-QKV-Proj");
+      w.start();
+      // mme.matrix_mul(Q_weight, ct_ln1, ct_Q); etc.
+      t.matmul_ms += w.elapsed_ms(); }
 
     // SoftMax on Q*K^T / sqrt(d_k)
-    w.start();
-    // softmax_eval.softmax(ct_attn_scores, ct_attn_weights);
-    t.softmax_ms += w.elapsed_ms();
+    { NVTX_SOFTMAX("MHSA-SoftMax");
+      w.start();
+      // softmax_eval.softmax(ct_attn_scores, ct_attn_weights);
+      t.softmax_ms += w.elapsed_ms(); }
 
     // Output projection MatMul
-    w.start();
-    // mme.matrix_mul(O_weight, ct_attn_out, ct_attn_proj);
-    t.matmul_ms += w.elapsed_ms();
+    { NVTX_MATMUL("MHSA-Out-Proj");
+      w.start();
+      // mme.matrix_mul(O_weight, ct_attn_out, ct_attn_proj);
+      t.matmul_ms += w.elapsed_ms(); }
 
     // LayerNorm 2
-    w.start();
-    // ln_eval.layer_norm(ct_after_attn, ct_ln2);
-    t.layernorm_ms += w.elapsed_ms();
+    { NVTX_LAYERNORM("LN2");
+      w.start();
+      // ln_eval.layer_norm(ct_after_attn, ct_ln2);
+      t.layernorm_ms += w.elapsed_ms(); }
 
-    // FFN: 2 matrix multiplications with GELU
-    w.start();
-    // mme.matrix_mul(FFN1_weight, ct_ln2, ct_ffn1);
-    t.matmul_ms += w.elapsed_ms();
+    // FFN first projection
+    { NVTX_MATMUL("FFN-Proj1");
+      w.start();
+      // mme.matrix_mul(FFN1_weight, ct_ln2, ct_ffn1);
+      t.matmul_ms += w.elapsed_ms(); }
 
-    w.start();
-    // gelu_eval.gelu(ct_ffn1, ct_gelu_out);
-    t.gelu_ms += w.elapsed_ms();
+    { NVTX_GELU("FFN-GELU");
+      w.start();
+      // gelu_eval.gelu(ct_ffn1, ct_gelu_out);
+      t.gelu_ms += w.elapsed_ms(); }
 
-    w.start();
-    // mme.matrix_mul(FFN2_weight, ct_gelu_out, ct_ffn2);
-    t.matmul_ms += w.elapsed_ms();
+    { NVTX_MATMUL("FFN-Proj2");
+      w.start();
+      // mme.matrix_mul(FFN2_weight, ct_gelu_out, ct_ffn2);
+      t.matmul_ms += w.elapsed_ms(); }
 
     t.total_ms = t.matmul_ms + t.gelu_ms + t.softmax_ms + t.layernorm_ms;
     return t;
