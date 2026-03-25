@@ -107,3 +107,96 @@ The project is in a **well-scaffolded but pre-implementation state**. All infras
 ---
 
 <!-- Add new entries below this line, newest at the bottom -->
+
+## 2026-03-25 — Submodule Init, Code Study, and Local Implementation Phase
+
+**What we did**:
+
+### Step 1: Submodule initialization
+- `git submodule update --init --recursive` — both NEXUS and Phantom cloned successfully
+- NEXUS at `e15058c`, Phantom at `1f4a198` (with nested nvbench and pybind11 submodules)
+- NEXUS bundles its own Phantom copy at `vendor/nexus/cuda/thirdparty/phantom-fhe/`
+
+### Step 2: Deep code study (all key source files read and analyzed)
+
+**Phantom ciphertext memory layout** (confirmed from `ciphertext.h`):
+```
+data_[poly_i * (degree * coeff_mod_size) + limb_j * degree + coeff_k]
+```
+- `data_` is a `cuda_auto_ptr<uint64_t>` — GPU memory RAII wrapper
+- For GELU (N=65536, L=20, 2 polys): 20.97 MB per ciphertext
+- `data(i)` accessor gives pointer to poly i
+
+**PhantomContext**: holds per-level ContextData, DNTTTable (NTT twiddles for all moduli on GPU), PhantomGaloisTool
+
+**NEXUS CKKSEvaluator**: wraps Encoder / Encryptor / Evaluator / Decryptor around Phantom. Key methods: eval_odd_deg9_poly, sgn_eval, invert_sqrt, exp, goldschmidt_iter, newton_iter.
+
+**main.cu benchmark structure**:
+- 5 test targets: MatMul (N=8192, 3 primes), Argmax (17 primes), SoftMax (18), LayerNorm (20), GELU (20)
+- BERT-base reported ~37s on A100 for full inference
+- GELU: reads from `gelu_input_32768.txt`, reports MAE against `gelu_calibration_32768.txt`
+
+**NTT**: 2D radix-8 kernel `nwt_2d_radix8_forward_inplace`. All limbs transformed in parallel. Independent per-limb -> perfect GPU parallelism.
+
+**Key-switching**: `key_switch_inner_prod_c2_and_evk` kernel. 3 stages: RNS decomposition -> inner product over beta digits -> basis extension. This is the bottleneck for multi-GPU communication.
+
+**Bootstrapping**: 31 total levels (17 main + 14 bootstrap). Pipeline: StoC (BSGS linear transform) -> ModularReduction (minimax poly) -> CtoS (BSGS inverse). ~8s on single A100.
+
+### Step 3: LaTeX code study document
+- Written: `paper/code_study.tex` (~450 lines)
+- Covers: FHE/CKKS/RNS/NTT background, Phantom data structures, NEXUS CKKSEvaluator API, all 5 neural network operations, our multi-GPU design, build instructions, profiling guide
+- Suitable for course presentation
+
+### Step 4: Multi-GPU implementation files (locally written, will compile on EC2)
+
+**`src/multi_gpu/comm/`**:
+- `nccl_comm.cuh/cu`: MultiGpuContext (ncclCommInitAll), allgather_ciphertext_limbs, allreduce_partial_keyswitching, broadcast_ciphertext, scatter/gather point-to-point
+
+**`src/multi_gpu/partition/`**:
+- `rns_partition.cuh/cu`: owner_of_limb, local_index_of_limb, n_local_limbs, limbs_for_gpu, kernel_scatter_limbs (CUDA kernel), kernel_gather_limbs, host wrappers
+
+**`src/multi_gpu/keyswitching/`**:
+- `input_broadcast.cuh/cu`: AllGather c2 -> local inner product -> extract local slice
+- `output_aggregation.cuh/cu`: Partial inner product from local limbs -> AllReduce -> extract local slice
+
+**`src/multi_gpu/overlap/`**:
+- `stream_manager.cuh/cu`: PerGpuStreams (compute + nccl streams + events), StreamManager (barrier, CudaGraph capture/replay), OverlapScheduler (compute-comm overlap scheduling)
+
+### Step 5: Benchmark harnesses
+
+**`src/benchmarks/nccl_bandwidth_test.cu`**:
+- Validates NCCL + peer access, measures AllGather/AllReduce/Broadcast bandwidth
+- Reports ciphertext-transfer time (expected ~33 us for 21 MB on NVSwitch)
+
+**`src/benchmarks/bert_inference.cu`**:
+- Full BERT-base benchmark harness: 12-layer loop, per-component timing
+- Outputs CSV: n_gpus, total_ms, matmul_ms, gelu_ms, softmax_ms, layernorm_ms, keyswitch_ms, comm_ms, speedup, efficiency
+- Integration points clearly marked (TODO on EC2: connect multi-GPU key-switch calls)
+
+**`src/benchmarks/bootstrapping_bench.cu`**:
+- Isolated bootstrapping latency: calls Bootstrapper.bootstrap_sparse_3()
+- Reports mean/min/max/stddev over N iterations
+- Outputs CSV for scaling analysis
+
+**Current state**:
+- All implementation files written with correct API signatures
+- Stubs (CUDA memset zero) in place where Phantom internal kernel calls needed
+- TODO markers at exact integration points for EC2 work
+- Ready to commit and push
+
+**Immediate next steps on EC2**:
+1. `cmake .. -DCMAKE_CUDA_ARCHITECTURES=80 && make -j96`
+2. Run `nccl_bandwidth_test` — validate NCCL + NVSwitch
+3. Run `bert_inference --n-gpus 1` — reproduce 37s baseline
+4. Replace stubs in `local_inner_product()` with Phantom's actual key_switch kernel call
+5. Run `bert_inference --n-gpus 2,4,8` — measure scaling
+
+**Key design decisions made this session**:
+- Use cyclic limb assignment (j % n_gpus): simplest, load-balanced, matches Cerium
+- Implement both Input Broadcast AND Output Aggregation: benchmark both on EC2
+- Use separate compute/NCCL streams + cudaEvent for overlap
+- CudaGraph capture for bootstrapping (reduces ~250us kernel launch overhead)
+- AllReduce for OutputAgg uses ncclSum on uint64 — caller applies mod reduction afterward
+- local_inner_product stub uses cudaMemset(0) so code links and runs without Phantom kernels
+
+---

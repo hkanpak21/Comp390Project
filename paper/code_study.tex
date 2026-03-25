@@ -1,0 +1,834 @@
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+% Code listing style
+\lstdefinestyle{cpp}{
+  language=C++,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{red!70!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!20},
+  backgroundcolor=\color{gray!5},
+  tabsize=2,
+  showstringspaces=false,
+  captionpos=b,
+}
+
+\lstdefinestyle{bash}{
+  language=bash,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{teal}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  numbers=none,
+  frame=single,
+  rulecolor=\color{black!20},
+  backgroundcolor=\color{gray!5},
+  breaklines=true,
+  showstringspaces=false,
+}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  urlcolor=blue!70!black,
+  citecolor=green!50!black,
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{NEXUS Multi-GPU FHE --- Code Study}
+\lhead{Comp 390 --- Spring 2026}
+\cfoot{\thepage}
+
+\title{\textbf{NEXUS \& Phantom FHE: A Complete Code Study}\\
+\large GPU-Accelerated Fully Homomorphic Encryption for Multi-GPU Extension}
+\author{Halil Ibrahim Kanpak \\ Comp 390 Independent Study, Spring 2026}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%============================================================
+\section{Introduction}
+%============================================================
+
+This document explains the entire NEXUS GPU-accelerated Fully Homomorphic Encryption (FHE)
+inference system from scratch. It is written for someone who may be new to both CUDA
+programming and FHE cryptography. We start from mathematical foundations and work up to the
+full BERT-base inference pipeline.
+
+The project builds on two open-source libraries:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Phantom FHE} (\texttt{encryptorion-lab/phantom-fhe}) --- A GPU-native CKKS-scheme FHE library. Provides the raw cryptographic building blocks: ciphertext data structures, NTT kernels, key-switching, arithmetic.
+  \item \textbf{NEXUS} (\texttt{zju-abclab/NEXUS}) --- A GPU-accelerated transformer inference engine built on top of Phantom. Provides encrypted GELU, SoftMax, LayerNorm, matrix multiplication, bootstrapping, and a full BERT-base benchmark.
+\end{itemize}
+
+Our goal is to extend NEXUS to run across \emph{multiple} GPUs by distributing the RNS limbs
+(the modular components of each ciphertext) across GPUs using NCCL collectives. This document
+serves both as an understanding guide and as a reference for the implementation decisions made.
+
+%============================================================
+\section{Background: Fully Homomorphic Encryption}
+%============================================================
+
+\subsection{What Is FHE?}
+
+Fully Homomorphic Encryption (FHE) allows arbitrary computations to be performed on
+\emph{encrypted} data without ever decrypting it. The data owner encrypts their input, sends
+the ciphertext to a server, the server computes on the ciphertext, and returns an encrypted
+result. Only the data owner, who holds the secret key, can decrypt the final answer.
+
+This is powerful for privacy-preserving machine learning: a hospital could encrypt patient
+data, send it to an AI inference server, and receive encrypted diagnoses --- with the server
+never seeing the actual patient data.
+
+\subsection{The CKKS Scheme}
+
+NEXUS uses the \textbf{CKKS} (Cheon-Kim-Kim-Song) FHE scheme, designed specifically for
+real-number arithmetic. Key properties:
+
+\begin{itemize}
+  \item \textbf{Plaintext space:} A vector of up to $N/2$ complex (or real) floating-point numbers, where $N$ is the polynomial degree.
+  \item \textbf{Approximate arithmetic:} Results are approximate, with a controllable error. This is acceptable for neural network inference.
+  \item \textbf{SIMD packing:} All $N/2$ slots are processed in \emph{one} FHE operation (Single Instruction, Multiple Data). NEXUS uses $N = 65536$, giving $32768$ slots per ciphertext.
+  \item \textbf{Scaling factor:} Real numbers are scaled up to integers (e.g., by $2^{40}$) before encryption. Each multiplication doubles the scale, requiring a ``rescale'' step to bring it back.
+\end{itemize}
+
+\subsection{Ring Learning With Errors (RLWE)}
+
+The security of CKKS rests on the Ring Learning With Errors (RLWE) problem. A ciphertext is
+a pair of polynomials $(c_0, c_1)$ in the ring $\mathbb{Z}_Q[x]/(x^N + 1)$:
+
+\[
+c_0 = a \cdot s + e + m, \quad c_1 = -a
+\]
+
+where $s$ is the secret key polynomial, $a$ is a uniformly random polynomial, $e$ is a small
+noise polynomial, and $m$ encodes the plaintext message. Given only $(c_0, c_1)$, recovering
+$m$ requires solving RLWE, which is believed to be computationally hard.
+
+\subsection{Residue Number System (RNS) Representation}
+
+The modulus $Q$ in CKKS is a 512--2000 bit integer, far too large to store as a single machine
+word. Instead, CKKS decomposes $Q$ as a product of small primes:
+\[
+Q = q_0 \cdot q_1 \cdot q_2 \cdots q_{L-1}
+\]
+
+Each prime $q_i$ fits in a 64-bit integer. By the Chinese Remainder Theorem (CRT), arithmetic
+modulo $Q$ can be performed independently modulo each small prime, then recombined. Each
+prime's contribution is called an \textbf{RNS limb}.
+
+\textbf{Key implication for multi-GPU:} Each RNS limb is an independent array of $N$
+64-bit integers. Limbs can be distributed across GPUs --- GPU $g$ computes limbs $i$ where
+$i \bmod n\_\text{GPUs} = g$.
+
+\subsection{Number Theoretic Transform (NTT)}
+
+The Number Theoretic Transform (NTT) is the modular-arithmetic analogue of the Fast Fourier
+Transform (FFT). It converts a polynomial from \emph{coefficient form} (list of coefficients
+$a_0, a_1, \ldots, a_{N-1}$) to \emph{evaluation form} (values at $N$ special roots of
+unity), and back. NTT form enables polynomial multiplication to be done via pointwise
+multiplication instead of convolution --- reducing complexity from $O(N^2)$ to $O(N \log N)$.
+
+All ciphertexts in NEXUS are stored in NTT form on the GPU. The Phantom library uses a
+\textbf{2D radix-8 NTT kernel} optimized for NVIDIA GPUs.
+
+\subsection{Bootstrapping}
+
+Each FHE multiplication consumes one ``level'' (drops one RNS prime from the chain).
+Bootstrapping is a special expensive operation that refreshes a ciphertext, restoring its
+level budget. NEXUS uses bootstrapping for the Argmax operation, which requires many
+multiplications. The bootstrapping pipeline in NEXUS uses approximately 31 total levels.
+
+%============================================================
+\section{Project Repository Structure}
+%============================================================
+
+\begin{lstlisting}[style=bash, caption=Top-level directory layout]
+Comp390Project/
+├── vendor/
+│   ├── nexus/          # NEXUS GPU inference engine (git submodule)
+│   │   └── cuda/src/   # All GPU CUDA source files
+│   └── phantom/        # Phantom FHE library (git submodule)
+├── src/
+│   └── multi_gpu/      # OUR implementation: multi-GPU extensions
+│       ├── comm/        # NCCL collective wrappers
+│       ├── partition/   # RNS limb-to-GPU assignment
+│       ├── keyswitching/ # Multi-GPU key-switching algorithms
+│       └── overlap/     # CUDA stream management, compute/comm overlap
+├── src/benchmarks/     # Our benchmark harnesses
+├── scripts/
+│   ├── aws/            # EC2 spot instance launch + env setup
+│   └── mn5/            # MareNostrum 5 SLURM scripts
+├── profiling/          # Nsight Systems / Compute scripts
+├── experiments/        # Raw results, plots (empty until EC2 run)
+├── paper/              # LaTeX documents
+├── CMakeLists.txt      # Top-level build system
+├── study.md            # Literature review (36 KB)
+└── notes/log.md        # Session-by-session research log
+\end{lstlisting}
+
+%============================================================
+\section{Phantom FHE Library: Data Structures}
+%============================================================
+
+\subsection{Overview}
+
+Phantom is a GPU-native FHE library. Unlike CPU-based libraries (Microsoft SEAL,
+OpenFHE), Phantom stores all ciphertext data \emph{on the GPU} from the moment of
+encryption. All arithmetic is performed on GPU memory via CUDA kernels. There is no
+host--device transfer overhead during computation.
+
+\subsection{PhantomCiphertext}
+
+This is the central data structure. It holds two (or more) polynomials encrypted under
+the CKKS scheme.
+
+\begin{lstlisting}[style=cpp, caption=PhantomCiphertext member variables (ciphertext.h)]
+class PhantomCiphertext {
+private:
+    phantom::parms_id_type parms_id_;   // Parameter set identifier
+    size_t chain_index_ = 0;            // Level in modulus chain (0 = freshest)
+    size_t size_ = 0;                   // Number of polynomials (2 = standard, 3 after multiply)
+    size_t poly_modulus_degree_ = 0;    // N (ring degree, e.g. 65536)
+    size_t coeff_modulus_size_ = 0;     // L = number of RNS primes at current level
+    double scale_ = 1.0;               // CKKS scaling factor (e.g. 2^40)
+    bool is_ntt_form_ = true;          // True if stored in NTT/evaluation form
+    cuda_auto_ptr<uint64_t> data_;     // THE GPU BUFFER (all polynomial data)
+};
+\end{lstlisting}
+
+\subsubsection{GPU Memory Layout}
+
+The \texttt{data\_} buffer stores all polynomial coefficient data in a flat 3D array:
+
+\[
+\texttt{data}[\,\underbrace{i}_{\text{poly}}\;]\,[\,\underbrace{j}_{\text{limb}}\;]\,[\,\underbrace{k}_{\text{coeff}}\;]
+= \texttt{data.get()} + i \cdot (N \cdot L) + j \cdot N + k
+\]
+
+\begin{itemize}
+  \item $i \in \{0, 1\}$: polynomial index (fresh ciphertext has 2 polynomials: $c_0$ and $c_1$)
+  \item $j \in \{0, \ldots, L-1\}$: RNS limb index (one per prime in the current modulus chain)
+  \item $k \in \{0, \ldots, N-1\}$: coefficient index within one polynomial modulo one prime
+\end{itemize}
+
+\textbf{Example sizes} (GELU benchmark):
+\begin{itemize}
+  \item $N = 65536$, $L = 20$ RNS primes, 2 polynomials
+  \item Buffer size: $2 \times 20 \times 65536 \times 8\ \text{bytes} = 20.97\ \text{MB}$ per ciphertext
+\end{itemize}
+
+The key accessor methods are:
+\begin{lstlisting}[style=cpp, caption=Accessing ciphertext data pointers]
+uint64_t* ct.data();           // Base pointer: poly 0, limb 0, coeff 0
+uint64_t* ct.data(i);          // Pointer to start of polynomial i
+// = data_.get() + i * (poly_modulus_degree_ * coeff_modulus_size_)
+\end{lstlisting}
+
+\subsubsection{Multi-GPU Relevance: Limb Partitioning}
+
+For multi-GPU distribution, each RNS limb $j$ is assigned to GPU $g = j \bmod n\_\text{GPUs}$.
+GPU $g$ holds limbs $j \in \{g,\; g + n_\text{GPUs},\; g + 2 n_\text{GPUs}, \ldots\}$ for
+each polynomial. This is the \textbf{RNS limb-level partitioning} strategy, identical to the
+approach described in the Cerium paper.
+
+\subsection{PhantomContext and the Modulus Chain}
+
+\texttt{PhantomContext} holds all precomputed tables and parameters for a given FHE parameter
+set. The \textbf{modulus chain} is the sequence of RNS prime sets at decreasing levels:
+
+\begin{lstlisting}[style=cpp, caption=Modulus chain for GELU benchmark (main.cu)]
+// GELU uses 20 primes: 58-bit anchor + eighteen 40-bit compute primes + 58-bit tail
+vector<int> gelu_moduli = {58, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+                            40, 40, 40, 40, 40, 40, 40, 40, 40, 58};
+// Level 0 (freshest): all 20 primes active
+// Level 1: 19 primes active (one dropped by rescale)
+// ...
+// Level 19: 1 prime active (cannot multiply further)
+\end{lstlisting}
+
+The full \texttt{PhantomContext} structure contains:
+\begin{itemize}
+  \item \texttt{std::vector<ContextData> context\_data\_}: One entry per chain level, each with its own RNS tools and NTT tables.
+  \item \texttt{DNTTTable gpu\_rns\_tables\_}: Precomputed NTT twiddle factors for all moduli, stored on GPU.
+  \item \texttt{PhantomGaloisTool* key\_galois\_tool\_}: Permutation indices for rotation operations.
+\end{itemize}
+
+\subsection{Evaluation Keys}
+
+Three types of keys enable ciphertext operations beyond addition:
+
+\begin{description}
+  \item[\texttt{PhantomRelinKey}] Relinearization key: reduces a size-3 ciphertext (product of two size-2 ciphertexts) back to size-2. Used after every multiplication.
+  \item[\texttt{PhantomGaloisKey}] Galois key set: enables rotation of the slot vector by any supported number of positions. Each rotation step $s$ needs its own Galois key.
+  \item[\texttt{PhantomPublicKey}] For asymmetric encryption.
+\end{description}
+
+Keys are stored entirely on GPU memory. For $N = 65536$ and $L = 20$ primes, a single
+Galois key is approximately $2 \times 20 \times 65536 \times 8\ \text{bytes} \approx 21\
+\text{MB}$. NEXUS's bootstrapping uses $\sim 60$ rotation keys, totaling $\sim 1.2\ \text{GB}$
+of key material on each GPU.
+
+%============================================================
+\section{Phantom FHE Library: Core Operations}
+%============================================================
+
+\subsection{NTT Kernels}
+
+The Number Theoretic Transform is the computational bottleneck in almost all FHE operations.
+Phantom implements a highly optimized \textbf{2D radix-8 NTT} on the GPU.
+
+\begin{lstlisting}[style=cpp, caption=NTT kernel interface (ntt.cuh)]
+// Forward NTT: coefficient form -> NTT/evaluation form (in-place)
+void nwt_2d_radix8_forward_inplace(
+    uint64_t *inout,              // GPU buffer: [coeff_modulus_size][poly_degree]
+    const DNTTTable &ntt_tables,  // Precomputed twiddle factors
+    size_t coeff_modulus_size,    // Number of RNS limbs to transform
+    size_t start_modulus_idx,     // First limb index to transform
+    const cudaStream_t &stream    // CUDA stream for async execution
+);
+
+// Backward NTT: NTT form -> coefficient form (in-place)
+void nwt_2d_radix8_backward_inplace(/* same signature */);
+\end{lstlisting}
+
+The 2D layout means each row in the GPU grid processes one RNS limb independently --- all
+$L$ limbs are transformed \emph{in parallel} on the GPU. Within each limb, the radix-8
+butterfly maximizes arithmetic intensity per global memory access.
+
+For multi-GPU, each GPU performs NTT only on its own subset of limbs. No communication is
+required for NTT --- it is the only FHE operation that parallelizes perfectly.
+
+\subsection{Key-Switching}
+
+Key-switching is the mechanism underlying both relinearization and rotation. Given a
+ciphertext's extra polynomial $c_2$ (produced during multiplication), key-switching computes
+a correction that eliminates $c_2$ while maintaining the decryption invariant.
+
+\begin{lstlisting}[style=cpp, caption=Key-switching inner product kernel (evaluate.cuh)}
+__global__ void key_switch_inner_prod_c2_and_evk(
+    uint64_t *dst,              // Output: two new polynomials of result ciphertext
+    const uint64_t *c2,         // Input: the extra polynomial to be switched
+    const uint64_t *const *evks, // Evaluation keys (one per decomposition level beta)
+    const DModulus *modulus,    // RNS moduli Q (current) and P (auxiliary)
+    size_t n,                   // Ring degree N
+    size_t size_QP,             // |Q| + |P| total moduli
+    size_t size_Ql,             // |Q| at current chain level
+    size_t beta,                // Number of key decomposition pieces
+    ...
+);
+\end{lstlisting}
+
+The algorithm proceeds in three stages:
+
+\begin{enumerate}
+  \item \textbf{RNS Decomposition}: $c_2$ is decomposed into $\beta$ ``digits'' using the
+    Hybrid/HPS decomposition. Each digit is a sub-polynomial with smaller coefficient size.
+  \item \textbf{Inner Product}: Each digit is multiplied by its corresponding evaluation key
+    component and accumulated (inner product over $\beta$ terms).
+  \item \textbf{Basis Extension}: The result, initially in the auxiliary basis $P$, is
+    lifted back to the main basis $Q$ via CRT-based modular arithmetic.
+\end{enumerate}
+
+This is the operation where multi-GPU parallelism is most complex: the inner product requires
+contributions from \emph{all} limbs, so GPUs must exchange partial results via NCCL AllReduce.
+
+\subsection{CKKS Arithmetic Operations}
+
+\begin{lstlisting}[style=cpp, caption=Core CKKS operations available in Phantom (evaluate.cuh)]
+// Multiply two ciphertexts (produces size-3 result)
+void multiply_inplace(PhantomCiphertext &ct1, const PhantomCiphertext &ct2, stream);
+
+// Relinearize: reduce size 3 -> 2 using relin keys
+void relinearize_inplace(PhantomCiphertext &ct, const PhantomRelinKey &rk, stream);
+
+// Rescale: divide by one prime, dropping one level (removes scale^2 -> scale)
+void rescale_to_next_inplace(PhantomCiphertext &ct, stream);
+
+// Mod-switch: drop one prime without scaling (aligns levels between ciphertexts)
+void mod_switch_to_next_inplace(PhantomCiphertext &ct, stream);
+
+// Addition and subtraction (no level consumed)
+void add_inplace(PhantomCiphertext &ct1, const PhantomCiphertext &ct2, stream);
+void sub_inplace(PhantomCiphertext &ct1, const PhantomCiphertext &ct2, stream);
+
+// Rotation: cyclic shift of slots by `steps` positions
+void rotate_vector_inplace(PhantomCiphertext &ct, int steps,
+                            const PhantomGaloisKey &gk, stream);
+
+// Multiply by a plaintext constant (one level consumed after rescale)
+void multiply_plain_inplace(PhantomCiphertext &ct, const PhantomPlaintext &pt, stream);
+\end{lstlisting}
+
+The computational cost hierarchy (fastest to slowest):
+\begin{enumerate}
+  \item Add/Sub: $O(N \cdot L)$ pointwise modular addition --- very cheap
+  \item Multiply-plain: $O(N \cdot L)$ pointwise modular multiplication --- cheap
+  \item NTT (forward/inverse): $O(N \cdot L \cdot \log N)$ --- moderate
+  \item Multiply + Relin: $O(\beta \cdot N \cdot L)$ where $\beta \approx L/\text{digit\_size}$ --- expensive
+  \item Rotation (= key-switch): Same cost as Multiply + Relin --- expensive
+\end{enumerate}
+
+%============================================================
+\section{NEXUS: The CKKSEvaluator Class}
+%============================================================
+
+\subsection{Architecture}
+
+NEXUS wraps Phantom in a more convenient C++ API. The central class is \texttt{CKKSEvaluator},
+which bundles together all state needed for FHE inference:
+
+\begin{lstlisting}[style=cpp, caption=CKKSEvaluator interface (ckks\_evaluator.cuh)]
+class CKKSEvaluator {
+public:
+    PhantomContext *context;
+    PhantomRelinKey *relin_keys;
+    PhantomGaloisKey *galois_keys;
+    vector<uint32_t> galois_elts;   // Supported rotation steps
+
+    Encoder   encoder;    // encode/decode double vectors <-> PhantomPlaintext
+    Encryptor encryptor;  // encrypt PhantomPlaintext -> PhantomCiphertext
+    Evaluator evaluator;  // FHE arithmetic (delegates to Phantom)
+    Decryptor decryptor;  // decrypt PhantomCiphertext -> PhantomPlaintext
+
+    size_t degree;        // N = poly_modulus_degree
+    double scale;         // CKKS scaling factor (e.g. pow(2.0, 40))
+    size_t slot_count;    // N/2 real-number slots per ciphertext
+};
+\end{lstlisting}
+
+\subsection{Mathematical Utility Methods}
+
+NEXUS provides high-level FHE implementations of common mathematical functions needed for
+transformer inference. Each function is a sequence of FHE operations requiring careful
+management of levels and scales.
+
+\subsubsection{Degree-9 Odd Polynomial Evaluation (\texttt{eval\_odd\_deg9\_poly})}
+
+Evaluates $f(x) = a_9 x^9 + a_7 x^7 + a_5 x^5 + a_3 x^3 + a_1 x$ in 4
+multiplications using a Paterson--Stockmeyer-like scheme:
+
+\begin{enumerate}
+  \item Compute $x^2 = x \cdot x$ (1 multiply, rescale)
+  \item Compute $x^3 = x^2 \cdot x$ (1 multiply, rescale)
+  \item Accumulate odd powers with careful scale management at each chain level
+\end{enumerate}
+
+This is used as a building block for approximating non-polynomial functions (GELU,
+SoftMax numerics) at low multiplicative depth.
+
+\subsubsection{Sign Function (\texttt{sgn\_eval})}
+
+Approximates $\text{sgn}(x)$ using composite Chebyshev polynomials (minimax approximation).
+The approximation alternates between two polynomial families (G and F coefficients) for $d_g$
+and $d_f$ iterations respectively. Used in bootstrapping's modular reduction step.
+
+\subsubsection{Inverse Square Root (\texttt{invert\_sqrt})}
+
+Computes $1/\sqrt{x}$ using a combination of Newton and Goldschmidt iterations in encrypted
+domain. Used in LayerNorm for normalization. The Goldschmidt iteration converges as:
+\[
+y_{n+1} = y_n \cdot (1.5 - 0.5 \cdot v \cdot y_n^2), \quad y_n \to 1/\sqrt{v}
+\]
+
+\subsubsection{Exponentiation (\texttt{exp})}
+
+Computes $e^x$ via: $e^x = (1 + x/128)^{128}$. The base $(1 + x/128)$ is computed with
+two FHE multiplications, and then squared $\log_2(128) = 7$ times. Total cost: 9 multiplications,
+depth 9.
+
+%============================================================
+\section{NEXUS: Neural Network Operations}
+%============================================================
+
+\subsection{BERT-Base Architecture Overview}
+
+BERT-base is a 12-layer Transformer encoder with hidden dimension 768, 12 attention
+heads, and 110M parameters. Each layer contains:
+
+\begin{enumerate}
+  \item \textbf{Multi-Head Self-Attention (MHSA):} Three matrix multiplications (Q, K, V
+    projections), attention score computation (SoftMax), and output projection.
+  \item \textbf{Feed-Forward Network (FFN):} Two matrix multiplications with GELU activation
+    in between.
+  \item \textbf{Layer Normalization:} Applied before/after each sub-layer.
+\end{enumerate}
+
+Each of these sub-operations has a homomorphic implementation in NEXUS.
+
+\subsection{Encrypted Matrix Multiplication (\texttt{MMEvaluator})}
+
+NEXUS uses a \textbf{row-packing} strategy for matrix multiplication. Given matrices $A
+\in \mathbb{R}^{m \times k}$ and $B \in \mathbb{R}^{k \times n}$:
+
+\begin{itemize}
+  \item Columns of $B^T$ are packed into plaintext slots (with periodic repetition to fill $N/2$ slots)
+  \item Encrypted rows of $A$ are multiplied pointwise by each packed column
+  \item Rotation-and-sum reduces the inner product across $k$ dimensions
+\end{itemize}
+
+\begin{lstlisting}[style=cpp, caption=Matrix multiplication key parameters (main.cu)}
+// BERT-base attention: 4096x768 times 768x64 matrix multiply
+N = 8192;  // Smaller degree for MatMul (fewer levels needed)
+// Input: 4096 rows packed into N/2 = 4096 slots per ciphertext
+// Weight: 768x64 weight matrix, columns packed as plaintexts
+// Result: 4096x64 output, 64 ciphertexts each holding one output column
+\end{lstlisting}
+
+The benchmark measures:
+\begin{itemize}
+  \item \textbf{Compression time}: Encoding/encrypting the input matrix
+  \item \textbf{MatMul time}: The actual encrypted multiplication
+  \item \textbf{Decompression time}: Decrypting and decoding the result
+\end{itemize}
+
+\subsection{GELU Activation (\texttt{GELUEvaluator})}
+
+GELU (Gaussian Error Linear Unit) is defined as:
+\[
+\text{GELU}(x) = x \cdot \Phi(x), \quad \Phi(x) = \frac{1}{2}\left[1 + \text{erf}\left(\frac{x}{\sqrt{2}}\right)\right]
+\]
+
+FHE cannot evaluate $\Phi(x)$ directly (it requires the error function). Instead, NEXUS
+approximates GELU with a degree-9 minimax polynomial (which is odd), evaluated using
+\texttt{eval\_odd\_deg9\_poly}. This consumes 4 levels.
+
+\begin{lstlisting}[style=cpp, caption=GELU benchmark setup (main.cu)}
+N = 65536;  // Large ring for 32768 slots
+// Input: 32768 values read from "gelu_input_32768.txt"
+// Parameters: 20-prime modulus chain (18 compute primes + 2 anchors)
+// After GELU: decrypt and compare to "gelu_calibration_32768.txt"
+// Reports: latency (ms) and Mean Absolute Error (MAE)
+\end{lstlisting}
+
+\subsection{SoftMax (\texttt{SoftMaxEvaluator})}
+
+SoftMax is:
+\[
+\text{SoftMax}(x_i) = \frac{e^{x_i}}{\sum_j e^{x_j}}
+\]
+
+Computing this in FHE requires:
+\begin{enumerate}
+  \item Encrypted exponentiation: \texttt{exp(x)} (depth 9)
+  \item Encrypted summation: rotate-and-sum over all $n$ slots (depth $\log_2 n$)
+  \item Encrypted division: use \texttt{inverse(sum)} then multiply (depth $\sim 4$)
+\end{enumerate}
+
+Total depth: $\sim 18$ levels for a $128 \times 128$ attention matrix. This requires 18
+primes in the modulus chain (matching the COEFF\_MODULI for SoftMax in main.cu).
+
+\subsection{Layer Normalization (\texttt{LNEvaluator})}
+
+LayerNorm normalizes each $d$-dimensional feature vector:
+\[
+\text{LN}(x) = \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} \cdot \gamma + \beta
+\]
+
+FHE computation:
+\begin{enumerate}
+  \item Mean $\mu$: rotate-and-sum, multiply by $1/d$
+  \item Variance $\sigma^2$: subtract mean, square, rotate-and-sum
+  \item Inverse square root $1/\sqrt{\sigma^2 + \epsilon}$: Goldschmidt iteration
+  \item Scale and shift by learned parameters $\gamma, \beta$
+\end{enumerate}
+
+\subsection{Argmax and Bootstrapping (\texttt{ArgmaxEvaluator})}
+
+Argmax is the hardest operation. It requires computing the index of the maximum value over
+encrypted data. NEXUS implements a ``QuickMax'' algorithm that uses the sign function
+approximation iteratively to identify the maximum.
+
+Argmax consumes many levels, requiring \textbf{bootstrapping} to refresh the ciphertext.
+The NEXUS bootstrapping pipeline:
+
+\begin{enumerate}
+  \item \textbf{Slot-to-Coefficient (StoC)}: Apply an encrypted IFFT to move data from
+    slots (evaluation domain) to polynomial coefficients. Uses Baby-Step Giant-Step (BSGS)
+    linear transformation: $O(\sqrt{N})$ rotations instead of $O(N)$.
+  \item \textbf{Modular Reduction}: Apply a minimax polynomial approximation to
+    $x \bmod q$, removing accumulated noise.
+  \item \textbf{Coefficient-to-Slot (CtoS)}: Apply encrypted FFT to move back to slots.
+\end{enumerate}
+
+The bootstrapping uses 31 total levels (17 for main computation, 14 for bootstrapping itself).
+
+%============================================================
+\section{Our Multi-GPU Extension: Design}
+%============================================================
+
+\subsection{Motivation}
+
+The NEXUS single-GPU baseline achieves $\sim 37$ seconds for BERT-base inference on one
+A100. The bottleneck is key-switching (relinearization + rotation), which involves NTT
+over all $L$ RNS limbs. With 8 GPUs:
+
+\begin{itemize}
+  \item Each GPU holds $L/8$ limbs instead of $L$
+  \item NTT is $8\times$ faster (perfect parallelism)
+  \item Key-switching requires communication but can overlap with computation
+\end{itemize}
+
+\subsection{RNS Limb Partitioning Strategy}
+
+GPU $g$ owns limb $j$ if $j \bmod n\_\text{GPUs} = g$ (cyclic assignment). This ensures
+load balance: every GPU handles the same number of limbs regardless of prime sizes.
+
+\subsection{Two Key-Switching Algorithms}
+
+\begin{description}
+  \item[Input Broadcast:] Each GPU broadcasts its portion of $c_2$ to all other GPUs
+    (AllGather), then each GPU computes the full inner product locally. Communication:
+    $O(L \cdot N \cdot 8)$ bytes broadcast = all limbs.
+  \item[Output Aggregation:] Each GPU computes a partial inner product from its local
+    limbs, then all GPUs sum partial results (AllReduce). Communication:
+    $O(L \cdot N \cdot 8)$ bytes reduce. Preferred when GPU memory is the bottleneck.
+\end{description}
+
+On p4d.24xlarge (NVSwitch, 600 GB/s per GPU), both algorithms are viable. We will implement
+and benchmark both.
+
+\subsection{CUDA Streams and Overlap}
+
+Each GPU runs computation and communication concurrently using multiple CUDA streams:
+\begin{itemize}
+  \item \textbf{Compute stream}: NTT, polynomial arithmetic
+  \item \textbf{NCCL stream}: AllGather / AllReduce collectives
+\end{itemize}
+
+NCCL operations and NTT on non-communicated limbs run in parallel, hiding latency.
+
+%============================================================
+\section{Source Code: Multi-GPU Implementation Files}
+%============================================================
+
+\subsection{Directory: \texttt{src/multi\_gpu/}}
+
+\begin{description}
+  \item[\texttt{comm/nccl\_comm.cuh/.cu}] NCCL wrapper for ciphertext collectives:
+    \texttt{broadcast\_rns\_limb()}, \texttt{allgather\_ct()}, \texttt{allreduce\_partial()}.
+  \item[\texttt{partition/rns\_partition.cuh/.cu}] RNS limb-to-GPU assignment:
+    \texttt{get\_limbs\_for\_gpu(gpu\_id, total\_limbs, n\_gpus)},
+    \texttt{scatter\_limbs()}, \texttt{gather\_limbs()}.
+  \item[\texttt{keyswitching/input\_broadcast.cuh/.cu}] Input Broadcast key-switching:
+    each GPU broadcasts its $c_2$ limbs; all GPUs compute full inner product.
+  \item[\texttt{keyswitching/output\_aggregation.cuh/.cu}] Output Aggregation key-switching:
+    each GPU computes partial inner product from local limbs; AllReduce merges results.
+  \item[\texttt{overlap/stream\_manager.cuh/.cu}] CUDA stream pool, event synchronization,
+    compute--communication overlap scheduling.
+\end{description}
+
+\subsection{Directory: \texttt{src/benchmarks/}}
+
+\begin{description}
+  \item[\texttt{nccl\_bandwidth\_test.cu}] Validates NCCL setup; measures NVSwitch bandwidth
+    for ciphertext-sized messages.
+  \item[\texttt{bert\_inference.cu}] End-to-end BERT-base benchmark: runs NEXUS inference
+    pipeline with 1, 2, 4, 8 GPUs; outputs latency breakdown.
+  \item[\texttt{bootstrapping\_bench.cu}] Isolated bootstrapping benchmark: measures
+    bootstrapping latency vs.\ number of GPUs.
+\end{description}
+
+%============================================================
+\section{Build System}
+%============================================================
+
+\begin{lstlisting}[style=bash, caption=Building on EC2 p4d.24xlarge]
+# Environment setup (sets CUDA, NCCL, MPI paths)
+source scripts/aws/setup_p4d_env.sh
+
+# Build all targets
+mkdir build && cd build
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=80   # A100 = sm_80
+make -j96                                 # 96 vCPUs on p4d.24xlarge
+
+# Run single-GPU NEXUS baseline
+./benchmarks/nexus_bert_baseline
+
+# Run multi-GPU BERT inference
+./benchmarks/bert_inference --n-gpus 8
+\end{lstlisting}
+
+The CMakeLists.txt in the project root:
+\begin{itemize}
+  \item Requires: CUDA 17+, NCCL 2.x, MPI (for multi-node)
+  \item Finds Phantom as a subdirectory (via \texttt{add\_subdirectory})
+  \item GLOB collects \texttt{.cu} files from \texttt{src/multi\_gpu/} into a static library
+  \item Each benchmark is an executable linking against the static library + Phantom + NCCL
+\end{itemize}
+
+%============================================================
+\section{Profiling Guide}
+%============================================================
+
+\subsection{Tools Required}
+
+\begin{description}
+  \item[Nsight Systems (\texttt{nsys})] System-level timeline profiler. Shows CPU--GPU
+    synchronization, NCCL collectives, kernel launch overhead, memory transfers. Runs
+    across the full application.
+  \item[Nsight Compute (\texttt{ncu})] Kernel-level profiler. Measures roofline
+    metrics: compute throughput (TFLOP/s), memory bandwidth (GB/s), occupancy, warp
+    stalls for individual CUDA kernels.
+\end{description}
+
+\subsection{Step-by-Step Profiling on EC2}
+
+\begin{lstlisting}[style=bash, caption=System profiling with Nsight Systems]
+# Profile full BERT inference, generate timeline
+bash profiling/nsys_profile.sh ./benchmarks/bert_inference --n-gpus 1
+
+# Output: bert_profile.nsys-rep
+# Open in Nsight Systems GUI (locally via X11 forwarding or SSH tunnel)
+nsys-ui bert_profile.nsys-rep
+\end{lstlisting}
+
+\begin{lstlisting}[style=bash, caption=Kernel profiling with Nsight Compute (NTT focus)]
+# Profile only the NTT kernel for roofline analysis
+bash profiling/ncu_ntt_profile.sh ./benchmarks/bert_inference --n-gpus 1
+
+# Key metrics to collect:
+# - sm__throughput.avg.pct_of_peak_sustained_elapsed (compute utilization)
+# - l1tex__t_bytes.sum / l2_global_load / dram_read_transactions (memory)
+# - achieved_occupancy (warp occupancy vs. theoretical max)
+# - stall_long_scoreboard (memory latency stalls)
+\end{lstlisting}
+
+\subsection{Metrics to Look For}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Operation} & \textbf{Bottleneck Indicator} & \textbf{Target on A100} \\
+\midrule
+NTT forward/inverse & Memory bandwidth bound & $>80\%$ HBM bandwidth \\
+Key-switch inner prod & Compute bound & $>50\%$ FP64 throughput \\
+RNS modular reduction & Compute bound & High int64 throughput \\
+NCCL AllGather & Network bound & $>400$ GB/s aggregate \\
+Bootstrap CtoS/StoC & Mixed: rotation + multiply & Balanced \\
+\bottomrule
+\end{tabular}
+\caption{Expected bottleneck profiles for each NEXUS operation on A100.}
+\end{table}
+
+\subsection{Identifying NTT, Key-Switch, and Bootstrapping Bottlenecks}
+
+In the Nsight Systems timeline, look for:
+
+\begin{itemize}
+  \item \textbf{NTT}: Kernel names containing \texttt{nwt\_2d\_radix8}. Should be
+    short and frequent. If they take $>50\%$ of total time, the NTT is the bottleneck.
+  \item \textbf{Key-switching}: Kernel names containing \texttt{key\_switch\_inner\_prod}.
+    Often the single most expensive kernel per FHE multiply.
+  \item \textbf{Bootstrapping}: A cluster of $>30$ sequential operations (NTT +
+    multiply-plain + rotate). Identifiable by the long uninterrupted GPU segment.
+  \item \textbf{NCCL}: Colored segments labeled \texttt{ncclAllGather} or
+    \texttt{ncclAllReduce}. Should overlap with computation segments.
+\end{itemize}
+
+\subsection{Expected Results and Plotting}
+
+Expected speedup for BERT inference on p4d.24xlarge:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{GPUs} & \textbf{Expected Time (s)} & \textbf{Speedup} & \textbf{Efficiency} \\
+\midrule
+1 (A100) & 37.3 & 1.0$\times$ & 100\% \\
+2 & $\sim$20 & 1.9$\times$ & 95\% \\
+4 & $\sim$11 & 3.4$\times$ & 85\% \\
+8 & $\sim$7 & 5.3$\times$ & 66\% \\
+\bottomrule
+\end{tabular}
+\caption{Expected BERT-base inference latency scaling (based on Cerium results for similar FHE workloads).}
+\end{table}
+
+To generate scaling plots from result CSVs:
+
+\begin{lstlisting}[style=bash, caption=Generating speedup plots]
+# Run experiments (on EC2)
+for gpus in 1 2 4 8; do
+  ./benchmarks/bert_inference --n-gpus $gpus \
+    --output experiments/results/bert_${gpus}gpu.csv
+done
+
+# Plot (locally)
+python3 experiments/plot_scaling.py \
+  --input experiments/results/ \
+  --output experiments/plots/bert_scaling.pdf
+\end{lstlisting}
+
+%============================================================
+\section{Glossary}
+%============================================================
+
+\begin{description}
+  \item[CKKS] Cheon-Kim-Kim-Song: an FHE scheme for approximate real-number arithmetic
+  \item[RNS] Residue Number System: representing large integers as tuples modulo small primes
+  \item[NTT] Number Theoretic Transform: modular-arithmetic FFT for fast polynomial multiplication
+  \item[RLWE] Ring Learning With Errors: the computational hardness assumption underlying CKKS
+  \item[Key-switching] Converting a ciphertext encrypted under one key to one encrypted under another; used for relinearization and rotation
+  \item[Bootstrapping] A procedure to refresh a ciphertext's level budget, enabling unlimited computation depth
+  \item[BSGS] Baby-Step Giant-Step: algorithmic trick to reduce rotation count from $O(N)$ to $O(\sqrt{N})$
+  \item[NCCL] NVIDIA Collective Communications Library: optimized multi-GPU/multi-node collectives
+  \item[Rescale] A CKKS-specific operation that divides ciphertext by one prime, reducing both level and scale
+  \item[Chain index] The current level of a ciphertext in the modulus chain (0 = freshest, increases as levels are consumed)
+  \item[Slot] One of the $N/2$ independent complex numbers that can be packed into one CKKS ciphertext
+  \item[Galois key] A key enabling one specific rotation of the slot vector; one key per rotation step
+  \item[Relin key] Relinearization key: used to reduce size-3 to size-2 after ciphertext multiplication
+  \item[p4d.24xlarge] AWS EC2 instance with 8x A100 40GB GPUs, NVSwitch interconnect, EFA networking
+  \item[NVSwitch] NVIDIA's high-bandwidth GPU-to-GPU interconnect in A100 DGX nodes (600 GB/s per GPU)
+  \item[MAE] Mean Absolute Error: metric for quantifying approximation error after FHE computation
+\end{description}
+
+%============================================================
+\section{Summary}
+%============================================================
+
+This document has covered:
+
+\begin{enumerate}
+  \item FHE fundamentals (CKKS, RNS, NTT, key-switching, bootstrapping)
+  \item Phantom FHE library: \texttt{PhantomCiphertext} memory layout, \texttt{PhantomContext}
+    parameter chain, all core CKKS operations
+  \item NEXUS GPU inference: \texttt{CKKSEvaluator}, all transformer sub-operations (MatMul,
+    GELU, SoftMax, LayerNorm, Argmax/Bootstrapping), BERT-base benchmark structure
+  \item Multi-GPU design: RNS limb partitioning, Input Broadcast vs.\ Output Aggregation
+    key-switching, CUDA stream overlap
+  \item Build instructions and profiling guide for EC2 p4d.24xlarge
+\end{enumerate}
+
+The next steps are to build on EC2, run the single-GPU baseline, and begin profiling to
+confirm where the multi-GPU communication overhead manifests.
+
+\end{document}
