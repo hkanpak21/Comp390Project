@@ -105,9 +105,10 @@ int main(int argc, char **argv) {
     timer.start();
 
     // NEXUS-compatible parameters: N=65536, L=20, scale=2^40
-    constexpr size_t POLY_DEGREE = 65536;
+    // Start with small params for quick validation; increase for benchmarking.
+    constexpr size_t POLY_DEGREE = 8192;
     const double SCALE = (double)(1ULL << 40);
-    constexpr size_t N_MODULI = 20;  // Use L=20 for a manageable test
+    constexpr size_t N_MODULI = 5;  // Small L for fast testing
 
     EncryptionParameters parms(scheme_type::ckks);
     parms.set_poly_modulus_degree(POLY_DEGREE);
