@@ -66,6 +66,10 @@ namespace nexus_multi_gpu {
 // that processes only digits in range [d_start, d_start + d_count).
 // The output is a PARTIAL sum — AllReduce across GPUs yields the full result.
 
+// Partial inner product kernel for Output Aggregation.
+// Processes digits assigned to this GPU in a STRIDED pattern:
+//   GPU g handles digits: g, g+n_gpus, g+2*n_gpus, ...
+// This avoids the overwrite bug of calling the kernel multiple times.
 __global__ void partial_key_switch_inner_prod(
     uint64_t       *dst,
     const uint64_t *c2,            // mod-up'd c2 [beta * size_QlP_n]
@@ -78,8 +82,9 @@ __global__ void partial_key_switch_inner_prod(
     size_t          size_QlP_n,
     size_t          size_Q,
     size_t          size_Ql,
-    size_t          d_start,       // first digit for this GPU
-    size_t          d_count,       // number of digits for this GPU
+    size_t          gpu_id,        // this GPU's index
+    size_t          n_gpus,        // total number of GPUs
+    size_t          beta,          // total number of digits
     size_t          reduction_threshold)
 {
     for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -96,16 +101,16 @@ __global__ void partial_key_switch_inner_prod(
         uint128_t acc0 = {0, 0};
         uint128_t acc1 = {0, 0};
 
-        // Accumulate only digits assigned to this GPU: [d_start, d_start + d_count)
-        for (uint64_t di = 0; di < d_count; di++) {
-            uint64_t d = d_start + di;
-
-            if (di > 0 && reduction_threshold == 0) {
+        // Accumulate digits in strided pattern: gpu_id, gpu_id+n_gpus, ...
+        bool first = true;
+        for (size_t d = gpu_id; d < beta; d += n_gpus) {
+            if (!first && reduction_threshold == 0) {
                 acc0.lo = barrett_reduce_uint128_uint64(acc0, mod.value(), mod.const_ratio());
                 acc0.hi = 0;
                 acc1.lo = barrett_reduce_uint128_uint64(acc1, mod.value(), mod.const_ratio());
                 acc1.hi = 0;
             }
+            first = false;
 
             prod0 = multiply_uint64_uint64(c2[c2_id + d * size_QlP_n], evks[d][evk_id]);
             add_uint128_uint128(acc0, prod0, acc0);
@@ -175,6 +180,7 @@ void keyswitching_output_aggregation(
     const PhantomRelinKey &relin_keys,
     int                    n_gpus)
 {
+    CUDA_CHECK(cudaSetDevice(gpu_id));
     const cudaStream_t &s = ctx.streams[gpu_id];
 
     // ---- Extract parameters (same logic as Phantom's keyswitch_inplace) ----
@@ -223,20 +229,17 @@ void keyswitching_output_aggregation(
     // each GPU gets at most 1 digit. Otherwise we call the kernel multiple times.
 
     auto cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
-    CUDA_CHECK(cudaMemsetAsync(cx.get(), 0, 2 * size_QlP_n * sizeof(uint64_t), s));
 
     auto reduction_threshold =
         (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
 
-    // Process each digit assigned to this GPU
-    for (size_t d = gpu_id; d < beta; d += n_gpus) {
-        partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
-            cx.get(), t_mod_up.get(), relin_keys.public_keys_ptr(),
-            modulus_QP, n, size_QP, size_QP * n,
-            size_QlP, size_QlP_n, size_Q, size_Ql,
-            d, 1,  // one digit at a time
-            reduction_threshold);
-    }
+    // Single kernel call processes all digits for this GPU (strided)
+    partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+        cx.get(), t_mod_up.get(), relin_keys.public_keys_ptr(),
+        modulus_QP, n, size_QP, size_QP * n,
+        size_QlP, size_QlP_n, size_Q, size_Ql,
+        static_cast<size_t>(gpu_id), static_cast<size_t>(n_gpus), beta,
+        reduction_threshold);
 
     // ---- Step 3: AllReduce partial inner products ----
     allreduce_keyswitching_result(ctx, gpu_id, cx.get(), 2 * size_QlP_n);

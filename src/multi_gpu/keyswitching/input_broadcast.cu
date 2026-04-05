@@ -74,6 +74,7 @@ void keyswitching_input_broadcast(
     size_t                 degree,
     int                    n_gpus)
 {
+    CUDA_CHECK(cudaSetDevice(gpu_id));
     size_t local_n = n_local_limbs(gpu_id, n_gpus, total_limbs);
 
     // ---- Step 1: AllGather c2 — every GPU gets all limbs ----
