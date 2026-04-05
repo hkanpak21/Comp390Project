@@ -146,9 +146,9 @@ int main(int argc, char **argv) {
     secret_key.encrypt_symmetric(context, plain_a, ct_a);
     secret_key.encrypt_symmetric(context, plain_b, ct_b);
 
-    // Multiply (creates a 3-element ciphertext with c2)
-    PhantomCiphertext ct_mul = multiply(context, ct_a, ct_b);
-    // ct_mul now has size=3 (c0, c1, c2)
+    // Multiply in-place (creates a 3-element ciphertext with c2)
+    multiply_inplace(context, ct_a, ct_b);
+    // ct_a now has size=3 (c0, c1, c2)
 
     printf("   Encrypt + multiply in %.1f ms\n", timer.elapsed_ms());
 
@@ -161,8 +161,15 @@ int main(int argc, char **argv) {
     printf("[4/6] Computing ground truth (single-GPU relinearize)...\n");
     timer.start();
 
-    // Re-multiply fresh for ground truth (avoid copy constructor issues)
-    PhantomCiphertext ct_gt = multiply(context, ct_a, ct_b);
+    // We need separate ciphertexts for each test. Re-encrypt and multiply.
+    PhantomCiphertext ct_gt;
+    {
+        PhantomCiphertext tmp_a, tmp_b;
+        secret_key.encrypt_symmetric(context, plain_a, tmp_a);
+        secret_key.encrypt_symmetric(context, plain_b, tmp_b);
+        multiply_inplace(context, tmp_a, tmp_b);
+        ct_gt = std::move(tmp_a);
+    }
     relinearize_inplace(context, ct_gt, relin_keys);
 
     printf("   Single-GPU relinearize in %.1f ms\n", timer.elapsed_ms());
@@ -178,7 +185,14 @@ int main(int argc, char **argv) {
     timer.start();
 
     // Fresh multiply for Input Broadcast test
-    PhantomCiphertext ct_ib = multiply(context, ct_a, ct_b);
+    PhantomCiphertext ct_ib;
+    {
+        PhantomCiphertext tmp_a, tmp_b;
+        secret_key.encrypt_symmetric(context, plain_a, tmp_a);
+        secret_key.encrypt_symmetric(context, plain_b, tmp_b);
+        multiply_inplace(context, tmp_a, tmp_b);
+        ct_ib = std::move(tmp_a);
+    }
 
     // Extract c2 pointer (3rd polynomial of the ciphertext)
     auto chain_idx = ct_ib.chain_index();
@@ -216,7 +230,14 @@ int main(int argc, char **argv) {
     timer.start();
 
     // Fresh multiply for Output Aggregation test
-    PhantomCiphertext ct_oa = multiply(context, ct_a, ct_b);
+    PhantomCiphertext ct_oa;
+    {
+        PhantomCiphertext tmp_a, tmp_b;
+        secret_key.encrypt_symmetric(context, plain_a, tmp_a);
+        secret_key.encrypt_symmetric(context, plain_b, tmp_b);
+        multiply_inplace(context, tmp_a, tmp_b);
+        ct_oa = std::move(tmp_a);
+    }
     uint64_t *c2_ptr_oa = ct_oa.data() + 2 * size_Ql * POLY_DEGREE;
 
     keyswitching_output_aggregation(mgpu_ctx, context, /*gpu_id=*/0,
