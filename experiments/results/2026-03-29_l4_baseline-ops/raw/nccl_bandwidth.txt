@@ -1,0 +1,13 @@
+=== NCCL Bandwidth Test ===
+GPUs:        1
+Msg size:    21 MB
+Iterations:  50
+
+AllGather  bandwidth: 1035.1 GB/s aggregate
+AllReduce  bandwidth: 0.0 GB/s aggregate
+Broadcast  bandwidth: 144091.7 GB/s aggregate
+
+--- Ciphertext Transfer Times (N=65536, L=20, 2 polys = 20.97 MB) ---
+AllGather  one ciphertext: 20 us
+
+Done.

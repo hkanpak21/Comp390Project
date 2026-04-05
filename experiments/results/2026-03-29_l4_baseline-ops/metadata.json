@@ -1,0 +1,14 @@
+{
+  "date": "2026-03-29",
+  "instance_type": "g6.xlarge",
+  "gpu_model": "L4",
+  "n_gpus": 1,
+  "cuda_version": "13.0",
+  "nccl_version": "2.29.7",
+  "driver_version": "580.126.09",
+  "git_commit": "see raw/git_sha.txt",
+  "experiment": "baseline-ops",
+  "binary": "ckks_bench + nccl_bandwidth_test",
+  "notes": "First L4 run: Phantom CKKS operation latencies and NCCL loopback bandwidth"
+}
+df92303a79f3d917e57a637f98e376a3a29a3fc3

@@ -67,12 +67,16 @@ if(NCCL_FOUND)
         ${NCCL_INCLUDE_DIR}
         ${NEXUS_SEAL_INCLUDE}
         ${CUDAToolkit_INCLUDE_DIRS}
+        ${PHANTOM_ROOT}/include
     )
     target_link_libraries(nexus_multi_gpu PUBLIC
         ${NCCL_LIBRARY}
         CUDA::cudart
         CUDA::cuda_driver
     )
+    if(TARGET phantom)
+        target_link_libraries(nexus_multi_gpu PUBLIC phantom)
+    endif()
     if(MPI_FOUND)
         target_link_libraries(nexus_multi_gpu PUBLIC MPI::MPI_CXX)
         target_compile_definitions(nexus_multi_gpu PUBLIC USE_MPI)
@@ -84,10 +88,17 @@ endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(NCCL_FOUND)
-    foreach(bench bert_inference bootstrapping_bench nccl_bandwidth_test)
+    foreach(bench bert_inference bootstrapping_bench nccl_bandwidth_test multi_gpu_keyswitch_test)
         if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/${bench}.cu)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)
+            # Link Phantom if the target was built
+            if(TARGET phantom)
+                target_link_libraries(${bench} PRIVATE phantom)
+            endif()
+            target_include_directories(${bench} PRIVATE
+                ${PHANTOM_ROOT}/include
+            )
             set_target_properties(${bench} PROPERTIES
                 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
                 CUDA_SEPARABLE_COMPILATION ON

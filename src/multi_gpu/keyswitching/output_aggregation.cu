@@ -1,34 +1,38 @@
 /**
  * output_aggregation.cu
  *
- * Implementation of Output Aggregation key-switching for multi-GPU FHE.
+ * Multi-GPU key-switching via Output Aggregation (Cinnamon, ASPLOS 2025).
  *
- * Algorithm recap:
- *   1. Each GPU computes a PARTIAL inner product from its local c2 limbs.
- *   2. AllReduce (sum) across all GPUs -> every GPU holds the full result.
- *   3. Each GPU keeps the result for its local limbs.
+ * The key difference from Input Broadcast: c2 is NOT gathered to every GPU.
+ * Instead, each GPU processes only its assigned digits of the decomposition
+ * and contributes a partial inner product. AllReduce sums these partials.
  *
- * Advantage over Input Broadcast:
- *   - c2 is never replicated in full on any GPU.
- *   - Lower peak HBM usage: important for larger parameter sets or many
- *     simultaneous ciphertexts (e.g., during bootstrapping).
+ * Pipeline per GPU:
+ *   1. mod-up: decompose c2 into beta digits. Each GPU does mod-up for ALL
+ *      digits (c2 is available locally after ciphertext multiplication).
+ *   2. partial inner product: GPU g accumulates only digits d where d%n == g.
+ *   3. AllReduce: sum partial inner products across GPUs.
+ *   4. mod-down: convert from QlP basis to Ql basis (local, no communication).
+ *   5. Add correction to ciphertext.
  *
- * Disadvantage:
- *   - The partial inner product is harder to implement correctly: we need
- *     to handle the digit decomposition of c2 using only local limbs.
- *   - Requires an AllReduce at the OUTPUT (not input), which can be harder
- *     to overlap with computation.
- *
- * TODO on EC2: replace partial_inner_product_local_limbs stub with
- * the actual Phantom key-switch kernel call using only local decomposition digits.
+ * Custom kernel: We modify Phantom's key_switch_inner_prod_c2_and_evk to
+ * accept a digit range [d_start, d_count) instead of iterating 0..beta-1.
+ * This is the only Phantom-internal modification required.
  */
 
 #include "output_aggregation.cuh"
 #include "../comm/nccl_comm.cuh"
 #include "../partition/rns_partition.cuh"
 
+#include "evaluate.cuh"
+#include "context.cuh"
+#include "secretkey.h"
+#include "ciphertext.h"
+#include "rns.cuh"
+#include "polymath.cuh"
+
 #include <stdexcept>
-#include <cstring>
+#include <cstdio>
 
 #define CUDA_CHECK(cmd) do {                                             \
     cudaError_t e = (cmd);                                               \
@@ -39,42 +43,80 @@
     }                                                                    \
 } while (0)
 
+#define NCCL_CHECK(cmd) do {                                             \
+    ncclResult_t r = (cmd);                                              \
+    if (r != ncclSuccess) {                                              \
+        throw std::runtime_error(std::string("NCCL error in ") +        \
+                                 __func__ + ": " +                       \
+                                 ncclGetErrorString(r));                  \
+    }                                                                    \
+} while (0)
+
+using namespace phantom;
+using namespace phantom::util;
+using namespace phantom::arith;
+
 namespace nexus_multi_gpu {
 
 // ---------------------------------------------------------------------------
-// partial_inner_product_local_limbs
+// Partial inner product kernel
 // ---------------------------------------------------------------------------
-// STUB: Computes partial key-switch inner product from local c2 limbs only.
-// On EC2: replace with modified Phantom kernel that processes only digits
-// corresponding to local limbs (digit_start to digit_start + digit_count).
+// This is a modified version of Phantom's key_switch_inner_prod_c2_and_evk
+// that processes only digits in range [d_start, d_start + d_count).
+// The output is a PARTIAL sum — AllReduce across GPUs yields the full result.
 
-void partial_inner_product_local_limbs(
-    const uint64_t        *local_c2,
-    const uint64_t *const *evk_data,
-    uint64_t              *partial_out_c0,
-    uint64_t              *partial_out_c1,
-    const void            *modulus_ptr,
-    size_t                 beta,
-    size_t                 local_digit_start,
-    size_t                 local_digit_count,
-    size_t                 total_limbs,
-    size_t                 degree,
-    cudaStream_t           stream)
+__global__ void partial_key_switch_inner_prod(
+    uint64_t       *dst,
+    const uint64_t *c2,            // mod-up'd c2 [beta * size_QlP_n]
+    const uint64_t *const *evks,   // evk pointers [beta]
+    const DModulus *modulus,
+    size_t          n,             // poly_modulus_degree
+    size_t          size_QP,
+    size_t          size_QP_n,
+    size_t          size_QlP,
+    size_t          size_QlP_n,
+    size_t          size_Q,
+    size_t          size_Ql,
+    size_t          d_start,       // first digit for this GPU
+    size_t          d_count,       // number of digits for this GPU
+    size_t          reduction_threshold)
 {
-    // Stub: zero output (no-op partial product).
-    CUDA_CHECK(cudaMemsetAsync(partial_out_c0, 0,
-               total_limbs * degree * sizeof(uint64_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(partial_out_c1, 0,
-               total_limbs * degree * sizeof(uint64_t), stream));
+    for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+         tid < size_QlP_n;
+         tid += blockDim.x * gridDim.x)
+    {
+        size_t nid = tid / n;
+        size_t twr = (nid >= size_Ql ? size_Q + (nid - size_Ql) : nid);
+        DModulus mod = modulus[twr];
+        uint64_t evk_id = (tid % n) + twr * n;
+        uint64_t c2_id = (tid % n) + nid * n;
 
-    (void)local_c2; (void)evk_data; (void)modulus_ptr;
-    (void)beta; (void)local_digit_start; (void)local_digit_count;
+        uint128_t prod0, prod1;
+        uint128_t acc0 = {0, 0};
+        uint128_t acc1 = {0, 0};
 
-    // TODO on EC2:
-    // For digits d in [local_digit_start, local_digit_start + local_digit_count):
-    //   Decompose local_c2 into digit d using hybrid/HPS decomposition.
-    //   Multiply by evk_data[d] and accumulate into partial_out_c0/c1.
-    // This is a partial sum; the AllReduce below will sum across GPUs.
+        // Accumulate only digits assigned to this GPU: [d_start, d_start + d_count)
+        for (uint64_t di = 0; di < d_count; di++) {
+            uint64_t d = d_start + di;
+
+            if (di > 0 && reduction_threshold == 0) {
+                acc0.lo = barrett_reduce_uint128_uint64(acc0, mod.value(), mod.const_ratio());
+                acc0.hi = 0;
+                acc1.lo = barrett_reduce_uint128_uint64(acc1, mod.value(), mod.const_ratio());
+                acc1.hi = 0;
+            }
+
+            prod0 = multiply_uint64_uint64(c2[c2_id + d * size_QlP_n], evks[d][evk_id]);
+            add_uint128_uint128(acc0, prod0, acc0);
+
+            prod1 = multiply_uint64_uint64(c2[c2_id + d * size_QlP_n], evks[d][evk_id + size_QP_n]);
+            add_uint128_uint128(acc1, prod1, acc1);
+        }
+
+        // Barrett reduce and store partial result
+        dst[tid]              = barrett_reduce_uint128_uint64(acc0, mod.value(), mod.const_ratio());
+        dst[tid + size_QlP_n] = barrett_reduce_uint128_uint64(acc1, mod.value(), mod.const_ratio());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,24 +126,39 @@ void partial_inner_product_local_limbs(
 void allreduce_keyswitching_result(
     MultiGpuContext &ctx,
     int              gpu_id,
-    uint64_t        *partial_out_c0,
-    uint64_t        *partial_out_c1,
-    size_t           total_limbs,
-    size_t           degree)
+    uint64_t        *partial_cx,
+    size_t           count)
 {
-    size_t count = total_limbs * degree;
-    // Group start/end ensures both AllReduces are issued atomically.
-    NCCL_CHECK(ncclGroupStart());
-    NCCL_CHECK(ncclAllReduce(partial_out_c0, partial_out_c0,
+    NCCL_CHECK(ncclAllReduce(partial_cx, partial_cx,
                              count, ncclUint64, ncclSum,
                              ctx.comms[gpu_id], ctx.streams[gpu_id]));
-    NCCL_CHECK(ncclAllReduce(partial_out_c1, partial_out_c1,
-                             count, ncclUint64, ncclSum,
-                             ctx.comms[gpu_id], ctx.streams[gpu_id]));
-    NCCL_CHECK(ncclGroupEnd());
     CUDA_CHECK(cudaStreamSynchronize(ctx.streams[gpu_id]));
-    // Note: the AllReduce sums uint64_t values without modular reduction.
-    // Caller must apply modular reduction (mod q_j for each limb j) afterward.
+}
+
+// ---------------------------------------------------------------------------
+// Modular reduction kernel (post-AllReduce)
+// ---------------------------------------------------------------------------
+// AllReduce sums uint64 values without modular reduction.
+// After AllReduce, each element must be reduced mod q_j for its limb j.
+
+__global__ void mod_reduce_after_allreduce(
+    uint64_t       *data,
+    const DModulus *modulus,
+    size_t          n,       // poly_modulus_degree
+    size_t          n_limbs, // size_QlP
+    size_t          size_Q,
+    size_t          size_Ql)
+{
+    size_t total = n_limbs * n;
+    for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+         tid < total;
+         tid += blockDim.x * gridDim.x)
+    {
+        size_t nid = tid / n;
+        size_t twr = (nid >= size_Ql ? size_Q + (nid - size_Ql) : nid);
+        DModulus mod = modulus[twr];
+        data[tid] = barrett_reduce_uint64(data[tid], mod.value(), mod.const_ratio());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,112 +166,112 @@ void allreduce_keyswitching_result(
 // ---------------------------------------------------------------------------
 
 void keyswitching_output_aggregation(
-    MultiGpuContext        &ctx,
-    const PhantomContext   &phantom_ctx,
-    int                     gpu_id,
-    size_t                  chain_index,
-    const uint64_t         *local_c2,
-    const PhantomRelinKey  &evk,
-    uint64_t               *local_out_c0_correction,
-    uint64_t               *local_out_c1_correction,
-    size_t                  total_limbs,
-    size_t                  degree,
-    int                     n_gpus)
+    MultiGpuContext       &ctx,
+    const PhantomContext  &phantom_ctx,
+    int                    gpu_id,
+    PhantomCiphertext     &encrypted,
+    uint64_t              *c2,
+    const PhantomRelinKey &relin_keys,
+    int                    n_gpus)
 {
-    size_t local_n = n_local_limbs(gpu_id, n_gpus, total_limbs);
+    const cudaStream_t &s = ctx.streams[gpu_id];
 
-    // Determine which digits belong to this GPU.
-    // With cyclic limb assignment, GPU g owns digits d where d % n_gpus == g.
-    // (In the HPS decomposition, digit d corresponds to limb group d.)
-    size_t local_digit_start = static_cast<size_t>(gpu_id);
-    size_t local_digit_count = local_n;  // one digit per local limb (approximation)
+    // ---- Extract parameters (same logic as Phantom's keyswitch_inplace) ----
+    auto &key_context_data = phantom_ctx.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto n = key_parms.poly_modulus_degree();
+    auto &key_modulus = key_parms.coeff_modulus();
+    size_t size_P = key_parms.special_modulus_size();
+    size_t size_QP = key_modulus.size();
 
-    // Allocate full-size partial output buffers.
-    uint64_t *partial_c0 = nullptr, *partial_c1 = nullptr;
-    CUDA_CHECK(cudaMalloc(&partial_c0, total_limbs * degree * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&partial_c1, total_limbs * degree * sizeof(uint64_t)));
+    // For CKKS: levelsDropped = chain_index - 1
+    uint32_t levelsDropped = encrypted.chain_index() - 1;
+    auto &rns_tool = phantom_ctx.get_context_data(1 + levelsDropped).gpu_rns_tool();
+    auto modulus_QP = phantom_ctx.gpu_rns_tables().modulus();
 
-    // Step 1: Compute partial inner product from local limbs.
-    cudaStream_t compute_stream = ctx.streams[gpu_id];
-    partial_inner_product_local_limbs(
-        local_c2,
-        /*evk_data=*/nullptr,
-        partial_c0, partial_c1,
-        /*modulus_ptr=*/nullptr,
-        /*beta=*/total_limbs,
-        local_digit_start, local_digit_count,
-        total_limbs, degree,
-        compute_stream);
+    size_t size_Ql = rns_tool.base_Ql().size();
+    size_t size_Q = size_QP - size_P;
+    size_t size_QlP = size_Ql + size_P;
+    auto size_Ql_n = size_Ql * n;
+    auto size_QlP_n = size_QlP * n;
 
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    // Handle HPS leveled scaling if needed
+    auto mul_tech = key_parms.mul_tech();
+    if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+        auto t_cks = make_cuda_auto_ptr<uint64_t>(size_Q * n, s);
+        cudaMemcpyAsync(t_cks.get(), c2, size_Q * n * sizeof(uint64_t),
+                        cudaMemcpyDeviceToDevice, s);
+        rns_tool.scaleAndRound_HPS_Q_Ql(c2, t_cks.get(), s);
+    }
 
-    // Step 2: AllReduce to sum partial contributions from all GPUs.
-    allreduce_keyswitching_result(ctx, gpu_id,
-                                  partial_c0, partial_c1,
-                                  total_limbs, degree);
+    // ---- Step 1: mod-up (each GPU does this for ALL digits) ----
+    size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
+    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+    rns_tool.modup(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(), key_parms.scheme(), s);
 
-    // Step 3: Extract local limbs of the combined result.
-    gather_ciphertext_from_gpu(partial_c0, local_out_c0_correction,
-                               1, total_limbs, degree, gpu_id, n_gpus,
-                               compute_stream);
-    gather_ciphertext_from_gpu(partial_c1, local_out_c1_correction,
-                               1, total_limbs, degree, gpu_id, n_gpus,
-                               compute_stream);
+    // ---- Step 2: partial inner product (only local digits) ----
+    // Assign digits to GPUs round-robin: GPU g processes digits d where d % n_gpus == g
+    size_t d_start = static_cast<size_t>(gpu_id);
+    size_t d_count = 0;
+    for (size_t d = d_start; d < beta; d += n_gpus)
+        d_count++;
 
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    // However, the kernel needs contiguous digit iteration. Since digits may not
+    // be contiguous for this GPU, we need to handle the strided pattern.
+    // For simplicity with the existing kernel structure, if beta <= n_gpus,
+    // each GPU gets at most 1 digit. Otherwise we call the kernel multiple times.
 
-    CUDA_CHECK(cudaFree(partial_c0));
-    CUDA_CHECK(cudaFree(partial_c1));
+    auto cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
+    CUDA_CHECK(cudaMemsetAsync(cx.get(), 0, 2 * size_QlP_n * sizeof(uint64_t), s));
 
-    (void)phantom_ctx; (void)chain_index; (void)evk;
-}
+    auto reduction_threshold =
+        (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
 
-// ---------------------------------------------------------------------------
-// rotation_output_aggregation
-// ---------------------------------------------------------------------------
+    // Process each digit assigned to this GPU
+    for (size_t d = gpu_id; d < beta; d += n_gpus) {
+        partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+            cx.get(), t_mod_up.get(), relin_keys.public_keys_ptr(),
+            modulus_QP, n, size_QP, size_QP * n,
+            size_QlP, size_QlP_n, size_Q, size_Ql,
+            d, 1,  // one digit at a time
+            reduction_threshold);
+    }
 
-void rotation_output_aggregation(
-    MultiGpuContext        &ctx,
-    const PhantomContext   &phantom_ctx,
-    int                     gpu_id,
-    size_t                  chain_index,
-    const uint64_t         *local_c1_rotated,
-    const PhantomGaloisKey &gk,
-    uint32_t                galois_elt,
-    uint64_t               *local_out_c0_correction,
-    uint64_t               *local_out_c1_new,
-    size_t                  total_limbs,
-    size_t                  degree,
-    int                     n_gpus)
-{
-    size_t local_n = n_local_limbs(gpu_id, n_gpus, total_limbs);
+    // ---- Step 3: AllReduce partial inner products ----
+    allreduce_keyswitching_result(ctx, gpu_id, cx.get(), 2 * size_QlP_n);
 
-    uint64_t *partial_c0 = nullptr, *partial_c1 = nullptr;
-    CUDA_CHECK(cudaMalloc(&partial_c0, total_limbs * degree * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&partial_c1, total_limbs * degree * sizeof(uint64_t)));
+    // ---- Step 3.5: Modular reduction after AllReduce ----
+    // AllReduce summed uint64 values; need mod reduction for correctness.
+    for (size_t i = 0; i < 2; i++) {
+        mod_reduce_after_allreduce<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+            cx.get() + i * size_QlP_n, modulus_QP, n, size_QlP, size_Q, size_Ql);
+    }
 
-    cudaStream_t s = ctx.streams[gpu_id];
-    partial_inner_product_local_limbs(
-        local_c1_rotated, nullptr,
-        partial_c0, partial_c1,
-        nullptr, total_limbs,
-        static_cast<size_t>(gpu_id), local_n,
-        total_limbs, degree, s);
+    // ---- Step 4: mod-down (local, no communication) ----
+    for (size_t i = 0; i < 2; i++) {
+        auto cx_i = cx.get() + i * size_QlP_n;
+        rns_tool.moddown_from_NTT(cx_i, cx_i, phantom_ctx.gpu_rns_tables(),
+                                  key_parms.scheme(), s);
+    }
+
+    // ---- Step 5: Add correction to ciphertext ----
+    for (size_t i = 0; i < 2; i++) {
+        auto cx_i = cx.get() + i * size_QlP_n;
+
+        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
+            auto ct_i = encrypted.data() + i * size_Q * n;
+            auto t_cx = make_cuda_auto_ptr<uint64_t>(size_Q * n, s);
+            rns_tool.ExpandCRTBasis_Ql_Q(t_cx.get(), cx_i, s);
+            add_to_ct_kernel<<<(size_Q * n) / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                ct_i, t_cx.get(), rns_tool.base_Q().base(), n, size_Q);
+        } else {
+            auto ct_i = encrypted.data() + i * size_Ql_n;
+            add_to_ct_kernel<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+                ct_i, cx_i, rns_tool.base_Ql().base(), n, size_Ql);
+        }
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(s));
-    allreduce_keyswitching_result(ctx, gpu_id, partial_c0, partial_c1,
-                                  total_limbs, degree);
-
-    gather_ciphertext_from_gpu(partial_c0, local_out_c0_correction,
-                               1, total_limbs, degree, gpu_id, n_gpus, s);
-    gather_ciphertext_from_gpu(partial_c1, local_out_c1_new,
-                               1, total_limbs, degree, gpu_id, n_gpus, s);
-
-    CUDA_CHECK(cudaStreamSynchronize(s));
-    CUDA_CHECK(cudaFree(partial_c0));
-    CUDA_CHECK(cudaFree(partial_c1));
-
-    (void)phantom_ctx; (void)chain_index; (void)gk; (void)galois_elt;
 }
 
 } // namespace nexus_multi_gpu

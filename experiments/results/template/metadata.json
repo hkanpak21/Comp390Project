@@ -1,0 +1,16 @@
+{
+  "date": "YYYY-MM-DD",
+  "instance_type": "g4dn.2xlarge",
+  "gpu_model": "T4",
+  "n_gpus": 1,
+  "cuda_version": "12.x",
+  "nccl_version": "2.x",
+  "driver_version": "xxx.xx",
+  "git_commit": "<run: git rev-parse HEAD>",
+  "git_branch": "main",
+  "experiment": "baseline-bert",
+  "binary": "./benchmarks/bert_inference",
+  "flags": "--n-gpus 1",
+  "cmake_arch": "sm_75",
+  "notes": "Describe in one sentence what this run is for."
+}
