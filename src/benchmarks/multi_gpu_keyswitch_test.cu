@@ -88,6 +88,17 @@ int main(int argc, char **argv) {
     printf("=== Multi-GPU Key-Switching Validation Test ===\n");
     printf("GPUs: %d\n\n", cfg.n_gpus);
 
+    // Initialize NCCL FIRST, before any Phantom operations.
+    // ncclCommInitAll touches all GPU device contexts; doing it after
+    // Phantom allocations on GPU 0 can corrupt the memory pool.
+    printf("[0/6] Initializing NCCL...\n");
+    vector<int> dev_ids(cfg.n_gpus);
+    for (int i = 0; i < cfg.n_gpus; i++) dev_ids[i] = i;
+    MultiGpuContext mgpu_ctx = MultiGpuContext::create(dev_ids);
+    // Restore device 0 for Phantom
+    cudaSetDevice(0);
+    printf("   NCCL initialized for %d GPUs\n\n", cfg.n_gpus);
+
     // ---- Step 1: Initialize Phantom CKKS context ----
     printf("[1/6] Initializing Phantom CKKS context...\n");
     Timer timer;
@@ -151,11 +162,6 @@ int main(int argc, char **argv) {
     // ct_a now has size=3 (c0, c1, c2)
 
     printf("   Encrypt + multiply in %.1f ms\n", timer.elapsed_ms());
-
-    // Initialize NCCL early
-    vector<int> dev_ids(cfg.n_gpus);
-    for (int i = 0; i < cfg.n_gpus; i++) dev_ids[i] = i;
-    MultiGpuContext mgpu_ctx = MultiGpuContext::create(dev_ids);
 
     // ---- Step 4: Ground truth — single-GPU relinearize ----
     printf("[4/6] Computing ground truth (single-GPU relinearize)...\n");
