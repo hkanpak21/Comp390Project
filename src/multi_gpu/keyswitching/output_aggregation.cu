@@ -168,6 +168,29 @@ __global__ void mod_reduce_after_allreduce(
 }
 
 // ---------------------------------------------------------------------------
+// add correction to ciphertext (replaces Phantom's add_to_ct_kernel)
+// ---------------------------------------------------------------------------
+__global__ void oa_add_to_ct(
+    uint64_t       *ct,     // destination: ct polynomial
+    const uint64_t *cx,     // source: key-switch correction
+    const DModulus *modulus,
+    size_t          n,      // poly_modulus_degree
+    size_t          n_limbs)
+{
+    size_t total = n_limbs * n;
+    for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+         tid < total;
+         tid += blockDim.x * gridDim.x)
+    {
+        size_t limb_idx = tid / n;
+        DModulus mod = modulus[limb_idx];
+        uint64_t sum = ct[tid] + cx[tid];
+        if (sum >= mod.value()) sum -= mod.value();
+        ct[tid] = sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // keyswitching_output_aggregation
 // ---------------------------------------------------------------------------
 
@@ -251,7 +274,7 @@ void keyswitching_output_aggregation(
             cx.get() + i * size_QlP_n, modulus_QP, n, size_QlP, size_Q, size_Ql);
     }
 
-    // ---- Step 4: mod-down (local, no communication) ----
+    // ---- Step 4: mod-down ----
     for (size_t i = 0; i < 2; i++) {
         auto cx_i = cx.get() + i * size_QlP_n;
         rns_tool.moddown_from_NTT(cx_i, cx_i, phantom_ctx.gpu_rns_tables(),
@@ -259,20 +282,12 @@ void keyswitching_output_aggregation(
     }
 
     // ---- Step 5: Add correction to ciphertext ----
+    // ct_i += cx_i (mod q_j) for each limb j in [0, size_Ql)
     for (size_t i = 0; i < 2; i++) {
         auto cx_i = cx.get() + i * size_QlP_n;
-
-        if (mul_tech == mul_tech_type::hps_overq_leveled && levelsDropped) {
-            auto ct_i = encrypted.data() + i * size_Q * n;
-            auto t_cx = make_cuda_auto_ptr<uint64_t>(size_Q * n, s);
-            rns_tool.ExpandCRTBasis_Ql_Q(t_cx.get(), cx_i, s);
-            add_to_ct_kernel<<<(size_Q * n) / blockDimGlb.x, blockDimGlb, 0, s>>>(
-                ct_i, t_cx.get(), rns_tool.base_Q().base(), n, size_Q);
-        } else {
-            auto ct_i = encrypted.data() + i * size_Ql_n;
-            add_to_ct_kernel<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
-                ct_i, cx_i, rns_tool.base_Ql().base(), n, size_Ql);
-        }
+        auto ct_i = encrypted.data() + i * size_Ql_n;
+        oa_add_to_ct<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+            ct_i, cx_i, modulus_QP, n, size_Ql);
     }
 
     CUDA_CHECK(cudaStreamSynchronize(s));
