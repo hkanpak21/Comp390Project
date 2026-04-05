@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
 
     // NEXUS-compatible parameters: N=65536, L=20, scale=2^40
     constexpr size_t POLY_DEGREE = 65536;
-    constexpr double SCALE = pow(2.0, 40);
+    const double SCALE = (double)(1ULL << 40);
     constexpr size_t N_MODULI = 20;  // Use L=20 for a manageable test
 
     EncryptionParameters parms(scheme_type::ckks);
@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < N_MODULI - 2; i++)
         bit_sizes.push_back(40);
     bit_sizes.push_back(60);  // tail (special prime for key-switching)
-    parms.set_coeff_modulus(CoeffModulus::Create(POLY_DEGREE, bit_sizes));
+    parms.set_coeff_modulus(phantom::arith::CoeffModulus::Create(POLY_DEGREE, bit_sizes));
 
     PhantomContext context(parms);
 
