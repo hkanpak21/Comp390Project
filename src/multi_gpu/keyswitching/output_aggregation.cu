@@ -158,7 +158,7 @@ __global__ void mod_reduce_after_allreduce(
         size_t nid = tid / n;
         size_t twr = (nid >= size_Ql ? size_Q + (nid - size_Ql) : nid);
         DModulus mod = modulus[twr];
-        data[tid] = barrett_reduce_uint64_uint64(data[tid], mod.value(), mod.const_ratio());
+        data[tid] = data[tid] % mod.value();
     }
 }
 
