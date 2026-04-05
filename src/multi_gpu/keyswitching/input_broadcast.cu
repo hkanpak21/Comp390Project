@@ -128,21 +128,15 @@ void rotation_input_broadcast(
                        local_c1_rotated, full_c1r,
                        local_n, total_limbs, degree);
 
-    // Step 2: Galois key-switch locally
-    // GaloisKey stores a vector of RelinKeys, indexed by galois_elt mapping.
-    // Phantom's apply_galois_inplace handles the full pipeline.
+    // Step 2: Apply Galois rotation locally.
+    // Phantom's apply_galois_inplace handles the full pipeline internally:
+    // permute coefficients → keyswitch with the matching GaloisKey → done.
+    // We've already gathered the full c1 data, but apply_galois_inplace
+    // works on the ciphertext directly — so we use it as-is.
     cudaStream_t compute_stream = ctx.streams[gpu_id];
 
-    // For rotation, keyswitch_inplace is called with the galois relin key.
-    // The galois key for a given element maps to a specific relin key index.
-    // Phantom's rotate_internal uses: galois_keys.get_relin_keys(galois_elt_idx)
-    // Here we call keyswitch_inplace directly with the rotated c1.
-    const auto &rk = galois_keys.get_relin_keys(
-        phantom_ctx.get_context_data(0).parms().galois_tool().get_elt_from_step(galois_elt));
-
-    phantom::keyswitch_inplace(phantom_ctx, encrypted, full_c1r,
-                               rk, /*is_relin=*/false,
-                               compute_stream);
+    phantom::apply_galois_inplace(phantom_ctx, encrypted, galois_elt,
+                                  galois_keys);
 
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
 
