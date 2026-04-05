@@ -129,6 +129,7 @@ public:
     size_t total_limbs() const { return total_limbs_; }
     double scale() const { return scale_; }
     bool is_ntt_form() const { return is_ntt_form_; }
+    size_t local_limb_count(int gpu) const { return local_limb_counts_[gpu]; }
 
     void set_chain_index(size_t idx) { chain_index_ = idx; }
     void set_scale(double s) { scale_ = s; }

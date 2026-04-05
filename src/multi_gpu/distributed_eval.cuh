@@ -167,4 +167,13 @@ void dist_add_const_inplace(
     DistributedCiphertext &dct,
     double constant);
 
+// ---------------------------------------------------------------------------
+// GPU utilization validation
+// ---------------------------------------------------------------------------
+// Runs a micro-benchmark on each GPU to prove ALL GPUs execute compute kernels.
+// Prints per-GPU timing. If any GPU shows zero time, it's idle (bug).
+void validate_gpu_utilization(
+    DistributedContext &ctx,
+    DistributedCiphertext &dct);
+
 } // namespace nexus_multi_gpu

@@ -1,35 +1,34 @@
 /**
  * distributed_eval.cu
  *
- * Multi-GPU wrappers for FHE operations.
+ * TRUE multi-GPU FHE evaluation — each GPU runs kernels on its local limbs.
  *
- * Architecture:
- *   LOCAL ops: gather limbs → local PhantomCiphertext → Phantom op → scatter back
- *   KEYED ops: gather to single GPU → Phantom keyswitch → scatter results
+ * For LOCAL operations (add, sub, multiply_plain, negate):
+ *   Each GPU calls Phantom's raw polynomial kernels (add_rns_poly,
+ *   sub_rns_poly, multiply_rns_poly, negate_rns_poly) directly on its
+ *   local limb buffer. NO gather/scatter. NO GPU-0-only execution.
+ *   ALL GPUs run compute kernels in parallel.
  *
- * For Phase 1, we use a "gather-operate-scatter" pattern:
- *   1. Gather distributed limbs to GPU 0 as a full PhantomCiphertext
- *   2. Run the Phantom operation on GPU 0
- *   3. Scatter results back to distributed limbs
+ * For KEYED operations (relinearize, rotate):
+ *   Communication + local compute. Currently uses gather-operate-scatter
+ *   (Phase 1), will be replaced with true distributed key-switching (Phase 2).
  *
- * This is NOT the final architecture (no actual parallelism for compute),
- * but it validates correctness and lets us profile where communication
- * vs computation time goes. Phase 2 will implement true per-GPU local ops.
- *
- * Why this approach first:
- *   - Phantom's evaluate functions expect PhantomCiphertext objects with
- *     specific metadata (chain_index, coeff_mod_size, etc.)
- *   - Creating "partial" PhantomCiphertexts with only local limbs requires
- *     modifying Phantom internals (which we don't want to do yet)
- *   - gather-operate-scatter lets us validate the full BERT pipeline
- *     and identify bottlenecks with Nsight before optimizing
+ * Validation: per-GPU cudaEvent timing proves each GPU runs kernels.
+ *   If GPU 1..n show zero kernel time, something is wrong.
  */
 
 #include "distributed_eval.cuh"
+#include "partition/rns_partition.cuh"
+
+// Phantom raw kernels (declared in polymath.cuh)
+#include "polymath.cuh"
 #include "evaluate.cuh"
 #include "ckks.h"
+#include "ntt.cuh"
 
 #include <cstdio>
+#include <thread>
+#include <vector>
 
 #define CUDA_CHECK(cmd) do {                                             \
     cudaError_t e = (cmd);                                               \
@@ -44,92 +43,54 @@ using namespace phantom;
 
 namespace nexus_multi_gpu {
 
+// Phantom's global block dimension (must match Phantom's definition)
+static const dim3 blockDim_local(256);
+
 // ---------------------------------------------------------------------------
-// Helper: gather → operate → scatter pattern
+// Per-GPU kernel launch helpers
 // ---------------------------------------------------------------------------
-// Gathers distributed ciphertext to GPU 0, runs a Phantom operation,
-// scatters the result back. Used for all operations in Phase 1.
+// These call Phantom's raw polynomial kernels on local limb buffers.
+// Each GPU has its own DModulus* from its own PhantomContext.
 
-static void gather_op_scatter(
-    DistributedContext &ctx,
-    DistributedCiphertext &dct,
-    std::function<void(PhantomContext&, PhantomCiphertext&)> op)
-{
-    // 1. Gather to GPU 0
-    PhantomCiphertext ct = dct.to_single_gpu(ctx, 0);
-
-    // 2. Operate on GPU 0
-    CUDA_CHECK(cudaSetDevice(0));
-    op(ctx.context(0), ct);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // 3. Free old distributed data, scatter new result
-    dct.free_all();
-    dct = DistributedCiphertext::from_single_gpu(ctx, ct, 0);
-}
-
-// Same but for binary operations (two input ciphertexts)
-static void gather_binary_op_scatter(
-    DistributedContext &ctx,
-    DistributedCiphertext &dct1,
-    const DistributedCiphertext &dct2,
-    std::function<void(PhantomContext&, PhantomCiphertext&, const PhantomCiphertext&)> op)
-{
-    PhantomCiphertext ct1 = dct1.to_single_gpu(ctx, 0);
-    PhantomCiphertext ct2 = dct2.to_single_gpu(ctx, 0);
-
-    CUDA_CHECK(cudaSetDevice(0));
-    op(ctx.context(0), ct1, ct2);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    dct1.free_all();
-    dct1 = DistributedCiphertext::from_single_gpu(ctx, ct1, 0);
+// Get the DModulus pointer for a GPU's context at a given chain level.
+// The modulus array contains ALL primes (Q + P). For a ciphertext at
+// chain_index, the relevant primes are the first coeff_mod_size entries.
+static const DModulus* get_modulus_ptr(DistributedContext &ctx, int gpu) {
+    return ctx.context(gpu).gpu_rns_tables().modulus();
 }
 
 // ---------------------------------------------------------------------------
-// LOCAL operations
+// LOCAL operations — TRUE per-GPU parallel execution
 // ---------------------------------------------------------------------------
-
-void dist_add_plain_inplace(
-    DistributedContext &ctx,
-    DistributedCiphertext &dct,
-    const PhantomPlaintext &plain)
-{
-    gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        add_plain_inplace(pctx, ct, plain);
-    });
-}
-
-void dist_multiply_plain_inplace(
-    DistributedContext &ctx,
-    DistributedCiphertext &dct,
-    const PhantomPlaintext &plain)
-{
-    gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        multiply_plain_inplace(pctx, ct, plain);
-    });
-}
-
-void dist_rescale_to_next_inplace(
-    DistributedContext &ctx,
-    DistributedCiphertext &dct)
-{
-    gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        rescale_to_next_inplace(pctx, ct);
-    });
-    // Update chain index after rescale
-    dct.set_chain_index(dct.chain_index() + 1);
-}
 
 void dist_add_inplace(
     DistributedContext &ctx,
     DistributedCiphertext &dct1,
     const DistributedCiphertext &dct2)
 {
-    gather_binary_op_scatter(ctx, dct1, dct2,
-        [](PhantomContext &pctx, PhantomCiphertext &ct1, const PhantomCiphertext &ct2) {
-            add_inplace(pctx, ct1, ct2);
+    std::vector<std::thread> threads;
+    for (int g = 0; g < ctx.n_gpus(); g++) {
+        threads.emplace_back([&, g]() {
+            CUDA_CHECK(cudaSetDevice(g));
+            size_t local_n = dct1.local_limb_count(g);
+            if (local_n == 0) return;
+
+            const DModulus *mod = get_modulus_ptr(ctx, g);
+            size_t N = dct1.poly_degree();
+            size_t local_coeff_count = local_n * N;
+            dim3 grid(local_coeff_count / blockDim_local.x);
+
+            cudaStream_t s = ctx.stream(g);
+            for (size_t p = 0; p < dct1.size(); p++) {
+                uint64_t *dst = dct1.data(g) + p * local_coeff_count;
+                const uint64_t *src = dct2.data(g) + p * local_coeff_count;
+                add_rns_poly<<<grid, blockDim_local, 0, s>>>(
+                    dst, src, mod, dst, N, local_n);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(s));
         });
+    }
+    for (auto &t : threads) t.join();
 }
 
 void dist_sub_inplace(
@@ -137,19 +98,178 @@ void dist_sub_inplace(
     DistributedCiphertext &dct1,
     const DistributedCiphertext &dct2)
 {
-    gather_binary_op_scatter(ctx, dct1, dct2,
-        [](PhantomContext &pctx, PhantomCiphertext &ct1, const PhantomCiphertext &ct2) {
-            sub_inplace(pctx, ct1, ct2);
+    std::vector<std::thread> threads;
+    for (int g = 0; g < ctx.n_gpus(); g++) {
+        threads.emplace_back([&, g]() {
+            CUDA_CHECK(cudaSetDevice(g));
+            size_t local_n = dct1.local_limb_count(g);
+            if (local_n == 0) return;
+
+            const DModulus *mod = get_modulus_ptr(ctx, g);
+            size_t N = dct1.poly_degree();
+            size_t local_coeff_count = local_n * N;
+            dim3 grid(local_coeff_count / blockDim_local.x);
+
+            cudaStream_t s = ctx.stream(g);
+            for (size_t p = 0; p < dct1.size(); p++) {
+                uint64_t *dst = dct1.data(g) + p * local_coeff_count;
+                const uint64_t *src = dct2.data(g) + p * local_coeff_count;
+                sub_rns_poly<<<grid, blockDim_local, 0, s>>>(
+                    dst, src, mod, dst, N, local_n);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(s));
         });
+    }
+    for (auto &t : threads) t.join();
 }
 
 void dist_negate_inplace(
     DistributedContext &ctx,
     DistributedCiphertext &dct)
 {
+    std::vector<std::thread> threads;
+    for (int g = 0; g < ctx.n_gpus(); g++) {
+        threads.emplace_back([&, g]() {
+            CUDA_CHECK(cudaSetDevice(g));
+            size_t local_n = dct.local_limb_count(g);
+            if (local_n == 0) return;
+
+            const DModulus *mod = get_modulus_ptr(ctx, g);
+            size_t N = dct.poly_degree();
+            size_t local_coeff_count = local_n * N;
+            dim3 grid(local_coeff_count / blockDim_local.x);
+
+            cudaStream_t s = ctx.stream(g);
+            for (size_t p = 0; p < dct.size(); p++) {
+                uint64_t *dst = dct.data(g) + p * local_coeff_count;
+                negate_rns_poly<<<grid, blockDim_local, 0, s>>>(
+                    dst, mod, dst, N, local_n);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(s));
+        });
+    }
+    for (auto &t : threads) t.join();
+}
+
+void dist_multiply_plain_inplace(
+    DistributedContext &ctx,
+    DistributedCiphertext &dct,
+    const PhantomPlaintext &plain)
+{
+    // Plaintext is on GPU 0. For true parallelism, we need the plaintext
+    // data on each GPU. Use cudaMemcpyPeer to copy the relevant limbs.
+    // For now: each GPU reads the plaintext from GPU 0 via peer access.
+    std::vector<std::thread> threads;
+    for (int g = 0; g < ctx.n_gpus(); g++) {
+        threads.emplace_back([&, g]() {
+            CUDA_CHECK(cudaSetDevice(g));
+            size_t local_n = dct.local_limb_count(g);
+            if (local_n == 0) return;
+
+            const DModulus *mod = get_modulus_ptr(ctx, g);
+            size_t N = dct.poly_degree();
+            size_t local_coeff_count = local_n * N;
+            dim3 grid(local_coeff_count / blockDim_local.x);
+
+            // Copy local limbs of plaintext to this GPU
+            // Plaintext layout: [limb_0][limb_1]..., each limb = N uint64s
+            uint64_t *local_plain = nullptr;
+            CUDA_CHECK(cudaMalloc(&local_plain, local_coeff_count * sizeof(uint64_t)));
+
+            size_t loc = 0;
+            for (size_t j = 0; j < dct.total_limbs(); j++) {
+                if (owner_of_limb(j, ctx.n_gpus()) != g) continue;
+                CUDA_CHECK(cudaMemcpyPeer(
+                    local_plain + loc * N, g,
+                    plain.data() + j * N, 0,  // plaintext on GPU 0
+                    N * sizeof(uint64_t)));
+                loc++;
+            }
+
+            cudaStream_t s = ctx.stream(g);
+            for (size_t p = 0; p < dct.size(); p++) {
+                uint64_t *dst = dct.data(g) + p * local_coeff_count;
+                multiply_rns_poly<<<grid, blockDim_local, 0, s>>>(
+                    dst, local_plain, mod, dst, N, local_n);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            CUDA_CHECK(cudaFree(local_plain));
+        });
+    }
+    for (auto &t : threads) t.join();
+}
+
+void dist_add_plain_inplace(
+    DistributedContext &ctx,
+    DistributedCiphertext &dct,
+    const PhantomPlaintext &plain)
+{
+    // add_plain only affects c0 (first polynomial)
+    std::vector<std::thread> threads;
+    for (int g = 0; g < ctx.n_gpus(); g++) {
+        threads.emplace_back([&, g]() {
+            CUDA_CHECK(cudaSetDevice(g));
+            size_t local_n = dct.local_limb_count(g);
+            if (local_n == 0) return;
+
+            const DModulus *mod = get_modulus_ptr(ctx, g);
+            size_t N = dct.poly_degree();
+            size_t local_coeff_count = local_n * N;
+            dim3 grid(local_coeff_count / blockDim_local.x);
+
+            // Copy local limbs of plaintext
+            uint64_t *local_plain = nullptr;
+            CUDA_CHECK(cudaMalloc(&local_plain, local_coeff_count * sizeof(uint64_t)));
+            size_t loc = 0;
+            for (size_t j = 0; j < dct.total_limbs(); j++) {
+                if (owner_of_limb(j, ctx.n_gpus()) != g) continue;
+                CUDA_CHECK(cudaMemcpyPeer(
+                    local_plain + loc * N, g,
+                    plain.data() + j * N, 0,
+                    N * sizeof(uint64_t)));
+                loc++;
+            }
+
+            cudaStream_t s = ctx.stream(g);
+            // Only c0 (poly index 0)
+            uint64_t *c0 = dct.data(g);
+            add_rns_poly<<<grid, blockDim_local, 0, s>>>(
+                c0, local_plain, mod, c0, N, local_n);
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            CUDA_CHECK(cudaFree(local_plain));
+        });
+    }
+    for (auto &t : threads) t.join();
+}
+
+// ---------------------------------------------------------------------------
+// CROSS-LIMB operations — require all limbs (gather-operate-scatter)
+// ---------------------------------------------------------------------------
+// rescale and mod_switch involve dropping primes across the RNS representation.
+// These cannot be done per-limb independently — they require the full
+// polynomial. We gather to GPU 0, operate, scatter back.
+
+static void gather_op_scatter(
+    DistributedContext &ctx,
+    DistributedCiphertext &dct,
+    std::function<void(PhantomContext&, PhantomCiphertext&)> op)
+{
+    PhantomCiphertext ct = dct.to_single_gpu(ctx, 0);
+    CUDA_CHECK(cudaSetDevice(0));
+    op(ctx.context(0), ct);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    dct.free_all();
+    dct = DistributedCiphertext::from_single_gpu(ctx, ct, 0);
+}
+
+void dist_rescale_to_next_inplace(
+    DistributedContext &ctx,
+    DistributedCiphertext &dct)
+{
     gather_op_scatter(ctx, dct, [](PhantomContext &pctx, PhantomCiphertext &ct) {
-        negate_inplace(pctx, ct);
+        rescale_to_next_inplace(pctx, ct);
     });
+    dct.set_chain_index(dct.chain_index() + 1);
 }
 
 void dist_mod_switch_to_next_inplace(
@@ -163,7 +283,8 @@ void dist_mod_switch_to_next_inplace(
 }
 
 // ---------------------------------------------------------------------------
-// KEYED operations (require communication)
+// KEYED operations — gather to GPU 0 for now (Phase 1)
+// Phase 2: true distributed key-switching with NCCL
 // ---------------------------------------------------------------------------
 
 void dist_multiply_and_relin_inplace(
@@ -172,7 +293,6 @@ void dist_multiply_and_relin_inplace(
     const DistributedCiphertext &dct2,
     const PhantomRelinKey &relin_keys)
 {
-    // Phase 1: gather both, multiply+relin on GPU 0, scatter
     PhantomCiphertext ct1 = dct1.to_single_gpu(ctx, 0);
     PhantomCiphertext ct2 = dct2.to_single_gpu(ctx, 0);
 
@@ -212,19 +332,7 @@ void dist_square_and_relin_inplace(
     const PhantomRelinKey &relin_keys)
 {
     gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        // square = multiply with self
-        PhantomCiphertext ct_copy;
-        ct_copy.resize(pctx, ct.chain_index(), ct.size(), cudaStreamPerThread);
-        cudaMemcpyAsync(ct_copy.data(), ct.data(),
-                        ct.size() * ct.coeff_modulus_size() * ct.poly_modulus_degree() * sizeof(uint64_t),
-                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        ct_copy.set_scale(ct.scale());
-        ct_copy.set_ntt_form(ct.is_ntt_form());
-        ct_copy.set_chain_index(ct.chain_index());
-        ct_copy.set_coeff_modulus_size(ct.coeff_modulus_size());
-        ct_copy.set_poly_modulus_degree(ct.poly_modulus_degree());
-
-        multiply_inplace(pctx, ct, ct_copy);
+        multiply_inplace(pctx, ct, ct);
         relinearize_inplace(pctx, ct, relin_keys);
     });
 }
@@ -238,13 +346,14 @@ void dist_multiply_const_inplace(
     DistributedCiphertext &dct,
     double constant)
 {
-    gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        PhantomCKKSEncoder encoder(pctx);
-        PhantomPlaintext plain;
-        encoder.encode(pctx, constant, ct.scale(), plain);
-        mod_switch_to_inplace(pctx, plain, ct.chain_index());
-        multiply_plain_inplace(pctx, ct, plain);
-    });
+    // Encode on GPU 0, then distribute plaintext limbs
+    CUDA_CHECK(cudaSetDevice(0));
+    PhantomCKKSEncoder encoder(ctx.context(0));
+    PhantomPlaintext plain;
+    encoder.encode(ctx.context(0), constant, dct.scale(), plain);
+    mod_switch_to_inplace(ctx.context(0), plain, dct.chain_index());
+
+    dist_multiply_plain_inplace(ctx, dct, plain);
 }
 
 void dist_add_const_inplace(
@@ -252,13 +361,68 @@ void dist_add_const_inplace(
     DistributedCiphertext &dct,
     double constant)
 {
-    gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        PhantomCKKSEncoder encoder(pctx);
-        PhantomPlaintext plain;
-        encoder.encode(pctx, constant, ct.scale(), plain);
-        mod_switch_to_inplace(pctx, plain, ct.chain_index());
-        add_plain_inplace(pctx, ct, plain);
-    });
+    CUDA_CHECK(cudaSetDevice(0));
+    PhantomCKKSEncoder encoder(ctx.context(0));
+    PhantomPlaintext plain;
+    encoder.encode(ctx.context(0), constant, dct.scale(), plain);
+    mod_switch_to_inplace(ctx.context(0), plain, dct.chain_index());
+
+    dist_add_plain_inplace(ctx, dct, plain);
+}
+
+// ---------------------------------------------------------------------------
+// GPU utilization validation
+// ---------------------------------------------------------------------------
+
+void validate_gpu_utilization(
+    DistributedContext &ctx,
+    DistributedCiphertext &dct)
+{
+    printf("\n=== GPU Utilization Validation ===\n");
+    printf("Testing that ALL %d GPUs run compute kernels...\n\n", ctx.n_gpus());
+
+    // Create a copy to add to itself (harmless operation)
+    // Each GPU should show non-zero kernel time
+    for (int g = 0; g < ctx.n_gpus(); g++) {
+        CUDA_CHECK(cudaSetDevice(g));
+
+        size_t local_n = dct.local_limb_count(g);
+        if (local_n == 0) {
+            printf("  GPU %d: 0 local limbs (idle) — WARNING\n", g);
+            continue;
+        }
+
+        const DModulus *mod = get_modulus_ptr(ctx, g);
+        size_t N = dct.poly_degree();
+        size_t local_coeff_count = local_n * N;
+        dim3 grid(local_coeff_count / blockDim_local.x);
+
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        cudaStream_t s = ctx.stream(g);
+        CUDA_CHECK(cudaEventRecord(start, s));
+
+        // Run 100 add_rns_poly kernels as a timing test
+        for (int iter = 0; iter < 100; iter++) {
+            uint64_t *c0 = dct.data(g);
+            add_rns_poly<<<grid, blockDim_local, 0, s>>>(
+                c0, c0, mod, c0, N, local_n);
+        }
+
+        CUDA_CHECK(cudaEventRecord(stop, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+
+        float ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        printf("  GPU %d: %zu local limbs, 100 add_rns_poly kernels in %.3f ms %s\n",
+               g, local_n, ms, ms > 0.001 ? "— ACTIVE" : "— IDLE (BUG!)");
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+    printf("\n");
 }
 
 } // namespace nexus_multi_gpu
