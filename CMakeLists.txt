@@ -74,8 +74,8 @@ if(NCCL_FOUND)
         CUDA::cudart
         CUDA::cuda_driver
     )
-    if(TARGET phantom)
-        target_link_libraries(nexus_multi_gpu PUBLIC phantom)
+    if(TARGET Phantom)
+        target_link_libraries(nexus_multi_gpu PUBLIC Phantom)
     endif()
     if(MPI_FOUND)
         target_link_libraries(nexus_multi_gpu PUBLIC MPI::MPI_CXX)
@@ -93,8 +93,8 @@ if(NCCL_FOUND)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)
             # Link Phantom if the target was built
-            if(TARGET phantom)
-                target_link_libraries(${bench} PRIVATE phantom)
+            if(TARGET Phantom)
+                target_link_libraries(${bench} PRIVATE Phantom)
             endif()
             target_include_directories(${bench} PRIVATE
                 ${PHANTOM_ROOT}/include
