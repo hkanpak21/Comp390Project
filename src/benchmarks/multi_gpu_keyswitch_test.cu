@@ -152,18 +152,24 @@ int main(int argc, char **argv) {
 
     printf("   Encrypt + multiply in %.1f ms\n", timer.elapsed_ms());
 
+    // Initialize NCCL early
+    vector<int> dev_ids(cfg.n_gpus);
+    for (int i = 0; i < cfg.n_gpus; i++) dev_ids[i] = i;
+    MultiGpuContext mgpu_ctx = MultiGpuContext::create(dev_ids);
+
     // ---- Step 4: Ground truth — single-GPU relinearize ----
     printf("[4/6] Computing ground truth (single-GPU relinearize)...\n");
     timer.start();
 
-    PhantomCiphertext ct_ground_truth = ct_mul;  // deep copy
-    relinearize_inplace(context, ct_ground_truth, relin_keys);
+    // Re-multiply fresh for ground truth (avoid copy constructor issues)
+    PhantomCiphertext ct_gt = multiply(context, ct_a, ct_b);
+    relinearize_inplace(context, ct_gt, relin_keys);
 
     printf("   Single-GPU relinearize in %.1f ms\n", timer.elapsed_ms());
 
     // Decrypt ground truth for comparison
     PhantomPlaintext plain_gt;
-    secret_key.decrypt(context, ct_ground_truth, plain_gt);
+    secret_key.decrypt(context, ct_gt, plain_gt);
     vector<double> result_gt;
     encoder.decode(context, plain_gt, result_gt);
 
@@ -171,19 +177,10 @@ int main(int argc, char **argv) {
     printf("[5/6] Testing Input Broadcast key-switching (%d GPUs)...\n", cfg.n_gpus);
     timer.start();
 
-    // Initialize NCCL
-    vector<int> dev_ids(cfg.n_gpus);
-    for (int i = 0; i < cfg.n_gpus; i++) dev_ids[i] = i;
-    MultiGpuContext mgpu_ctx = MultiGpuContext::create(dev_ids);
-
-    // For Input Broadcast, we make a copy of ct_mul and call our function.
-    // Since Input Broadcast calls Phantom's keyswitch_inplace directly,
-    // we need the full ciphertext on GPU 0 (for this test we use GPU 0 only
-    // to validate correctness — the multi-GPU communication is still exercised).
-    PhantomCiphertext ct_ib = ct_mul;  // deep copy
+    // Fresh multiply for Input Broadcast test
+    PhantomCiphertext ct_ib = multiply(context, ct_a, ct_b);
 
     // Extract c2 pointer (3rd polynomial of the ciphertext)
-    // ct_ib has size=3, so c2 starts at offset 2 * size_Ql * n
     auto chain_idx = ct_ib.chain_index();
     auto &ctx_data = context.get_context_data(chain_idx);
     size_t size_Ql = ctx_data.gpu_rns_tool().base_Ql().size();
@@ -218,7 +215,8 @@ int main(int argc, char **argv) {
     printf("[6/6] Testing Output Aggregation key-switching (%d GPUs)...\n", cfg.n_gpus);
     timer.start();
 
-    PhantomCiphertext ct_oa = ct_mul;  // deep copy
+    // Fresh multiply for Output Aggregation test
+    PhantomCiphertext ct_oa = multiply(context, ct_a, ct_b);
     uint64_t *c2_ptr_oa = ct_oa.data() + 2 * size_Ql * POLY_DEGREE;
 
     keyswitching_output_aggregation(mgpu_ctx, context, /*gpu_id=*/0,
