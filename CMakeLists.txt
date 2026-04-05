@@ -47,10 +47,31 @@ set(NEXUS_ROOT ${CMAKE_SOURCE_DIR}/vendor/nexus)
 set(NEXUS_SEAL_INCLUDE ${NEXUS_ROOT}/thirdparty/SEAL-4.1-bs/native/src)
 
 # Phantom FHE (GPU-native CKKS)
+# Phantom's CMakeLists uses CMAKE_SOURCE_DIR for include paths, which breaks
+# when built as a subdirectory. We build it via ExternalProject instead.
 set(PHANTOM_ROOT ${CMAKE_SOURCE_DIR}/vendor/phantom)
-if(EXISTS ${PHANTOM_ROOT}/CMakeLists.txt)
-    add_subdirectory(${PHANTOM_ROOT} phantom_build EXCLUDE_FROM_ALL)
-endif()
+
+include(ExternalProject)
+ExternalProject_Add(phantom_ext
+    SOURCE_DIR ${PHANTOM_ROOT}
+    BINARY_DIR ${CMAKE_BINARY_DIR}/phantom_build
+    CMAKE_ARGS
+        -DCMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+        -DPHANTOM_ENABLE_EXAMPLE=OFF
+        -DPHANTOM_ENABLE_BENCH=OFF
+        -DPHANTOM_ENABLE_TEST=OFF
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/phantom_build/lib/libPhantom.so
+)
+
+# Create an imported target for Phantom
+add_library(Phantom SHARED IMPORTED)
+set_target_properties(Phantom PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_BINARY_DIR}/phantom_build/lib/libPhantom.so
+    INTERFACE_INCLUDE_DIRECTORIES ${PHANTOM_ROOT}/include
+)
+add_dependencies(Phantom phantom_ext)
 
 # ── src/multi_gpu library ─────────────────────────────────────────────────────
 if(NCCL_FOUND)
