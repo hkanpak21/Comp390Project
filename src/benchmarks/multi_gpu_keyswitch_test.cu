@@ -23,8 +23,30 @@
 #include <stdexcept>
 #include <chrono>
 #include <thread>
-#include <barrier>
+#include <mutex>
+#include <condition_variable>
 #include <atomic>
+
+// Simple barrier for C++17 (std::barrier requires C++20)
+class SimpleBarrier {
+    int n_, count_;
+    int generation_ = 0;
+    mutex mtx_;
+    condition_variable cv_;
+public:
+    explicit SimpleBarrier(int n) : n_(n), count_(n) {}
+    void arrive_and_wait() {
+        unique_lock<mutex> lk(mtx_);
+        int gen = generation_;
+        if (--count_ == 0) {
+            generation_++;
+            count_ = n_;
+            cv_.notify_all();
+        } else {
+            cv_.wait(lk, [&] { return gen != generation_; });
+        }
+    }
+};
 
 // Phantom FHE
 #include "context.cuh"
@@ -78,7 +100,7 @@ struct GpuWorkerArgs {
     size_t buf_elems;     // total_limbs * degree for allgather/allreduce
     size_t local_elems;   // local_limbs * degree
     // Synchronization
-    barrier<> *sync_bar;
+    SimpleBarrier *sync_bar;
     atomic<int> *phase;   // 0=wait, 1=IB_allgather, 2=OA_allreduce, 3=done
 };
 
@@ -230,7 +252,7 @@ int main(int argc, char **argv) {
     size_t total_elems = size_Ql * POLY_DEGREE;
 
     // ---- Launch worker threads for non-zero GPUs ----
-    barrier sync_bar(cfg.n_gpus);  // all GPUs including 0
+    SimpleBarrier sync_bar(cfg.n_gpus);  // all GPUs including 0
     atomic<int> phase{0};
 
     vector<thread> workers;
