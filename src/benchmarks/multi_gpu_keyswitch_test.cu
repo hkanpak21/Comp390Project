@@ -31,12 +31,12 @@
 class SimpleBarrier {
     int n_, count_;
     int generation_ = 0;
-    mutex mtx_;
-    condition_variable cv_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
 public:
     explicit SimpleBarrier(int n) : n_(n), count_(n) {}
     void arrive_and_wait() {
-        unique_lock<mutex> lk(mtx_);
+        std::unique_lock<std::mutex> lk(mtx_);
         int gen = generation_;
         if (--count_ == 0) {
             generation_++;
