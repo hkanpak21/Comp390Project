@@ -143,8 +143,8 @@ int main(int argc, char **argv) {
     encoder.encode(context, input_b, SCALE, plain_b);
 
     PhantomCiphertext ct_a, ct_b;
-    secret_key.encrypt_symmetric(context, plain_a, ct_a, false);
-    secret_key.encrypt_symmetric(context, plain_b, ct_b, false);
+    secret_key.encrypt_symmetric(context, plain_a, ct_a);
+    secret_key.encrypt_symmetric(context, plain_b, ct_b);
 
     // Multiply (creates a 3-element ciphertext with c2)
     PhantomCiphertext ct_mul = multiply(context, ct_a, ct_b);
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
                                  size_Ql, POLY_DEGREE, cfg.n_gpus);
 
     // Resize ciphertext back to 2 elements (c2 has been consumed)
-    ct_ib.resize(context, chain_idx, 2);
+    ct_ib.resize(context, chain_idx, 2, cudaStreamPerThread);
 
     double ib_time = timer.elapsed_ms();
 
@@ -225,7 +225,7 @@ int main(int argc, char **argv) {
                                     ct_oa, c2_ptr_oa, relin_keys,
                                     cfg.n_gpus);
 
-    ct_oa.resize(context, chain_idx, 2);
+    ct_oa.resize(context, chain_idx, 2, cudaStreamPerThread);
 
     double oa_time = timer.elapsed_ms();
 
