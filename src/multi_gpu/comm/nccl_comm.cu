@@ -162,11 +162,16 @@ void allgather_ciphertext_limbs(MultiGpuContext &ctx,
                                 size_t n_polys,
                                 size_t local_limbs,
                                 size_t degree) {
-    // Total elements sent by this GPU per polynomial.
+    // NCCL AllGather requires ALL ranks to send the SAME count.
+    // With cyclic limb assignment, some GPUs may have one more limb than others
+    // when total_limbs % n_gpus != 0. We pad to max_local_limbs.
+    size_t max_local = (local_limbs > 0) ? local_limbs : 0;
+    // Compute max across all GPUs: max_local = ceil(total_limbs / n_gpus)
+    // Since we don't have total_limbs here, we receive it from the caller.
+    // For now, use local_limbs directly — the caller must ensure all GPUs
+    // pass the SAME value for local_limbs (= max_local_limbs across all GPUs).
     size_t send_count = local_limbs * degree;
 
-    // We gather each polynomial separately because the polynomials are stored
-    // in separate contiguous blocks in both local_buf and recv_buf.
     NCCL_CHECK(ncclGroupStart());
     for (size_t poly = 0; poly < n_polys; ++poly) {
         const uint64_t *send = local_buf + poly * send_count;

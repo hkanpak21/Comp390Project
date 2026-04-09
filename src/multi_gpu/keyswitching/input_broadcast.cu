@@ -50,13 +50,34 @@ void allgather_c2_limbs(
     size_t           total_limbs,
     size_t           degree)
 {
-    // c2 is a single polynomial (n_polys = 1).
+    // NCCL AllGather requires ALL ranks to send the SAME count.
+    // With cyclic assignment, some GPUs have ceil(total/n) limbs, others floor(total/n).
+    // Pad to max = ceil(total_limbs / n_gpus).
+    int n_gpus = ctx.n_gpus;
+    size_t max_local = (total_limbs + n_gpus - 1) / n_gpus;
+
+    // If this GPU has fewer limbs than max, create a padded buffer
+    uint64_t *padded_local = nullptr;
+    if (local_limbs < max_local) {
+        CUDA_CHECK(cudaMalloc(&padded_local, max_local * degree * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemsetAsync(padded_local, 0, max_local * degree * sizeof(uint64_t),
+                                   ctx.streams[gpu_id]));
+        CUDA_CHECK(cudaMemcpyAsync(padded_local, local_c2,
+                                   local_limbs * degree * sizeof(uint64_t),
+                                   cudaMemcpyDeviceToDevice, ctx.streams[gpu_id]));
+    }
+
+    const uint64_t *send_buf = padded_local ? padded_local : local_c2;
+
+    // AllGather with uniform send count
     allgather_ciphertext_limbs(ctx, gpu_id,
-                               local_c2, full_c2,
+                               send_buf, full_c2,
                                /*n_polys=*/1,
-                               local_limbs, degree);
-    // Synchronize: inner product must not start before AllGather completes.
+                               max_local, degree);
+
     CUDA_CHECK(cudaStreamSynchronize(ctx.streams[gpu_id]));
+
+    if (padded_local) CUDA_CHECK(cudaFree(padded_local));
 }
 
 // ---------------------------------------------------------------------------
@@ -78,14 +99,15 @@ void keyswitching_input_broadcast(
     size_t local_n = n_local_limbs(gpu_id, n_gpus, total_limbs);
 
     // ---- Step 1: AllGather c2 — every GPU gets all limbs ----
-    // AllGather output layout: [GPU0_limbs | GPU1_limbs | ... | GPUn_limbs]
-    // But Phantom needs sequential order: [limb0 | limb1 | limb2 | ...]
-    // With cyclic assignment, GPU g has limbs g, g+n, g+2n, ... so AllGather
-    // produces wrong ordering. We gather then reorder.
+    // AllGather output layout: [GPU0_padded_limbs | GPU1_padded_limbs | ...]
+    // Each GPU contributes max_local limbs (padded). Total gathered size = n_gpus * max_local * degree.
+    // We need to extract and reorder to sequential: [limb0 | limb1 | limb2 | ...]
+    size_t max_local = (total_limbs + n_gpus - 1) / n_gpus;
+    size_t gathered_bytes = n_gpus * max_local * degree * sizeof(uint64_t);
+    size_t c2_bytes = total_limbs * degree * sizeof(uint64_t);
     uint64_t *gathered_c2 = nullptr;
     uint64_t *full_c2 = nullptr;
-    size_t c2_bytes = total_limbs * degree * sizeof(uint64_t);
-    CUDA_CHECK(cudaMalloc(&gathered_c2, c2_bytes));
+    CUDA_CHECK(cudaMalloc(&gathered_c2, gathered_bytes));
     CUDA_CHECK(cudaMalloc(&full_c2, c2_bytes));
 
     allgather_c2_limbs(ctx, gpu_id,
@@ -98,27 +120,22 @@ void keyswitching_input_broadcast(
     // In gathered_c2, GPU g's data starts at offset (sum of local_limbs for GPUs < g) * degree
     cudaStream_t compute_stream = ctx.streams[gpu_id];
     if (n_gpus == 1) {
-        // No reorder needed
         CUDA_CHECK(cudaMemcpyAsync(full_c2, gathered_c2, c2_bytes,
                                    cudaMemcpyDeviceToDevice, compute_stream));
     } else {
-        // Reorder limbs from GPU-grouped to sequential
-        size_t src_offset = 0;
+        // Reorder from GPU-grouped (padded) to sequential.
+        // In gathered_c2: GPU g's data starts at g * max_local * degree
         for (int g = 0; g < n_gpus; g++) {
-            size_t g_local = n_local_limbs(g, n_gpus, total_limbs);
             size_t loc = 0;
             for (size_t j = 0; j < total_limbs; j++) {
                 if (owner_of_limb(j, n_gpus) != g) continue;
-                // Source: gathered_c2 + (src_offset + loc) * degree
-                // Dest:   full_c2 + j * degree
                 CUDA_CHECK(cudaMemcpyAsync(
                     full_c2 + j * degree,
-                    gathered_c2 + (src_offset + loc) * degree,
+                    gathered_c2 + (g * max_local + loc) * degree,
                     degree * sizeof(uint64_t),
                     cudaMemcpyDeviceToDevice, compute_stream));
                 loc++;
             }
-            src_offset += g_local;
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
