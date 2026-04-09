@@ -78,20 +78,54 @@ void keyswitching_input_broadcast(
     size_t local_n = n_local_limbs(gpu_id, n_gpus, total_limbs);
 
     // ---- Step 1: AllGather c2 — every GPU gets all limbs ----
+    // AllGather output layout: [GPU0_limbs | GPU1_limbs | ... | GPUn_limbs]
+    // But Phantom needs sequential order: [limb0 | limb1 | limb2 | ...]
+    // With cyclic assignment, GPU g has limbs g, g+n, g+2n, ... so AllGather
+    // produces wrong ordering. We gather then reorder.
+    uint64_t *gathered_c2 = nullptr;
     uint64_t *full_c2 = nullptr;
     size_t c2_bytes = total_limbs * degree * sizeof(uint64_t);
+    CUDA_CHECK(cudaMalloc(&gathered_c2, c2_bytes));
     CUDA_CHECK(cudaMalloc(&full_c2, c2_bytes));
 
     allgather_c2_limbs(ctx, gpu_id,
-                       local_c2, full_c2,
+                       local_c2, gathered_c2,
                        local_n, total_limbs, degree);
 
-    // ---- Step 2: Call Phantom's keyswitch_inplace locally ----
-    // This does the full pipeline: mod-up → inner product → mod-down → add to ct.
-    // Each GPU has the full c2 and the full relin key, so this is a standard
-    // single-GPU operation — no further communication needed.
+    // Reorder: gathered_c2 is [GPU0_limbs | GPU1_limbs | ...]
+    // full_c2 should be [limb0 | limb1 | limb2 | ...]
+    // GPU g contributed limbs: g, g+n_gpus, g+2*n_gpus, ...
+    // In gathered_c2, GPU g's data starts at offset (sum of local_limbs for GPUs < g) * degree
     cudaStream_t compute_stream = ctx.streams[gpu_id];
+    if (n_gpus == 1) {
+        // No reorder needed
+        CUDA_CHECK(cudaMemcpyAsync(full_c2, gathered_c2, c2_bytes,
+                                   cudaMemcpyDeviceToDevice, compute_stream));
+    } else {
+        // Reorder limbs from GPU-grouped to sequential
+        size_t src_offset = 0;
+        for (int g = 0; g < n_gpus; g++) {
+            size_t g_local = n_local_limbs(g, n_gpus, total_limbs);
+            size_t loc = 0;
+            for (size_t j = 0; j < total_limbs; j++) {
+                if (owner_of_limb(j, n_gpus) != g) continue;
+                // Source: gathered_c2 + (src_offset + loc) * degree
+                // Dest:   full_c2 + j * degree
+                CUDA_CHECK(cudaMemcpyAsync(
+                    full_c2 + j * degree,
+                    gathered_c2 + (src_offset + loc) * degree,
+                    degree * sizeof(uint64_t),
+                    cudaMemcpyDeviceToDevice, compute_stream));
+                loc++;
+            }
+            src_offset += g_local;
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    CUDA_CHECK(cudaFree(gathered_c2));
 
+    // ---- Step 2: Call Phantom's keyswitch_inplace locally ----
+    // Now full_c2 has limbs in sequential order — Phantom can process it.
     phantom::keyswitch_inplace(phantom_ctx, encrypted, full_c2,
                                relin_keys, /*is_relin=*/true,
                                compute_stream);
