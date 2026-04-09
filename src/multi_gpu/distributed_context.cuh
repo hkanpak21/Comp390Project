@@ -82,6 +82,13 @@ public:
     size_t total_limbs_at_level(size_t chain_index) const;
     size_t local_limbs(int gpu, size_t chain_index) const;
 
+    // Move-only (contains unique_ptr vector)
+    DistributedContext() = default;
+    DistributedContext(const DistributedContext&) = delete;
+    DistributedContext& operator=(const DistributedContext&) = delete;
+    DistributedContext(DistributedContext&&) = default;
+    DistributedContext& operator=(DistributedContext&&) = default;
+
     // Cleanup
     void destroy();
     ~DistributedContext();

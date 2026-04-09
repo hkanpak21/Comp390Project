@@ -76,10 +76,7 @@ add_dependencies(Phantom phantom_ext)
 # ── src/multi_gpu library ─────────────────────────────────────────────────────
 if(NCCL_FOUND)
     file(GLOB_RECURSE MULTI_GPU_SRCS
-        src/multi_gpu/comm/*.cu
-        src/multi_gpu/partition/*.cu
-        src/multi_gpu/keyswitching/*.cu
-        src/multi_gpu/overlap/*.cu
+        src/multi_gpu/*.cu
     )
 
     add_library(nexus_multi_gpu STATIC ${MULTI_GPU_SRCS})

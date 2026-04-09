@@ -322,7 +322,7 @@ void dist_rotate_vector_inplace(
     const PhantomGaloisKey &galois_keys)
 {
     gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        rotate_vector_inplace(pctx, ct, steps, galois_keys);
+        rotate_inplace(pctx, ct, steps, galois_keys);
     });
 }
 
@@ -350,7 +350,9 @@ void dist_multiply_const_inplace(
     CUDA_CHECK(cudaSetDevice(0));
     PhantomCKKSEncoder encoder(ctx.context(0));
     PhantomPlaintext plain;
-    encoder.encode(ctx.context(0), constant, dct.scale(), plain);
+    size_t slots = ctx.context(0).get_context_data(0).parms().poly_modulus_degree() / 2;
+    std::vector<double> vec(slots, constant);
+    encoder.encode(ctx.context(0), vec, dct.scale(), plain);
     mod_switch_to_inplace(ctx.context(0), plain, dct.chain_index());
 
     dist_multiply_plain_inplace(ctx, dct, plain);
@@ -364,7 +366,9 @@ void dist_add_const_inplace(
     CUDA_CHECK(cudaSetDevice(0));
     PhantomCKKSEncoder encoder(ctx.context(0));
     PhantomPlaintext plain;
-    encoder.encode(ctx.context(0), constant, dct.scale(), plain);
+    size_t slots = ctx.context(0).get_context_data(0).parms().poly_modulus_degree() / 2;
+    std::vector<double> vec(slots, constant);
+    encoder.encode(ctx.context(0), vec, dct.scale(), plain);
     mod_switch_to_inplace(ctx.context(0), plain, dct.chain_index());
 
     dist_add_plain_inplace(ctx, dct, plain);
