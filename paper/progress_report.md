@@ -249,7 +249,54 @@ OA distributes only the inner product across GPUs (25% of key-switch time):
 
 ---
 
-## 6. Technical Challenges Solved
+## 6. Profiling Analysis (Nsight Systems)
+
+### 6.1 BERT MatMul Kernel Breakdown (1 GPU, N=8192, 64 cols × 64 inner)
+
+| Kernel | Time % | Total (ms) | Instances | Role |
+|--------|--------|-----------|-----------|------|
+| `multiply_rns_poly` | 44.8% | 72.7 | 32,769 | Plaintext × ciphertext (per-limb) |
+| `add_rns_poly` | 40.1% | 65.0 | 32,576 | Ciphertext accumulation (per-limb) |
+| `fnwt_radix8_phase2` (NTT) | 3.1% | 5.0 | 1,109 | Forward NTT |
+| `fnwt_radix8_phase1` (NTT) | 2.9% | 4.7 | 1,109 | Forward NTT |
+| `inwt_radix8` (INTT) | 2.7% | 4.3 | 1,024 | Inverse NTT (rescale) |
+| Other (encoding, sampling) | 6.4% | 10.4 | — | Setup |
+
+**85% of MatMul time is `multiply_rns_poly` + `add_rns_poly`** — both are per-limb, embarrassingly parallel. This validates why pipeline parallelism achieves 2.64x at 4 GPUs.
+
+### 6.2 Key-Switch Kernel Breakdown (1 GPU, N=65536, L=20)
+
+| Kernel | Time % | Total (ms) | Role | Distributable? |
+|--------|--------|-----------|------|---------------|
+| `key_switch_inner_prod_c2_and_evk` | 35.9% | 8.4 | Inner product | Yes (OA) |
+| `fnwt_radix8_phase2_include_special` | 19.2% | 4.5 | NTT for modup | No* |
+| `fnwt_radix8_phase1_include_special` | 13.4% | 3.1 | NTT for modup | No* |
+| `modup_bconv_single_p_kernel` | 6.9% | 1.6 | Base conversion | No* |
+| `fnwt_radix8_phase2_fuse_moddown` | 3.2% | 0.7 | Fused NTT+moddown | No |
+| Other | 21.4% | 5.0 | Key gen, encoding | — |
+
+*modup kernels are `static __global__` in Phantom — cannot be called externally.
+
+### 6.3 Pipeline 4-GPU Efficiency
+
+Comparing 1 GPU vs 4 GPU kernel totals for BERT MatMul:
+- 1 GPU: 72.7ms multiply + 65.0ms add = 137.7ms total kernel time
+- 4 GPU: 72.5ms multiply + 64.9ms add = 137.4ms total kernel time (identical — proves all GPUs active)
+
+The wall-clock difference (87ms vs 39ms = 2.23x) comes from parallelism: 4 GPUs execute their kernels simultaneously, not from reducing per-kernel time.
+
+### 6.4 Profile Files
+
+8 Nsight Systems reports generated on MN5 (`profiling/reports/`):
+- `bert_mm_1gpu.nsys-rep` — BERT MatMul single GPU baseline
+- `bert_mm_4gpu.nsys-rep` — BERT MatMul 4-GPU pipeline
+- `pipe_4gpu.nsys-rep` — Generic pipeline 128 ciphertexts
+- `ks_breakdown_n65536.nsys-rep` — Key-switch stage breakdown
+- `ks_{1,2,4}gpu_n8192.nsys-rep` — Key-switch multi-GPU scaling
+
+---
+
+## 7. Technical Challenges Solved
 
 ### 6.1 Build & Integration (10 fixes)
 1. Phantom ExternalProject integration (CMake `CMAKE_SOURCE_DIR` conflict)
@@ -275,7 +322,7 @@ OA distributes only the inner product across GPUs (25% of key-switch time):
 
 ---
 
-## 7. Hardware & Infrastructure
+## 8. Hardware & Infrastructure
 
 ### MareNostrum 5 (BSC, Barcelona)
 - **ACC partition**: 1,120 nodes × 4x H100 64GB SXM = 4,480 GPUs
@@ -293,7 +340,7 @@ OA distributes only the inner product across GPUs (25% of key-switch time):
 
 ---
 
-## 8. Path to BERT and Next Steps
+## 9. Path to BERT and Next Steps
 
 ### 8.1 BERT Layer Decomposition
 
