@@ -106,7 +106,7 @@ endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(NCCL_FOUND)
-    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling)
+    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench)
         if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/${bench}.cu)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)
