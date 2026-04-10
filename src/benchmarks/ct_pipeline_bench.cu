@@ -124,17 +124,20 @@ int main(int argc, char **argv) {
     }
     printf("   Created %d ciphertexts in %.1f ms\n", cfg.n_cts, timer.elapsed_ms());
 
-    // The operation: multiply_plain + relinearize + rescale
-    // This is the core loop of BERT MatMul's column processing
+    // Workload per ciphertext: multiply_plain + rescale (1 level consumed).
+    // Then 20x add_plain to simulate heavy accumulation (no level cost).
+    // Total: ~22 kernel launches per ct — enough to saturate H100.
     auto process_ct = [&](PhantomContext &c, PhantomCiphertext &ct,
                           PhantomRelinKey &r, PhantomCKKSEncoder &e) {
-        // multiply_plain: ct * plain
-        PhantomPlaintext local_plain;
-        e.encode(c, plain_data, ct.scale(), local_plain);
-        multiply_plain_inplace(c, ct, local_plain);
-        // No relinearize needed for multiply_plain (stays size 2)
-        // rescale to next level
+        PhantomPlaintext lp;
+        e.encode(c, plain_data, ct.scale(), lp);
+        multiply_plain_inplace(c, ct, lp);
         rescale_to_next_inplace(c, ct);
+        // Re-encode at new scale
+        e.encode(c, plain_data, ct.scale(), lp);
+        for (int rep = 0; rep < 20; rep++) {
+            add_plain_inplace(c, ct, lp);
+        }
     };
 
     // === GROUND TRUTH: single GPU, serial ===
@@ -270,11 +273,7 @@ int main(int argc, char **argv) {
 
         // Warmup
         for (int w = 0; w < cfg.warmup; w++) {
-            for (auto &ct : batch) {
-                PhantomPlaintext lp;
-                enc.encode(ctx0, plain_data, ct.scale(), lp);
-                multiply_plain_inplace(ctx0, ct, lp);
-            }
+            for (auto &ct : batch) process_ct(ctx0, ct, rk, enc);
             cudaDeviceSynchronize();
             // Re-encrypt for next warmup
             for (int i = 0; i < cfg.n_cts; i++)
@@ -282,11 +281,7 @@ int main(int argc, char **argv) {
         }
 
         timer.start();
-        for (auto &ct : batch) {
-            PhantomPlaintext lp;
-            enc.encode(ctx0, plain_data, ct.scale(), lp);
-            multiply_plain_inplace(ctx0, ct, lp);
-        }
+        for (auto &ct : batch) process_ct(ctx0, ct, rk, enc);
         cudaDeviceSynchronize();
         gt_compute = timer.elapsed_ms();
         printf("   GT compute-only (%d cts, 1 GPU): %.2f ms\n", cfg.n_cts, gt_compute);
@@ -306,11 +301,7 @@ int main(int argc, char **argv) {
         for (int w = 0; w < cfg.warmup; w++) {
             pipe.execute([&](int gpu, PhantomContext &c, PhantomRelinKey &r,
                              PhantomCKKSEncoder &e, vector<PhantomCiphertext> &local) {
-                for (auto &ct : local) {
-                    PhantomPlaintext lp;
-                    e.encode(c, plain_data, ct.scale(), lp);
-                    multiply_plain_inplace(c, ct, lp);
-                }
+                for (auto &ct : local) process_ct(c, ct, r, e);
             });
             // Re-scatter for next warmup
             pipe.scatter(batch);
@@ -319,11 +310,7 @@ int main(int argc, char **argv) {
         timer.start();
         pipe.execute([&](int gpu, PhantomContext &c, PhantomRelinKey &r,
                          PhantomCKKSEncoder &e, vector<PhantomCiphertext> &local) {
-            for (auto &ct : local) {
-                PhantomPlaintext lp;
-                e.encode(c, plain_data, ct.scale(), lp);
-                multiply_plain_inplace(c, ct, lp);
-            }
+            for (auto &ct : local) process_ct(c, ct, r, e);
         });
         cudaSetDevice(0);
         cudaDeviceSynchronize();
