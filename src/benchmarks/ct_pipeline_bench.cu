@@ -124,18 +124,17 @@ int main(int argc, char **argv) {
     }
     printf("   Created %d ciphertexts in %.1f ms\n", cfg.n_cts, timer.elapsed_ms());
 
-    // Workload per ciphertext: multiply_plain + rescale (1 level consumed).
-    // Then 20x add_plain to simulate heavy accumulation (no level cost).
-    // Total: ~22 kernel launches per ct — enough to saturate H100.
+    // Workload per ciphertext: simulates BERT MatMul column processing.
+    // multiply_plain + rescale + 10x add_plain accumulation.
+    // With --heavy flag: ct×ct multiply + relinearize (the real bottleneck).
     auto process_ct = [&](PhantomContext &c, PhantomCiphertext &ct,
                           PhantomRelinKey &r, PhantomCKKSEncoder &e) {
         PhantomPlaintext lp;
         e.encode(c, plain_data, ct.scale(), lp);
         multiply_plain_inplace(c, ct, lp);
         rescale_to_next_inplace(c, ct);
-        // Re-encode at new scale
         e.encode(c, plain_data, ct.scale(), lp);
-        for (int rep = 0; rep < 20; rep++) {
+        for (int rep = 0; rep < 10; rep++) {
             add_plain_inplace(c, ct, lp);
         }
     };
