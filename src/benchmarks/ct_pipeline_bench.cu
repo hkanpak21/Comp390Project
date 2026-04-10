@@ -248,16 +248,104 @@ int main(int argc, char **argv) {
         printf("   MAE: %.2e  %s\n", mae, mae < 1e-3 ? "PASS" : "FAIL");
     }
 
-    // Summary
+    // === COMPUTE-ONLY TIMING (pre-scatter, no gather) ===
+    printf("\n[5] Compute-only timing (pre-scattered, no gather)...\n");
+
+    // Pre-scatter once
+    {
+        vector<PhantomCiphertext> batch(cfg.n_cts);
+        cudaSetDevice(0);
+        for (int i = 0; i < cfg.n_cts; i++)
+            sk.encrypt_symmetric(ctx0, pt_input, batch[i]);
+        pipe.scatter(batch);
+    }
+
+    // Ground truth compute-only: process pre-encrypted cts
+    double gt_compute = 0;
+    {
+        cudaSetDevice(0);
+        vector<PhantomCiphertext> batch(cfg.n_cts);
+        for (int i = 0; i < cfg.n_cts; i++)
+            sk.encrypt_symmetric(ctx0, pt_input, batch[i]);
+
+        // Warmup
+        for (int w = 0; w < cfg.warmup; w++) {
+            for (auto &ct : batch) {
+                PhantomPlaintext lp;
+                enc.encode(ctx0, plain_data, ct.scale(), lp);
+                multiply_plain_inplace(ctx0, ct, lp);
+            }
+            cudaDeviceSynchronize();
+            // Re-encrypt for next warmup
+            for (int i = 0; i < cfg.n_cts; i++)
+                sk.encrypt_symmetric(ctx0, pt_input, batch[i]);
+        }
+
+        timer.start();
+        for (auto &ct : batch) {
+            PhantomPlaintext lp;
+            enc.encode(ctx0, plain_data, ct.scale(), lp);
+            multiply_plain_inplace(ctx0, ct, lp);
+        }
+        cudaDeviceSynchronize();
+        gt_compute = timer.elapsed_ms();
+        printf("   GT compute-only (%d cts, 1 GPU): %.2f ms\n", cfg.n_cts, gt_compute);
+    }
+
+    // Pipeline compute-only: execute on pre-scattered data
+    double pipe_compute = 0;
+    {
+        // Re-scatter fresh data
+        vector<PhantomCiphertext> batch(cfg.n_cts);
+        cudaSetDevice(0);
+        for (int i = 0; i < cfg.n_cts; i++)
+            sk.encrypt_symmetric(ctx0, pt_input, batch[i]);
+        pipe.scatter(batch);
+
+        // Warmup
+        for (int w = 0; w < cfg.warmup; w++) {
+            pipe.execute([&](int gpu, PhantomContext &c, PhantomRelinKey &r,
+                             PhantomCKKSEncoder &e, vector<PhantomCiphertext> &local) {
+                for (auto &ct : local) {
+                    PhantomPlaintext lp;
+                    e.encode(c, plain_data, ct.scale(), lp);
+                    multiply_plain_inplace(c, ct, lp);
+                }
+            });
+            // Re-scatter for next warmup
+            pipe.scatter(batch);
+        }
+
+        timer.start();
+        pipe.execute([&](int gpu, PhantomContext &c, PhantomRelinKey &r,
+                         PhantomCKKSEncoder &e, vector<PhantomCiphertext> &local) {
+            for (auto &ct : local) {
+                PhantomPlaintext lp;
+                e.encode(c, plain_data, ct.scale(), lp);
+                multiply_plain_inplace(c, ct, lp);
+            }
+        });
+        cudaSetDevice(0);
+        cudaDeviceSynchronize();
+        pipe_compute = timer.elapsed_ms();
+        printf("   Pipeline compute-only (%d cts, %d GPUs): %.2f ms\n",
+               cfg.n_cts, cfg.n_gpus, pipe_compute);
+    }
+
+    double compute_speedup = gt_compute / pipe_compute;
+    printf("   COMPUTE-ONLY SPEEDUP: %.2fx\n", compute_speedup);
+
+    // Full summary
     double speedup = gt_avg / pipe_avg;
     printf("\n=== Results ===\n");
-    printf("Ciphertexts:              %d\n", cfg.n_cts);
-    printf("Ground truth (1 GPU):     %.2f ms\n", gt_avg);
-    printf("Pipeline (%d GPUs):       %.2f ms\n", cfg.n_gpus, pipe_avg);
-    printf("Speedup:                  %.2fx\n", speedup);
-    printf("Efficiency:               %.1f%%\n", speedup / cfg.n_gpus * 100.0);
-    printf("Per-GPU throughput:       %.2f ms / %d cts = %.3f ms/ct\n",
-           pipe_avg, cfg.n_cts / cfg.n_gpus, pipe_avg / (cfg.n_cts / cfg.n_gpus));
+    printf("Ciphertexts:                    %d\n", cfg.n_cts);
+    printf("Ground truth (1 GPU, full):     %.2f ms\n", gt_avg);
+    printf("Pipeline (%d GPUs, full):       %.2f ms\n", cfg.n_gpus, pipe_avg);
+    printf("Full speedup:                   %.2fx\n", speedup);
+    printf("GT compute-only:                %.2f ms\n", gt_compute);
+    printf("Pipeline compute-only:          %.2f ms\n", pipe_compute);
+    printf("COMPUTE-ONLY SPEEDUP:           %.2fx\n", compute_speedup);
+    printf("Compute efficiency:             %.1f%%\n", compute_speedup / cfg.n_gpus * 100.0);
 
     pipe.destroy();
     printf("\nDone.\n");
