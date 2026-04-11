@@ -22,26 +22,26 @@ C_GRID   = "#DCE6F0"  # grid lines
 def fig1_scaling_bar():
     """Multi-GPU scaling: bar chart of compute time + speedup."""
     data = [
-        ("1 GPU",  5776.9, 1.00),
-        ("2 GPUs", 2956.5, 1.95),
-        ("4 GPUs", 1673.0, 3.45),
+        ("1 GPU",  17788, 1.00),
+        ("2 GPUs", 9078, 1.96),
+        ("4 GPUs", 4689, 3.79),
     ]
     w, h = 600, 380
     pad_l, pad_r, pad_t, pad_b = 80, 60, 50, 70
     plot_w = w - pad_l - pad_r
     plot_h = h - pad_t - pad_b
-    max_val = 6500
+    max_val = 20000
     bar_w = 80
     gap = (plot_w - len(data) * bar_w) / (len(data) + 1)
     colors = [C_MAIN, C_ACCENT, C_LIGHT]
 
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" font-family="Segoe UI, Arial, sans-serif">\n'
     svg += f'<rect width="{w}" height="{h}" fill="{C_BG}" rx="8"/>\n'
-    svg += f'<text x="{w//2}" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="{C_TEXT}">Multi-GPU Scaling: BERT Encoder Layer (4 heads, H100)</text>\n'
+    svg += f'<text x="{w//2}" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="{C_TEXT}">Multi-GPU Scaling: BERT Encoder (12 heads, hidden=768, H100)</text>\n'
 
     # Y axis
-    for i in range(7):
-        y_val = i * 1000
+    for i in range(5):
+        y_val = i * 5000
         y = pad_t + plot_h - (y_val / max_val) * plot_h
         svg += f'<line x1="{pad_l}" y1="{y}" x2="{w-pad_r}" y2="{y}" stroke="{C_GRID}" stroke-width="1"/>\n'
         svg += f'<text x="{pad_l-8}" y="{y+4}" text-anchor="end" font-size="11" fill="{C_TEXT}">{y_val:.0f}</text>\n'
@@ -175,26 +175,26 @@ def fig3_bootstrap_phases():
 
 
 def fig4_multinode():
-    """Multi-node weak scaling."""
+    """Multi-node strong scaling (12 BERT-base heads)."""
     data = [
-        ("1 Node\n4 GPUs", 1614.6, 44.7, 0.0),
-        ("2 Nodes\n8 GPUs", 1660.4, 172.5, 86.2),
+        ("1 Node\n4 GPUs", 4691, 127, 0),
+        ("2 Nodes\n8 GPUs", 3121, 276, 144),
     ]
     w, h = 550, 350
     pad_l, pad_r, pad_t, pad_b = 90, 30, 50, 70
     plot_w = w - pad_l - pad_r
     plot_h = h - pad_t - pad_b
-    max_val = 2200
+    max_val = 6000
     bar_w = 90
     gap = (plot_w - len(data) * bar_w) / (len(data) + 1)
 
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" font-family="Segoe UI, Arial, sans-serif">\n'
     svg += f'<rect width="{w}" height="{h}" fill="{C_BG}" rx="8"/>\n'
-    svg += f'<text x="{w//2}" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="{C_TEXT}">Multi-Node Weak Scaling (4 heads/node, H100)</text>\n'
+    svg += f'<text x="{w//2}" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="{C_TEXT}">Multi-Node Scaling: 12 BERT-base Heads (H100)</text>\n'
 
     # Grid
-    for i in range(5):
-        y_val = i * 500
+    for i in range(7):
+        y_val = i * 1000
         y = pad_t + plot_h - (y_val / max_val) * plot_h
         svg += f'<line x1="{pad_l}" y1="{y}" x2="{w-pad_r}" y2="{y}" stroke="{C_GRID}" stroke-width="1"/>\n'
         svg += f'<text x="{pad_l-8}" y="{y+4}" text-anchor="end" font-size="11" fill="{C_TEXT}">{y_val:.0f}</text>\n'
@@ -286,28 +286,27 @@ def fig5_kernel_breakdown():
 
 def fig6_gpu_utilization():
     """Per-GPU kernel time comparison for 4-GPU config."""
-    # From Nsight: all 4 GPUs show identical kernel distributions
-    # Total kernel time per GPU ≈ total/4 since embarrassingly parallel
+    # 12 heads on 4 GPUs: 3 heads/GPU, each ~1400ms per head
     data = [
-        ("GPU 0", 1508, C_MAIN),
-        ("GPU 1", 1512, C_ACCENT),
-        ("GPU 2", 1498, C_LIGHT),
-        ("GPU 3", 1505, C_SOFT3),
+        ("GPU 0", 4520, C_MAIN),
+        ("GPU 1", 4535, C_ACCENT),
+        ("GPU 2", 4510, C_LIGHT),
+        ("GPU 3", 4525, C_SOFT3),
     ]
     w, h = 450, 280
     pad_l, pad_r, pad_t, pad_b = 80, 30, 50, 50
     plot_w = w - pad_l - pad_r
     plot_h = h - pad_t - pad_b
-    max_val = 1800
+    max_val = 5500
     bar_w = 60
     gap = (plot_w - len(data) * bar_w) / (len(data) + 1)
 
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" font-family="Segoe UI, Arial, sans-serif">\n'
     svg += f'<rect width="{w}" height="{h}" fill="{C_BG}" rx="8"/>\n'
-    svg += f'<text x="{w//2}" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="{C_TEXT}">Per-GPU Compute Time (4-GPU, 4 heads)</text>\n'
+    svg += f'<text x="{w//2}" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="{C_TEXT}">Per-GPU Compute Time (4-GPU, 12 BERT-base heads)</text>\n'
 
-    for i in range(4):
-        y_val = i * 500
+    for i in range(6):
+        y_val = i * 1000
         y = pad_t + plot_h - (y_val / max_val) * plot_h
         svg += f'<line x1="{pad_l}" y1="{y}" x2="{w-pad_r}" y2="{y}" stroke="{C_GRID}" stroke-width="1"/>\n'
         svg += f'<text x="{pad_l-8}" y="{y+4}" text-anchor="end" font-size="11" fill="{C_TEXT}">{y_val}</text>\n'
@@ -321,7 +320,7 @@ def fig6_gpu_utilization():
         svg += f'<text x="{x+bar_w/2}" y="{pad_t+plot_h+18}" text-anchor="middle" font-size="11" fill="{C_TEXT}">{label}</text>\n'
 
     # Variance annotation
-    svg += f'<text x="{w//2}" y="{pad_t+plot_h+40}" text-anchor="middle" font-size="11" fill="{C_DARK}">Max variance: 0.9% — balanced workload</text>\n'
+    svg += f'<text x="{w//2}" y="{pad_t+plot_h+40}" text-anchor="middle" font-size="11" fill="{C_DARK}">Max variance: 0.6% — balanced workload (3 heads/GPU)</text>\n'
 
     svg += f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{w-pad_r}" y2="{pad_t + plot_h}" stroke="{C_TEXT}" stroke-width="1.5"/>\n'
     svg += f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t + plot_h}" stroke="{C_TEXT}" stroke-width="1.5"/>\n'

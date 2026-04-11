@@ -336,15 +336,15 @@ Complete layer with all 14 operations and 4x real bootstrapping:
 
 ### 5.3 Multi-GPU Scaling (Single Node, 4x H100)
 
-Per-head pipeline parallelism: each GPU creates its own PhantomContext, keys, and bootstrapper, then processes its assigned heads independently.
+Per-head pipeline parallelism with **BERT-base 12 attention heads** (hidden=768, inner=64). Each GPU creates its own PhantomContext, keys, and bootstrapper, then processes its assigned heads independently.
 
 > **Figure**: [fig1_multigpu_scaling.svg](fig1_multigpu_scaling.svg)
 
-| GPUs | Heads per GPU | Compute (ms) | Speedup | Efficiency |
-|------|--------------|-------------|---------|------------|
-| 1 | 4 | 5,776.9 | 1.00x | - |
-| 2 | 2 | 2,956.5 | **1.95x** | **97.7%** |
-| 4 | 1 | 1,673.0 | **3.45x** | **86.3%** |
+| GPUs | Heads/GPU | Compute (ms) | Speedup | Efficiency |
+|------|-----------|-------------|---------|------------|
+| 1 | 12 | 17,788 | 1.00x | — |
+| 2 | 6 | 9,078 | **1.96x** | **98.0%** |
+| 4 | 3 | 4,689 | **3.79x** | **94.8%** |
 
 **Nsight per-GPU kernel time (4-GPU configuration)**:
 
@@ -366,18 +366,20 @@ All 4 GPUs show identical kernel distributions — validates balanced workload w
 
 ### 5.4 Multi-Node Scaling (MPI + Per-GPU Threading)
 
-Weak scaling: double the heads when doubling the nodes. Each node processes 4 heads on 4 GPUs.
+12 BERT-base heads distributed across nodes. Each node runs 4 GPUs with per-thread PhantomContexts.
 
-| Nodes | GPUs | Heads | Compute (ms) | Scatter (ms) | Gather (ms) | Total (ms) |
-|-------|------|-------|-------------|-------------|-------------|-----------|
-| 1 | 4 | 4 | 1,614.6 | 44.7 | 0.0 | 1,659.3 |
-| 2 | 8 | 8 | 1,660.4 | 172.5 | 86.2 | 1,919.1 |
+**Strong scaling (fixed 12 heads):**
 
-**Compute stays flat at ~1,615 ms** — perfect weak scaling. Communication grows linearly with nodes but remains small (172ms scatter for serializing 4 ciphertexts over InfiniBand).
+| Nodes | GPUs | Heads/Node | Compute (ms) | Scatter (ms) | Gather (ms) |
+|-------|------|-----------|-------------|-------------|-------------|
+| 1 | 4 | 12 | 4,691 | 127 | 0 |
+| 2 | 8 | 6 | 3,121 | 276 | 144 |
+
+**Compute speedup**: 4,691 / 3,121 = **1.50x at 2 nodes** — each node processes 6 heads instead of 12, with 3 heads per GPU. The sub-2x scaling is because each 4-GPU node already has 3 heads/GPU (near-optimal load), so adding a second node only reduces each node's load from 3 to 1.5 heads/GPU — the 0.5 head creates imbalance (some GPUs get 2 heads, others 1).
 
 > **Figure**: [fig4_multinode_scaling.svg](fig4_multinode_scaling.svg)
 
-**Communication breakdown**: At 2 nodes, MPI scatter serializes 4 ciphertexts (~21 MB each = 84 MB) via `PhantomCiphertext::save()` (GPU→CPU memcpy + binary stream write) then `MPI_Send` over InfiniBand NDR200. The 172ms is dominated by GPU→CPU transfer in `save()`, not by network bandwidth (InfiniBand could transfer 84 MB in ~3.4ms at 200 Gb/s).
+**Communication overhead**: At 2 nodes, MPI scatter serializes 6 ciphertexts (~21 MB each = 126 MB) via `PhantomCiphertext::save()` (GPU→CPU memcpy + binary write) then `MPI_Send` over InfiniBand NDR200. The 276ms is dominated by GPU→CPU transfer in `save()`, not by network bandwidth (InfiniBand could transfer 126 MB in ~5ms at 200 Gb/s). GPUDirect RDMA would reduce scatter to ~10ms.
 
 ### 5.5 Nsight Systems Profiling
 

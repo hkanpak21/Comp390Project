@@ -1,36 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="600" height="380" font-family="Segoe UI, Arial, sans-serif">
 <rect width="600" height="380" fill="#F5F8FC" rx="8"/>
-<text x="300" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="#2C3E50">Multi-GPU Scaling: BERT Encoder Layer (4 heads, H100)</text>
+<text x="300" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="#2C3E50">Multi-GPU Scaling: BERT Encoder (12 heads, hidden=768, H100)</text>
 <line x1="80" y1="310.0" x2="540" y2="310.0" stroke="#DCE6F0" stroke-width="1"/>
 <text x="72" y="314.0" text-anchor="end" font-size="11" fill="#2C3E50">0</text>
-<line x1="80" y1="270.0" x2="540" y2="270.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="274.0" text-anchor="end" font-size="11" fill="#2C3E50">1000</text>
-<line x1="80" y1="230.0" x2="540" y2="230.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="234.0" text-anchor="end" font-size="11" fill="#2C3E50">2000</text>
-<line x1="80" y1="190.0" x2="540" y2="190.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="194.0" text-anchor="end" font-size="11" fill="#2C3E50">3000</text>
-<line x1="80" y1="150.0" x2="540" y2="150.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="154.0" text-anchor="end" font-size="11" fill="#2C3E50">4000</text>
-<line x1="80" y1="110.0" x2="540" y2="110.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="114.0" text-anchor="end" font-size="11" fill="#2C3E50">5000</text>
-<line x1="80" y1="70.0" x2="540" y2="70.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="74.0" text-anchor="end" font-size="11" fill="#2C3E50">6000</text>
+<line x1="80" y1="245.0" x2="540" y2="245.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="249.0" text-anchor="end" font-size="11" fill="#2C3E50">5000</text>
+<line x1="80" y1="180.0" x2="540" y2="180.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="184.0" text-anchor="end" font-size="11" fill="#2C3E50">10000</text>
+<line x1="80" y1="115.0" x2="540" y2="115.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="119.0" text-anchor="end" font-size="11" fill="#2C3E50">15000</text>
+<line x1="80" y1="50.0" x2="540" y2="50.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="54.0" text-anchor="end" font-size="11" fill="#2C3E50">20000</text>
 <text x="30" y="180" text-anchor="middle" font-size="12" fill="#2C3E50" transform="rotate(-90,30,180)">Compute Time (ms)</text>
-<rect x="135.0" y="78.924" width="80" height="231.076" fill="#4682B4" rx="4"/>
-<text x="175.0" y="56.92400000000001" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">5777 ms</text>
-<text x="175.0" y="70.924" text-anchor="middle" font-size="11" fill="#36648B">1.00x</text>
+<rect x="135.0" y="78.756" width="80" height="231.244" fill="#4682B4" rx="4"/>
+<text x="175.0" y="56.756" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">17788 ms</text>
+<text x="175.0" y="70.756" text-anchor="middle" font-size="11" fill="#36648B">1.00x</text>
 <text x="175.0" y="328" text-anchor="middle" font-size="12" fill="#2C3E50">1 GPU</text>
-<rect x="270.0" y="191.74" width="80" height="118.26" fill="#5B9BD5" rx="4"/>
-<text x="310.0" y="169.74" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">2956 ms</text>
-<text x="310.0" y="183.74" text-anchor="middle" font-size="11" fill="#36648B">1.95x</text>
+<rect x="270.0" y="191.986" width="80" height="118.01400000000001" fill="#5B9BD5" rx="4"/>
+<text x="310.0" y="169.986" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">9078 ms</text>
+<text x="310.0" y="183.986" text-anchor="middle" font-size="11" fill="#36648B">1.96x</text>
 <text x="310.0" y="328" text-anchor="middle" font-size="12" fill="#2C3E50">2 GPUs</text>
-<rect x="405.0" y="243.07999999999998" width="80" height="66.92" fill="#B0C4DE" rx="4"/>
-<text x="445.0" y="221.07999999999998" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">1673 ms</text>
-<text x="445.0" y="235.07999999999998" text-anchor="middle" font-size="11" fill="#36648B">3.45x</text>
+<rect x="405.0" y="249.043" width="80" height="60.957" fill="#B0C4DE" rx="4"/>
+<text x="445.0" y="227.043" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">4689 ms</text>
+<text x="445.0" y="241.043" text-anchor="middle" font-size="11" fill="#36648B">3.79x</text>
 <text x="445.0" y="328" text-anchor="middle" font-size="12" fill="#2C3E50">4 GPUs</text>
 <line x1="80" y1="310" x2="540" y2="310" stroke="#2C3E50" stroke-width="1.5"/>
 <line x1="80" y1="50" x2="80" y2="310" stroke="#2C3E50" stroke-width="1.5"/>
-<line x1="175.0" y1="78.924" x2="310.0" y2="194.462" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
-<line x1="310.0" y1="194.462" x2="445.0" y2="232.97466666666668" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
+<line x1="175.0" y1="78.756" x2="310.0" y2="194.378" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
+<line x1="310.0" y1="194.378" x2="445.0" y2="232.91866666666667" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
 <text x="535" y="65" text-anchor="end" font-size="10" fill="#36648B">--- ideal linear</text>
 </svg>
