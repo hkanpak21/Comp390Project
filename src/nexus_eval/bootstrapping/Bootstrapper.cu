@@ -2985,31 +2985,18 @@ void Bootstrapper::bootstrap_full(PhantomCiphertext &rtncipher, PhantomCiphertex
 }
 
 void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher) {
-  // ModRaise
-  auto timer = Timer();
-
-  std::cout << "Modulus Raising... ";
+  // ModRaise — no timing overhead
   modraise_inplace(cipher);
-
-  timer.stop();
-  std::cout << timer.duration<milliseconds>() << "ms\n";
-  // ckks->print_decrypted_ct(cipher, 10);
 
   const auto modulus = ckks->context->first_context_data().parms().coeff_modulus();
   cipher.scale() = ((double)modulus[0].value());
 
-  timer.start();
-
-  std::cout << "Subsum... ";
+  // Subsum
   PhantomCiphertext rot;
   for (auto i = logn; i < logNh; i++) {
     ckks->evaluator.rotate_vector(cipher, (1 << i), *(ckks->galois_keys), rot);
     ckks->evaluator.add_inplace(cipher, rot);
   }
-
-  timer.stop();
-  std::cout << timer.duration<milliseconds>() << "ms\n";
-  // ckks->print_decrypted_ct(cipher, 10);
 
   PhantomCiphertext rtn;
   if (logn == 0) {
@@ -3026,30 +3013,14 @@ void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphe
     PhantomCiphertext conjrtn;
     ckks->evaluator.complex_conjugate(rtn, *(ckks->galois_keys), conjrtn);
     ckks->evaluator.add_inplace_reduced_error(rtn, conjrtn);
-  }
-
-  // Coefficient to Slots
-  else {
-    timer.start();
-
-    std::cout << "Coeff-to-slot... ";
+  } else {
+    // Coefficient to Slots
     coefftoslot_3(rtn, cipher);
-
-    timer.stop();
-    std::cout << timer.duration<milliseconds>() << "ms\n";
-    // ckks->print_decrypted_ct(rtn, 10);
   }
 
   // Modular Reduction
-  timer.start();
-
-  std::cout << "Modular reduction... ";
   PhantomCiphertext modrtn;
   mod_reducer->modular_reduction(modrtn, rtn);
-
-  timer.stop();
-  std::cout << timer.duration<milliseconds>() << "ms\n";
-  // ckks->print_decrypted_ct(modrtn, 10);
 
   if (logn == 0) {
     const auto modulus = ckks->context->first_context_data().parms().coeff_modulus();
@@ -3073,18 +3044,9 @@ void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphe
     PhantomCiphertext rotrtncipher;
     ckks->evaluator.rotate_vector(rtncipher, 1, *(ckks->galois_keys), rotrtncipher);
     ckks->evaluator.add_inplace_reduced_error(rtncipher, rotrtncipher);
-  }
-
-  // Slots to Coefficients
-  else {
-    timer.start();
-
-    std::cout << "Slot-to-coeff... ";
+  } else {
+    // Slots to Coefficients
     slottocoeff_3(rtncipher, modrtn);
-
-    timer.stop();
-    std::cout << timer.duration<milliseconds>() << "ms\n";
-    // ckks->print_decrypted_ct(rtncipher, 10);
   }
 
   rtncipher.scale() = final_scale;

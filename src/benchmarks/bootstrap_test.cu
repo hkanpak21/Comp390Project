@@ -65,9 +65,9 @@ int main() {
     int total_level = main_mod_count + bs_mod_count;
     int secret_key_hw = 192;  // NEXUS uses h=192
 
-    // Bootstrapping parameters
+    // Bootstrapping parameters — try lower degree for speed
     long boundary_K = 25;
-    long deg = 59;
+    long deg = 59;        // NEXUS default (lower values crash in polynomial generation)
     long scale_factor = 2;
     long inverse_deg = 1;
     long loge = 10;

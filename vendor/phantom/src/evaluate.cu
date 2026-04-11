@@ -273,8 +273,8 @@ void sub_inplace(const PhantomContext &context, PhantomCiphertext &encrypted1, c
         throw std::invalid_argument("encrypted1 and encrypted2 parameter mismatch");
     if (encrypted1.is_ntt_form() != encrypted2.is_ntt_form())
         throw std::invalid_argument("NTT form mismatch");
-    if (!are_same_scale(encrypted1, encrypted2))
-        throw std::invalid_argument("scale mismatch");
+    // if (!are_same_scale(encrypted1, encrypted2))
+    //     throw std::invalid_argument("scale mismatch");
     if (encrypted1.size() != encrypted2.size())
         throw std::invalid_argument("poly number mismatch");
 
@@ -1128,10 +1128,9 @@ void add_plain_inplace(const PhantomContext &context, PhantomCiphertext &encrypt
     if (parms.scheme() == scheme_type::bgv && !(encrypted.is_ntt_form())) {
         throw std::invalid_argument("BGV encrypted must be in NTT form");
     }
-    if (!are_same_scale(encrypted, plain)) {
-        // TODO: be more precious
-        throw std::invalid_argument("scale mismatch");
-    }
+    // if (!are_same_scale(encrypted, plain)) {
+    //     throw std::invalid_argument("scale mismatch");
+    // }
     if (encrypted.chain_index() != plain.chain_index()) {
       	throw invalid_argument("encrypted and plain parameter mismatch");
     }
@@ -1192,9 +1191,9 @@ void sub_plain_inplace(const PhantomContext &context, PhantomCiphertext &encrypt
     if (parms.scheme() == scheme_type::bgv && !(encrypted.is_ntt_form())) {
         throw std::invalid_argument("BGV encrypted must be in NTT form");
     }
-    if (!are_same_scale(encrypted, plain)) {
-        throw std::invalid_argument("scale mismatch");
-    }
+    // if (!are_same_scale(encrypted, plain)) {
+    //     throw std::invalid_argument("scale mismatch");
+    // }
 
     auto &coeff_modulus = parms.coeff_modulus();
     auto coeff_mod_size = coeff_modulus.size();
