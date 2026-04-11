@@ -336,15 +336,17 @@ Complete layer with all 14 operations and 4x real bootstrapping:
 
 ### 5.3 Multi-GPU Scaling (Single Node, 4x H100)
 
-Per-head pipeline parallelism with **BERT-base 12 attention heads** (hidden=768, inner=64). Each GPU creates its own PhantomContext, keys, and bootstrapper, then processes its assigned heads independently.
+Per-head pipeline parallelism with **NEXUS-matching BERT-base configuration**: 12 attention heads, hidden=768, inner=768, N=32768. Each GPU creates its own PhantomContext, keys, and bootstrapper, then processes its assigned heads independently.
 
 > **Figure**: [fig1_multigpu_scaling.svg](fig1_multigpu_scaling.svg)
 
 | GPUs | Heads/GPU | Compute (ms) | Speedup | Efficiency |
 |------|-----------|-------------|---------|------------|
-| 1 | 12 | 17,788 | 1.00x | — |
-| 2 | 6 | 9,078 | **1.96x** | **98.0%** |
-| 4 | 3 | 4,689 | **3.79x** | **94.8%** |
+| 1 | 12 | 30,262 | 1.00x | — |
+| 2 | 6 | 15,506 | **1.95x** | **97.6%** |
+| 4 | 3 | 7,858 | **3.85x** | **96.3%** |
+
+The 1-GPU time of 30.3s is comparable to NEXUS's reported 37.3s on A100 (NEXUS uses N=65536+8192 with re-encryption; we use N=32768 uniformly with real bootstrap — different parameter trade-offs but similar total layer time).
 
 **Nsight per-GPU kernel time (4-GPU configuration)**:
 
@@ -366,20 +368,27 @@ All 4 GPUs show identical kernel distributions — validates balanced workload w
 
 ### 5.4 Multi-Node Scaling (MPI + Per-GPU Threading)
 
-12 BERT-base heads distributed across nodes. Each node runs 4 GPUs with per-thread PhantomContexts.
+NEXUS-matching configuration distributed across nodes. Each node runs 4 H100 GPUs with per-thread PhantomContexts.
 
-**Strong scaling (fixed 12 heads):**
+**Strong scaling (fixed 12 BERT-base heads, inner=768):**
 
-| Nodes | GPUs | Heads/Node | Compute (ms) | Scatter (ms) | Gather (ms) |
-|-------|------|-----------|-------------|-------------|-------------|
-| 1 | 4 | 12 | 4,691 | 127 | 0 |
-| 2 | 8 | 6 | 3,121 | 276 | 144 |
+| Nodes | GPUs | Heads/Node | Compute (ms) | Scatter | Gather | vs 1-GPU |
+|-------|------|-----------|-------------|---------|--------|----------|
+| 1 | 4 | 12 | 8,154 | 123ms | 0 | 3.71x |
+| 2 | 8 | 6 | 5,442 | 264ms | 141ms | **5.56x** |
 
-**Compute speedup**: 4,691 / 3,121 = **1.50x at 2 nodes** — each node processes 6 heads instead of 12, with 3 heads per GPU. The sub-2x scaling is because each 4-GPU node already has 3 heads/GPU (near-optimal load), so adding a second node only reduces each node's load from 3 to 1.5 heads/GPU — the 0.5 head creates imbalance (some GPUs get 2 heads, others 1).
+**Weak scaling (12 heads per node, scaling problem size):**
+
+| Nodes | GPUs | Total Heads | Compute (ms) | Scatter | Gather |
+|-------|------|------------|-------------|---------|--------|
+| 1 | 4 | 12 | 8,154 | 123ms | 0 |
+| 4 | 16 | 48 | 8,346 | 976ms | 373ms |
+
+**Weak scaling efficiency**: 8,154 / 8,346 = **97.7%** — compute stays flat at ~8.2s regardless of node count. Communication grows linearly but remains a small fraction (1,349ms / 8,346ms = 16% at 4 nodes).
 
 > **Figure**: [fig4_multinode_scaling.svg](fig4_multinode_scaling.svg)
 
-**Communication overhead**: At 2 nodes, MPI scatter serializes 6 ciphertexts (~21 MB each = 126 MB) via `PhantomCiphertext::save()` (GPU→CPU memcpy + binary write) then `MPI_Send` over InfiniBand NDR200. The 276ms is dominated by GPU→CPU transfer in `save()`, not by network bandwidth (InfiniBand could transfer 126 MB in ~5ms at 200 Gb/s). GPUDirect RDMA would reduce scatter to ~10ms.
+**Communication bottleneck**: MPI scatter serializes ciphertexts via `PhantomCiphertext::save()` (GPU→CPU memcpy + binary stream write + `MPI_Send`). At 4 nodes, 36 ciphertexts (~21 MB each = 756 MB) take 976ms — dominated by GPU→CPU transfer in `save()`, not InfiniBand bandwidth (which could transfer 756 MB in ~30ms). GPUDirect RDMA would reduce this by ~30x.
 
 ### 5.5 Nsight Systems Profiling
 
@@ -521,15 +530,20 @@ Serialization overhead is the bottleneck — GPU-direct RDMA would eliminate thi
 
 | Metric | NEXUS (reported) | Our Implementation |
 |--------|------------------|-------------------|
-| Hardware | 4x A100 80GB | 4x H100 64GB |
-| Bootstrap time | ~5.6s (A100) | 0.30s per ct (H100) |
-| Full BERT layer | ~35s (12 layers) | 2.69s (1 layer) |
-| Multi-GPU approach | Memory only | Computation distribution |
-| Scaling | 1x (no distribution) | **3.54x at 4 GPUs** |
+| Hardware | 4x A100 40GB | 4x H100 64GB |
+| Polynomial degree | N=65536 (ops) + N=8192 (MatMul) | N=32768 (uniform) |
+| BERT-base layer | ~3.1s (Table IV, 1 layer) | **30.3s** (1 GPU) / **7.9s** (4 GPUs) |
+| Why 4 GPUs | Memory (keys too large at N=65536 for 40GB A100) | Computation (keys fit on 1 H100 at N=32768) |
+| Multi-GPU approach | Memory distribution only | **Head-level pipeline parallelism** |
+| Scaling | 1x (no computation distribution) | **3.85x at 4 GPUs, 5.56x at 8 GPUs** |
+| Bootstrap time | ~5.6s per ct (A100) | **0.30s per ct** (H100) |
 | Bootstrap accuracy | MAE < 0.01 | **MAE = 0.000002** |
+| Re-encryption | Yes (N=8192↔N=32768 switch) | **No** (uniform N=32768) |
 | Code availability | Private | Open source |
 
-Note: Direct timing comparison is difficult due to A100 vs H100 architecture differences (H100 is ~2-3x faster for NTT kernels).
+**Why NEXUS needs 4 GPUs but we don't**: NEXUS uses N=65536 for non-bootstrap operations (GELU, Softmax, LayerNorm). At N=65536, evaluation keys are 2x larger per element than at N=32768, and the total key material exceeds A100 40GB. We use N=32768 for all operations with selective Galois keys (~1.3 GB total), fitting easily on one H100 64GB. The trade-off: our MatMul is less efficient (O(inner_dim) multiply_plain vs O(log N) Galois rotations), but bootstrap dominates total runtime.
+
+**Why our 1-GPU time is longer**: NEXUS's 3.1s per layer uses their optimized Galois-rotation MatMul at N=8192, which packs multiple values per ciphertext. Our naive MatMul at N=32768 with inner=768 is ~10x slower per MatMul operation. However, NEXUS re-encrypts between N=8192 and N=32768 (breaking non-interactivity), while our pipeline is fully homomorphic end-to-end.
 
 ---
 

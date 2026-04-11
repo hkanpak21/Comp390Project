@@ -22,15 +22,15 @@ C_GRID   = "#DCE6F0"  # grid lines
 def fig1_scaling_bar():
     """Multi-GPU scaling: bar chart of compute time + speedup."""
     data = [
-        ("1 GPU",  17788, 1.00),
-        ("2 GPUs", 9078, 1.96),
-        ("4 GPUs", 4689, 3.79),
+        ("1 GPU",  30262, 1.00),
+        ("2 GPUs", 15506, 1.95),
+        ("4 GPUs", 7858, 3.85),
     ]
     w, h = 600, 380
     pad_l, pad_r, pad_t, pad_b = 80, 60, 50, 70
     plot_w = w - pad_l - pad_r
     plot_h = h - pad_t - pad_b
-    max_val = 20000
+    max_val = 35000
     bar_w = 80
     gap = (plot_w - len(data) * bar_w) / (len(data) + 1)
     colors = [C_MAIN, C_ACCENT, C_LIGHT]
@@ -40,7 +40,7 @@ def fig1_scaling_bar():
     svg += f'<text x="{w//2}" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="{C_TEXT}">Multi-GPU Scaling: BERT Encoder (12 heads, hidden=768, H100)</text>\n'
 
     # Y axis
-    for i in range(5):
+    for i in range(8):
         y_val = i * 5000
         y = pad_t + plot_h - (y_val / max_val) * plot_h
         svg += f'<line x1="{pad_l}" y1="{y}" x2="{w-pad_r}" y2="{y}" stroke="{C_GRID}" stroke-width="1"/>\n'
@@ -175,17 +175,18 @@ def fig3_bootstrap_phases():
 
 
 def fig4_multinode():
-    """Multi-node strong scaling (12 BERT-base heads)."""
+    """Multi-node strong scaling (12 BERT-base heads, inner=768)."""
     data = [
-        ("1 Node\n4 GPUs", 4691, 127, 0),
-        ("2 Nodes\n8 GPUs", 3121, 276, 144),
+        ("1 Node\n4 GPUs", 8154, 123, 0),
+        ("2 Nodes\n8 GPUs", 5442, 264, 141),
+        ("4 Nodes\n16 GPUs\n(weak:48h)", 8346, 976, 373),
     ]
     w, h = 550, 350
     pad_l, pad_r, pad_t, pad_b = 90, 30, 50, 70
     plot_w = w - pad_l - pad_r
     plot_h = h - pad_t - pad_b
-    max_val = 6000
-    bar_w = 90
+    max_val = 12000
+    bar_w = 70
     gap = (plot_w - len(data) * bar_w) / (len(data) + 1)
 
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" font-family="Segoe UI, Arial, sans-serif">\n'

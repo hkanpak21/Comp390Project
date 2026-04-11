@@ -3,30 +3,36 @@
 <text x="300" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="#2C3E50">Multi-GPU Scaling: BERT Encoder (12 heads, hidden=768, H100)</text>
 <line x1="80" y1="310.0" x2="540" y2="310.0" stroke="#DCE6F0" stroke-width="1"/>
 <text x="72" y="314.0" text-anchor="end" font-size="11" fill="#2C3E50">0</text>
-<line x1="80" y1="245.0" x2="540" y2="245.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="249.0" text-anchor="end" font-size="11" fill="#2C3E50">5000</text>
-<line x1="80" y1="180.0" x2="540" y2="180.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="184.0" text-anchor="end" font-size="11" fill="#2C3E50">10000</text>
-<line x1="80" y1="115.0" x2="540" y2="115.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="119.0" text-anchor="end" font-size="11" fill="#2C3E50">15000</text>
+<line x1="80" y1="272.8571428571429" x2="540" y2="272.8571428571429" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="276.8571428571429" text-anchor="end" font-size="11" fill="#2C3E50">5000</text>
+<line x1="80" y1="235.71428571428572" x2="540" y2="235.71428571428572" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="239.71428571428572" text-anchor="end" font-size="11" fill="#2C3E50">10000</text>
+<line x1="80" y1="198.57142857142858" x2="540" y2="198.57142857142858" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="202.57142857142858" text-anchor="end" font-size="11" fill="#2C3E50">15000</text>
+<line x1="80" y1="161.42857142857144" x2="540" y2="161.42857142857144" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="165.42857142857144" text-anchor="end" font-size="11" fill="#2C3E50">20000</text>
+<line x1="80" y1="124.28571428571428" x2="540" y2="124.28571428571428" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="128.28571428571428" text-anchor="end" font-size="11" fill="#2C3E50">25000</text>
+<line x1="80" y1="87.14285714285717" x2="540" y2="87.14285714285717" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="91.14285714285717" text-anchor="end" font-size="11" fill="#2C3E50">30000</text>
 <line x1="80" y1="50.0" x2="540" y2="50.0" stroke="#DCE6F0" stroke-width="1"/>
-<text x="72" y="54.0" text-anchor="end" font-size="11" fill="#2C3E50">20000</text>
+<text x="72" y="54.0" text-anchor="end" font-size="11" fill="#2C3E50">35000</text>
 <text x="30" y="180" text-anchor="middle" font-size="12" fill="#2C3E50" transform="rotate(-90,30,180)">Compute Time (ms)</text>
-<rect x="135.0" y="78.756" width="80" height="231.244" fill="#4682B4" rx="4"/>
-<text x="175.0" y="56.756" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">17788 ms</text>
-<text x="175.0" y="70.756" text-anchor="middle" font-size="11" fill="#36648B">1.00x</text>
+<rect x="135.0" y="85.19657142857145" width="80" height="224.80342857142855" fill="#4682B4" rx="4"/>
+<text x="175.0" y="63.196571428571445" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">30262 ms</text>
+<text x="175.0" y="77.19657142857145" text-anchor="middle" font-size="11" fill="#36648B">1.00x</text>
 <text x="175.0" y="328" text-anchor="middle" font-size="12" fill="#2C3E50">1 GPU</text>
-<rect x="270.0" y="191.986" width="80" height="118.01400000000001" fill="#5B9BD5" rx="4"/>
-<text x="310.0" y="169.986" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">9078 ms</text>
-<text x="310.0" y="183.986" text-anchor="middle" font-size="11" fill="#36648B">1.96x</text>
+<rect x="270.0" y="194.81257142857143" width="80" height="115.18742857142857" fill="#5B9BD5" rx="4"/>
+<text x="310.0" y="172.81257142857143" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">15506 ms</text>
+<text x="310.0" y="186.81257142857143" text-anchor="middle" font-size="11" fill="#36648B">1.95x</text>
 <text x="310.0" y="328" text-anchor="middle" font-size="12" fill="#2C3E50">2 GPUs</text>
-<rect x="405.0" y="249.043" width="80" height="60.957" fill="#B0C4DE" rx="4"/>
-<text x="445.0" y="227.043" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">4689 ms</text>
-<text x="445.0" y="241.043" text-anchor="middle" font-size="11" fill="#36648B">3.79x</text>
+<rect x="405.0" y="251.6262857142857" width="80" height="58.373714285714286" fill="#B0C4DE" rx="4"/>
+<text x="445.0" y="229.6262857142857" text-anchor="middle" font-size="12" font-weight="bold" fill="#2C3E50">7858 ms</text>
+<text x="445.0" y="243.6262857142857" text-anchor="middle" font-size="11" fill="#36648B">3.85x</text>
 <text x="445.0" y="328" text-anchor="middle" font-size="12" fill="#2C3E50">4 GPUs</text>
 <line x1="80" y1="310" x2="540" y2="310" stroke="#2C3E50" stroke-width="1.5"/>
 <line x1="80" y1="50" x2="80" y2="310" stroke="#2C3E50" stroke-width="1.5"/>
-<line x1="175.0" y1="78.756" x2="310.0" y2="194.378" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
-<line x1="310.0" y1="194.378" x2="445.0" y2="232.91866666666667" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
+<line x1="175.0" y1="85.19657142857145" x2="310.0" y2="197.59828571428574" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
+<line x1="310.0" y1="197.59828571428574" x2="445.0" y2="235.06552380952382" stroke="#36648B" stroke-width="1.5" stroke-dasharray="6,3"/>
 <text x="535" y="65" text-anchor="end" font-size="10" fill="#36648B">--- ideal linear</text>
 </svg>
