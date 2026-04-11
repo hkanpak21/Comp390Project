@@ -2,8 +2,8 @@
  * bert_encoder_multigpu.cu
  *
  * Multi-GPU BERT encoder layer with REAL bootstrapping.
- * Pipelines per-head processing across GPUs via CtPipeline.
- * Each GPU runs complete attention+FFN per head with 4× bootstrap.
+ * Each GPU thread creates its own PhantomContext, keys, encoder, and bootstrapper
+ * to avoid cross-thread CUDA stream issues with the NEXUS Phantom fork.
  *
  * Usage:
  *   ./bin/bert_encoder_multigpu --n-gpus 4 --heads 4 --inner 16
@@ -18,6 +18,10 @@
 #include <chrono>
 #include <random>
 #include <algorithm>
+#include <thread>
+#include <sstream>
+#include <atomic>
+#include <mutex>
 
 #include "context.cuh"
 #include "secretkey.h"
@@ -31,13 +35,11 @@
 #include "layer_norm.cuh"
 #include "matrix_mul.cuh"
 #include "bootstrapping/Bootstrapper.cuh"
-#include "../multi_gpu/pipeline/ct_pipeline.cuh"
 
 using namespace std;
 using namespace phantom;
 using namespace phantom::arith;
 using namespace nexus;
-using namespace nexus_multi_gpu;
 
 struct PerfTimer {
     chrono::high_resolution_clock::time_point t0;
@@ -94,32 +96,27 @@ int main(int argc, char **argv) {
     parms.set_sparse_slots(sparse_slots_val);
     parms.set_secret_key_hamming_weight(192);
 
-    cudaSetDevice(0);
-    PhantomContext ctx(parms);
-    PhantomCKKSEncoder enc(ctx);
-    PhantomSecretKey sk(ctx);
-    PhantomPublicKey pk = sk.gen_publickey(ctx);
-    PhantomRelinKey rk = sk.gen_relinkey(ctx);
-    size_t slots = enc.slot_count();
-
-    // Galois keys: bootstrap + operations
-    vector<int> gal_steps;
-    gal_steps.push_back(0);
-    for (int i = 0; i < logN - 1; i++) gal_steps.push_back(1 << i);
-    for (int i = 0; i < logN - 1; i++) gal_steps.push_back(-(1 << i));
-    gal_steps.push_back(-seq_len);
-    gal_steps.push_back(-hidden);
-
     long boundary_K = 25, deg = 59, scale_factor = 2, inverse_deg = 1, loge = 10;
 
-    // Minimal evaluator for encryption only (no Galois keys needed)
-    PhantomGaloisKey gk; // empty
-    CKKSEvaluator eval0(&ctx, &pk, &sk, &enc, &rk, &gk, SCALE);
+    // ═══ Setup on GPU 0: context, keys, encrypt input ═══
+    cudaSetDevice(0);
+    PhantomContext ctx0(parms);
+    PhantomCKKSEncoder enc0(ctx0);
+    PhantomSecretKey sk0(ctx0);
+    PhantomPublicKey pk0 = sk0.gen_publickey(ctx0);
+    PhantomRelinKey rk0 = sk0.gen_relinkey(ctx0);
+    PhantomGaloisKey gk0; // empty, not needed for encryption
+    size_t slots = enc0.slot_count();
 
-    // ═══ Weights (shared) ═══
+    CKKSEvaluator eval0(&ctx0, &pk0, &sk0, &enc0, &rk0, &gk0, SCALE);
+
+    // Serialize secret key for distribution to other GPUs
+    stringstream sk_buf;
+    sk0.save(sk_buf);
+
+    // Weights
     mt19937 rng(42);
     uniform_real_distribution<double> wdist(-0.02, 0.02), idist(-0.5, 0.5);
-
     auto make_w = [&]() {
         vector<vector<double>> w(inner, vector<double>(slots, 0.0));
         for (auto &r : w) for (size_t s = 0; s < std::min((size_t)hidden, slots); s++) r[s] = wdist(rng);
@@ -128,7 +125,7 @@ int main(int argc, char **argv) {
     auto W_q = make_w(), W_k = make_w(), W_v = make_w(), W_o = make_w();
     auto W_f1 = make_w(), W_f2 = make_w();
 
-    // ═══ Encrypt input ═══
+    // Encrypt input on GPU 0
     vector<PhantomCiphertext> X(n_heads);
     for (int i = 0; i < n_heads; i++) {
         vector<double> d(slots, 0.0);
@@ -137,70 +134,103 @@ int main(int argc, char **argv) {
         eval0.encoder.encode(d, SCALE, pt);
         eval0.encryptor.encrypt(pt, X[i]);
     }
-    // Mod-switch past bootstrap levels
     for (auto &ct : X)
         for (int i = 0; i < bs_mod; i++)
             eval0.evaluator.mod_switch_to_next_inplace(ct);
 
-    printf("[Setup] Encrypted %d heads, levels=%zu\n\n", n_heads, X[0].coeff_modulus_size());
+    printf("[Setup] Encrypted %d heads on GPU 0, levels=%zu\n\n", n_heads, X[0].coeff_modulus_size());
 
-    // ═══════════════════════════════════════════════════════════════
-    // MULTI-GPU PIPELINE
-    // ═══════════════════════════════════════════════════════════════
-    {
-        printf("═══ Multi-GPU Pipeline (%d GPUs) ═══\n", n_gpus);
+    // ═══ Serialize ciphertexts for distribution ═══
+    // Round-robin assignment: head i → GPU (i % n_gpus)
+    vector<vector<int>> gpu_heads(n_gpus);
+    for (int i = 0; i < n_heads; i++)
+        gpu_heads[i % n_gpus].push_back(i);
 
-        CtPipeline pipe = CtPipeline::create(parms, n_gpus, sk);
+    // Serialize each ct for transfer
+    vector<string> ct_data(n_heads);
+    for (int i = 0; i < n_heads; i++) {
+        stringstream ss;
+        X[i].save(ss);
+        ct_data[i] = ss.str();
+    }
 
-        // Galois keys will be generated per-GPU inside execute_full
-        // after bootstrapper adds its rotation steps
+    // ═══ Multi-GPU execution ═══
+    printf("═══ Running on %d GPUs ═══\n", n_gpus);
 
-        // Re-encrypt fresh input
-        vector<PhantomCiphertext> X2(n_heads);
-        for (int i = 0; i < n_heads; i++) {
-            vector<double> d(slots, 0.0);
-            for (size_t s = 0; s < std::min((size_t)hidden, slots); s++) d[s] = idist(rng);
-            PhantomPlaintext pt;
-            eval0.encoder.encode(d, SCALE, pt);
-            eval0.encryptor.encrypt(pt, X2[i]);
-        }
-        for (auto &ct : X2)
-            for (int i = 0; i < bs_mod; i++)
-                eval0.evaluator.mod_switch_to_next_inplace(ct);
+    // Per-GPU results
+    vector<vector<string>> gpu_results(n_gpus);
+    vector<thread> threads;
+    atomic<int> setup_done{0};
+    PerfTimer setup_timer, compute_timer;
 
-        timer.start();
-        pipe.scatter(X2);
+    setup_timer.start();
+    for (int g = 0; g < n_gpus; g++) {
+        threads.emplace_back([&, g]() {
+            cudaSetDevice(g);
 
-        pipe.execute_full([&](int gpu, PhantomContext &c, PhantomSecretKey &lsk,
-                              PhantomPublicKey &lpk, PhantomRelinKey &lrk,
-                              PhantomGaloisKey &lgk, PhantomCKKSEncoder &e,
-                              vector<PhantomCiphertext> &local) {
+            // Each GPU creates its OWN PhantomContext (sets default_stream for this thread)
+            PhantomContext ctx(parms);
+            PhantomCKKSEncoder enc(ctx);
 
-            CKKSEvaluator le(&c, &lpk, &lsk, &e, &lrk, &lgk, SCALE);
+            // Load secret key from serialized
+            PhantomSecretKey sk;
+            {
+                stringstream ss(sk_buf.str());
+                sk.load(ss);
+            }
+            PhantomPublicKey pk = sk.gen_publickey(ctx);
+            PhantomRelinKey rk = sk.gen_relinkey(ctx);
 
-            // Per-GPU bootstrapper setup
+            // Build Galois key steps: bootstrap + operations
+            vector<int> gsteps;
+            gsteps.push_back(0);
+            for (int i = 0; i < logN - 1; i++) gsteps.push_back(1 << i);
+            for (int i = 0; i < logN - 1; i++) gsteps.push_back(-(1 << i));
+            gsteps.push_back(-seq_len);
+            gsteps.push_back(-hidden);
+
+            PhantomGaloisKey gk = sk.create_galois_keys_from_steps(ctx, gsteps);
+            CKKSEvaluator le(&ctx, &pk, &sk, &enc, &rk, &gk, SCALE);
+
+            // Per-GPU bootstrapper
             Bootstrapper lb(loge, logn, logNh, total_level, SCALE,
                             boundary_K, deg, scale_factor, inverse_deg, &le);
             lb.slot_vec.push_back(logn);
             lb.prepare_mod_polynomial();
             lb.generate_LT_coefficient_3();
 
-            // Generate Galois keys with all rotation steps (bootstrap + operations)
-            vector<int> gpu_gal_steps;
-            gpu_gal_steps.push_back(0);
-            for (int i = 0; i < logN - 1; i++) gpu_gal_steps.push_back(1 << i);
-            for (int i = 0; i < logN - 1; i++) gpu_gal_steps.push_back(-(1 << i));
-            gpu_gal_steps.push_back(-seq_len);
-            gpu_gal_steps.push_back(-hidden);
-            lb.addLeftRotKeys_Linear_to_vector_3(gpu_gal_steps);
-            le.decryptor.create_galois_keys_from_steps(gpu_gal_steps, *le.galois_keys);
+            // Add bootstrap rotation steps to Galois keys
+            gsteps.clear();
+            gsteps.push_back(0);
+            for (int i = 0; i < logN - 1; i++) gsteps.push_back(1 << i);
+            for (int i = 0; i < logN - 1; i++) gsteps.push_back(-(1 << i));
+            gsteps.push_back(-seq_len);
+            gsteps.push_back(-hidden);
+            lb.addLeftRotKeys_Linear_to_vector_3(gsteps);
+            le.decryptor.create_galois_keys_from_steps(gsteps, *le.galois_keys);
+
+            printf("[GPU %d] Setup complete (%zu heads)\n", g, gpu_heads[g].size());
+
+            // Signal setup done and wait for all GPUs
+            int my_count = setup_done.fetch_add(1) + 1;
+            while (setup_done.load() < n_gpus) { /* spin */ }
+            // First GPU to pass barrier starts the compute timer
+            if (my_count == n_gpus) compute_timer.start();
 
             GELUEvaluator lg(le);
             SoftmaxEvaluator ls(le);
             LNEvaluator ll(le);
             MMEvaluator lm(le);
 
-            for (auto &ct : local) {
+            // Load and process assigned ciphertexts
+            for (int h_idx : gpu_heads[g]) {
+                // Deserialize ct
+                PhantomCiphertext ct;
+                {
+                    stringstream ss(ct_data[h_idx]);
+                    ct.load(ss);
+                }
+
                 // QKV
                 vector<PhantomCiphertext> xi = {ct}, q, k, v;
                 lm.matrix_mul_unified(xi, W_q, 1, q);
@@ -275,25 +305,31 @@ int main(int argc, char **argv) {
                 PhantomCiphertext b4;
                 lb.bootstrap_3(b4, ln2o);
 
-                ct = std::move(b4);
+                // Serialize result
+                stringstream ss;
+                b4.save(ss);
+                gpu_results[g].push_back(ss.str());
             }
+
+            cudaDeviceSynchronize();
+            printf("[GPU %d] Done\n", g);
         });
-
-        cudaSetDevice(0);
-        auto results = pipe.gather();
-        cudaDeviceSynchronize();
-        double total_pipe = timer.elapsed_ms();
-
-        printf("\n════════════════════════════════════════════════\n");
-        printf("  BERT Encoder Layer — Real Bootstrap (%d GPUs)\n", n_gpus);
-        printf("════════════════════════════════════════════════\n");
-        printf("  Heads: %d, GPUs: %d\n", n_heads, n_gpus);
-        printf("  Total:     %8.1f ms\n", total_pipe);
-        printf("  Per-head:  %8.1f ms\n", total_pipe);  // all heads parallel
-        printf("════════════════════════════════════════════════\n");
-
-        pipe.destroy();
     }
+
+    for (auto &t : threads) t.join();
+    double total_compute = compute_timer.elapsed_ms();
+    double total_setup = setup_timer.elapsed_ms();
+
+    // Collect results
+    cudaSetDevice(0);
+    printf("\n════════════════════════════════════════════════\n");
+    printf("  BERT Encoder Layer — Real Bootstrap Scaling\n");
+    printf("════════════════════════════════════════════════\n");
+    printf("  Heads: %d, GPUs: %d\n", n_heads, n_gpus);
+    printf("  Setup:     %8.1f ms (context + bootstrapper per GPU)\n", total_setup - total_compute);
+    printf("  Compute:   %8.1f ms (BERT layer with 4× bootstrap)\n", total_compute);
+    printf("  Total:     %8.1f ms\n", total_setup);
+    printf("════════════════════════════════════════════════\n");
 
     printf("\nDone.\n");
     return 0;
