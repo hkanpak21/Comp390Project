@@ -71,11 +71,30 @@ public:
 
     void execute(GpuFn fn);
 
+    // Extended execute with full key access (SecretKey, PublicKey, GaloisKey).
+    // Needed for operations like GELU/Softmax/LayerNorm that require
+    // per-GPU CKKSEvaluator with all key types.
+    using FullGpuFn = std::function<void(
+        int gpu_id,
+        PhantomContext &ctx,
+        PhantomSecretKey &sk,
+        PhantomPublicKey &pk,
+        PhantomRelinKey &rk,
+        PhantomGaloisKey &gk,
+        PhantomCKKSEncoder &enc,
+        std::vector<PhantomCiphertext> &local_cts)>;
+
+    void execute_full(FullGpuFn fn);
+
     // Gather results back to GPU 0 in original order.
     std::vector<PhantomCiphertext> gather();
 
     int n_gpus() const { return n_gpus_; }
     size_t total_cts() const { return total_cts_; }
+
+    // Enable Galois keys on all GPUs (expensive, call once).
+    // Must be called after create() and before execute_full().
+    void enable_galois_keys();
 
     void destroy();
 
@@ -83,12 +102,15 @@ private:
     int n_gpus_ = 0;
     size_t total_cts_ = 0;
     phantom::EncryptionParameters parms_;
+    bool galois_keys_enabled_ = false;
 
     // Per-GPU state
     struct GpuState {
         PhantomContext *ctx = nullptr;
         PhantomSecretKey *sk = nullptr;
+        PhantomPublicKey *pk = nullptr;
         PhantomRelinKey *rk = nullptr;
+        PhantomGaloisKey *gk = nullptr;
         PhantomCKKSEncoder *enc = nullptr;
         std::vector<PhantomCiphertext> local_cts;
         std::vector<size_t> original_indices;  // for gather reordering

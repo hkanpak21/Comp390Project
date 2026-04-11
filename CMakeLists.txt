@@ -73,6 +73,41 @@ set_target_properties(Phantom PROPERTIES
 )
 add_dependencies(Phantom phantom_ext)
 
+# ── NEXUS evaluator library (ported BERT ops + bootstrapping) ────────────────
+file(GLOB NEXUS_EVAL_SRCS src/nexus_eval/*.cu)
+file(GLOB NEXUS_BOOT_SRCS src/nexus_eval/bootstrapping/*.cu
+                           src/nexus_eval/bootstrapping/common/*.cu)
+add_library(nexus_evaluators STATIC ${NEXUS_EVAL_SRCS} ${NEXUS_BOOT_SRCS})
+target_include_directories(nexus_evaluators PUBLIC
+    src/nexus_eval
+    src/nexus_eval/bootstrapping
+    src/nexus_eval/bootstrapping/common
+    ${PHANTOM_ROOT}/include
+    /gpfs/projects/etur02/hkanpak/local/include
+    /usr/local/include
+)
+target_link_libraries(nexus_evaluators PUBLIC Phantom CUDA::cudart)
+
+# NTL/GMP for bootstrapping polynomial generation (Remez approximation)
+set(NTL_INCLUDE_DIR "/gpfs/projects/etur02/hkanpak/local/include" CACHE PATH "NTL include dir")
+find_library(NTL_LIBRARY ntl HINTS /gpfs/projects/etur02/hkanpak/local/lib /usr/local/lib)
+find_library(GMP_LIBRARY gmp HINTS /usr/lib64 /usr/local/lib)
+if(NTL_LIBRARY)
+    target_link_libraries(nexus_evaluators PUBLIC ${NTL_LIBRARY} m pthread)
+    target_include_directories(nexus_evaluators SYSTEM PUBLIC ${NTL_INCLUDE_DIR})
+    target_compile_options(nexus_evaluators PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-I${NTL_INCLUDE_DIR}>)
+    message(STATUS "NTL found: ${NTL_LIBRARY}, headers: ${NTL_INCLUDE_DIR}")
+    if(GMP_LIBRARY)
+        target_link_libraries(nexus_evaluators PUBLIC ${GMP_LIBRARY})
+        message(STATUS "GMP found: ${GMP_LIBRARY}")
+    endif()
+else()
+    message(WARNING "NTL not found — bootstrapping will not link")
+endif()
+
+set_target_properties(nexus_evaluators PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+add_dependencies(nexus_evaluators phantom_ext)
+
 # ── src/multi_gpu library ─────────────────────────────────────────────────────
 if(NCCL_FOUND)
     file(GLOB_RECURSE MULTI_GPU_SRCS
@@ -106,7 +141,7 @@ endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(NCCL_FOUND)
-    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline)
+    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode)
         if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/${bench}.cu)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)
@@ -114,13 +149,25 @@ if(NCCL_FOUND)
             if(TARGET Phantom)
                 target_link_libraries(${bench} PRIVATE Phantom)
             endif()
+            # Link NEXUS evaluators for BERT benchmarks
+            if(TARGET nexus_evaluators)
+                target_link_libraries(${bench} PRIVATE nexus_evaluators)
+            endif()
             target_include_directories(${bench} PRIVATE
                 ${PHANTOM_ROOT}/include
+                src/nexus_eval
+                src/nexus_eval/bootstrapping
+                src/nexus_eval/bootstrapping/common
+                /gpfs/projects/etur02/hkanpak/local/include
             )
             set_target_properties(${bench} PROPERTIES
                 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
                 CUDA_SEPARABLE_COMPILATION ON
             )
+            # NTL include for CUDA compilation (needed by bootstrapping headers)
+            if(NTL_LIBRARY)
+                target_compile_options(${bench} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-I/gpfs/projects/etur02/hkanpak/local/include>)
+            endif()
         endif()
     endforeach()
 endif()

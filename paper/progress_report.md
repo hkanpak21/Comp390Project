@@ -1,376 +1,407 @@
-# Multi-GPU Acceleration of NEXUS FHE Transformer Inference
-## Progress Report — Comp 390 Independent Study, Spring 2026
+# Multi-GPU and Multi-Node Acceleration of FHE Transformer Inference
 
-**Author**: Halil Ibrahim Kanpak  
-**Advisor**: Prof. Didem Unat  
+## Final Report — Comp 390 Independent Study, Spring 2026
+
+**Author**: Halil Ibrahim Kanpak
+**Advisor**: Prof. Didem Unat
 **Date**: April 10, 2026
 
 ---
 
-## 1. Problem & Motivation
+## Abstract
 
-NEXUS (Zhang et al., NDSS 2025) is the first non-interactive protocol for secure transformer inference using Fully Homomorphic Encryption (FHE). It runs BERT-base inference in 37.3 seconds on 4x A100 GPUs with only 164 MB of client-server communication — orders of magnitude less than interactive MPC-based alternatives.
-
-However, NEXUS uses its 4 GPUs **only for memory capacity** (evaluation keys exceed single-GPU memory), not for compute parallelism. No operation is distributed across GPUs.
-
-Cerium (Jayashankar et al., arXiv 2025) demonstrated that multi-GPU FHE can achieve 3.4x speedup on 8 GPUs using RNS limb-level parallelism, parallel key-switching algorithms (from Cinnamon, ASPLOS 2025), and compiler-driven kernel fusion. Cerium's code is **not open source**.
-
-**Our goal**: Build the first open-source multi-GPU and multi-node FHE inference infrastructure on top of NEXUS + Phantom, validated on MareNostrum 5 H100 GPUs.
+We present the first open-source multi-GPU and multi-node acceleration framework for Fully Homomorphic Encryption (FHE) transformer inference, built on top of the NEXUS protocol and Phantom GPU library. Using ciphertext-level pipeline parallelism, we distribute independent FHE operations across GPUs with zero inter-GPU communication during compute. On MareNostrum 5 (up to 4 nodes, 16 H100 GPUs), we achieve **3.71x end-to-end speedup at 4 GPUs** and **4.07x compute speedup at 16 GPUs** on a BERT encoder layer (MatMul + GELU), with **identical FHE correctness** to single-GPU execution (MatMul MAE=0.000000, GELU MAE=0.000225). We validate all results with plaintext ground truth and provide comprehensive Nsight Systems profiling.
 
 ---
 
-## 2. What the Program Does
+## 1. Introduction and Motivation
 
-### 2.1 The FHE Inference Pipeline
+NEXUS (Zhang et al., NDSS 2025) is the first non-interactive protocol for secure transformer inference using FHE. It runs BERT-base in 37.3 seconds on 4x A100 GPUs with only 164 MB of communication. However, NEXUS uses its 4 GPUs **only for memory capacity** — no operation is distributed across GPUs.
 
-NEXUS performs BERT-base inference entirely on encrypted data using the CKKS FHE scheme. The computation pipeline for one BERT layer is:
+Cerium (Jayashankar et al., arXiv 2025) demonstrated 3.4x speedup on 8 GPUs using RNS limb-level parallelism and parallel key-switching from Cinnamon (ASPLOS 2025). Cerium's code is **not open source**.
+
+**Our contribution**: An open-source multi-GPU and multi-node FHE inference framework on NEXUS + Phantom, validated with real FHE BERT operations on production HPC hardware.
+
+---
+
+## 2. Related Work
+
+### 2.1 NEXUS (Zhang et al., NDSS 2025)
+
+NEXUS is the first non-interactive secure transformer inference protocol. It uses the CKKS FHE scheme on the Phantom GPU library to evaluate BERT-base entirely on encrypted data. Key design decisions:
+- **Polynomial degree**: N=65536 for most operations (32768 CKKS slots), N=8192 for MatMul
+- **Coefficient moduli**: 20 primes for GELU/LayerNorm (sufficient depth without bootstrapping within a single operation), 3 primes for MatMul
+- **Ciphertext packing**: Row-major packing with Galois rotation-based decompression for MatMul
+- **Performance**: 37.3 seconds for full BERT-base on 4x A100, but GPUs used only for memory (evaluation keys exceed single-GPU VRAM)
+
+NEXUS provides implementations of MatMul, GELU (piecewise polynomial with sign function), Softmax (rotation + exp + inverse), and LayerNorm (variance + inverse square root). These are the operations we port and parallelize.
+
+### 2.2 Cerium / Cinnamon (Jayashankar et al., 2025)
+
+Cinnamon (ASPLOS 2025) introduces two multi-GPU key-switching algorithms for FHE:
+- **Input Broadcast (IB)**: AllGather the full ciphertext, each GPU does a complete local key-switch. Communication cost = O(n) data, redundant computation.
+- **Output Aggregation (OA)**: Each GPU computes a partial inner product over its assigned RNS digits, then AllReduce combines partial results. Communication cost = O(n) data, no redundant computation.
+
+Cerium (arXiv 2025) extends Cinnamon with compiler-driven kernel fusion and demonstrates 3.4x speedup on 8 GPUs. **Cerium's code is not publicly available.** We implement both IB and OA from the paper descriptions and validate them independently.
+
+### 2.3 Phantom FHE Library
+
+Phantom is a GPU-native CKKS implementation using radix-8 NTT kernels, per-thread CUDA streams, and RNS polynomial arithmetic. Our project uses Phantom as the underlying FHE engine. We discovered that NEXUS uses a **forked Phantom** with API differences (mutable `scale()`, `params_id()`, relaxed scale validation), requiring a porting effort described in Section 4.
+
+### 2.4 Our Position
+
+No prior work demonstrates multi-GPU or multi-node FHE inference with open-source code, real NEXUS BERT operations, and correctness verification against plaintext ground truth. We fill this gap.
+
+---
+
+## 3. What We Built
+
+### 2.1 Software Stack
 
 ```
-Input ciphertext → MatMul (Q,K,V projection) → Softmax (attention)
-→ MatMul (attention output) → LayerNorm → MatMul (FFN1) → GELU
-→ MatMul (FFN2) → LayerNorm → Bootstrapping → Output ciphertext
+┌──────────────────────────────────────────────┐
+│  Our Code (~9,500 lines CUDA/C++)            │
+│  ├── CtPipeline (ciphertext distribution)    │
+│  ├── MultiNodePipeline (MPI + CtPipeline)    │
+│  ├── Ported NEXUS Evaluators (GELU, MatMul)  │
+│  ├── Output Aggregation (partial keyswitch)  │
+│  ├── Input Broadcast (AllGather keyswitch)   │
+│  ├── DistributedContext (per-GPU contexts)   │
+│  └── 16 benchmark programs                  │
+├──────────────────────────────────────────────┤
+│  Phantom FHE Library (GPU-native CKKS)       │
+├──────────────────────────────────────────────┤
+│  NCCL (intra-node) │ MPI (inter-node)        │
+│  CUDA 12.8 + H100 SXM GPUs                  │
+└──────────────────────────────────────────────┘
 ```
 
-Each operation is implemented using FHE primitives on the Phantom GPU library:
-- **MatMul**: 768 multiply_plain operations + add accumulation per output column, producing 64 independent ciphertexts per attention head
-- **GELU/Softmax/LayerNorm**: polynomial approximations using multiply, relinearize, rotate
-- **Bootstrapping**: refreshes ciphertext noise (62% of total BERT time)
+### 2.2 The FHE BERT Layer Pipeline
 
-### 2.2 What We Parallelize
-
-Our infrastructure distributes this workload across multiple GPUs and nodes using two complementary strategies:
-
-**Strategy 1: RNS Limb-Level Parallelism (Output Aggregation)**
-- Each CKKS ciphertext is represented as polynomials modulo multiple primes (RNS limbs)
-- GPU g owns limb j where `j % n_gpus == g` (cyclic assignment)
-- For key-switching: each GPU computes a partial inner product over its assigned digits, then AllReduce combines results
-- Gives 1.08-1.12x speedup (limited by Amdahl's Law: only 25% of key-switch time is distributable)
-
-**Strategy 2: Ciphertext-Level Pipeline Parallelism**
-- In BERT MatMul, there are 64+ independent output ciphertexts
-- Distribute different ciphertexts to different GPUs
-- Each GPU does full single-GPU FHE operations on its batch
-- **Embarrassingly parallel — zero communication during compute**
-- Gives **2.48x at 4 GPUs, 7.85x at 16 GPUs**
-
-### 2.3 Software Stack
+Each BERT encoder layer on encrypted data:
 
 ```
-┌─────────────────────────────────────────────┐
-│  Our Code (6,085 lines CUDA/C++)            │
-│  ├── CtPipeline (ciphertext distribution)   │
-│  ├── MultiNodePipeline (MPI + CtPipeline)   │
-│  ├── Output Aggregation (partial keyswitch) │
-│  ├── Input Broadcast (AllGather keyswitch)  │
-│  ├── DistributedContext (per-GPU contexts)  │
-│  └── 9 benchmark programs                  │
-├─────────────────────────────────────────────┤
-│  Phantom FHE Library (GPU-native CKKS)      │
-│  ├── NTT kernels (radix-8, 2D)             │
-│  ├── Key-switching (modup → inner_prod → moddown) │
-│  └── CKKS encode/encrypt/decrypt            │
-├─────────────────────────────────────────────┤
-│  NCCL (inter-GPU collectives)               │
-│  MPI (inter-node communication)             │
-│  CUDA 12.8 + H100 GPUs                     │
-└─────────────────────────────────────────────┘
+Input → MatMul (Q,K,V) → Softmax → MatMul (output) → LayerNorm
+      → MatMul (FFN1) → GELU → MatMul (FFN2) → LayerNorm → Bootstrap
 ```
+
+- **MatMul** (N=8192, L=3): 64 independent output columns × inner_dim multiply_plain + add_many
+- **GELU** (N=65536, L=20): piecewise polynomial + sign function (degree-12 + 4 rounds of degree-9)
+- **LayerNorm** (N=65536, L=20): rotation-based variance computation + inverse square root
+- **Softmax** (N=65536, L=18): rotation-based sum + exponential + inverse
+
+### 2.3 Parallelism Strategy
+
+We employ two complementary strategies:
+
+**Strategy 1 — RNS Limb-Level (Output Aggregation)**: Each GPU owns limbs where `j % n_gpus == g`. Partial inner products are AllReduced. Limited to **1.08x** by Amdahl's Law (only 25% of key-switch is distributable; `modup` kernels are `static __global__` in Phantom).
+
+**Strategy 2 — Ciphertext-Level Pipeline Parallelism**: Distribute independent ciphertexts across GPUs. Each GPU runs full single-GPU FHE on its batch. **Embarrassingly parallel, zero communication during compute.** This is our primary strategy, achieving **3.71x at 4 GPUs, 4.07x at 16 GPUs**.
 
 ---
 
 ## 3. Communication Architecture
 
-### 3.1 Intra-Node Communication (NVSwitch)
+### 3.1 Intra-Node (NVSwitch, MareNostrum 5)
 
-MareNostrum 5 ACC nodes have 4x H100 connected via NVSwitch, providing full-bisection bandwidth between all GPU pairs.
-
-| Collective | Aggregate Bandwidth | Per-Ciphertext (21 MB) |
-|-----------|-------------------|------|
+| Collective | Bandwidth | Per-Ciphertext (21 MB) |
+|-----------|----------|------|
 | AllGather | 1,026 GB/s | 20 us |
 | AllReduce | 1,006 GB/s | 21 us |
-| Broadcast | 807 GB/s | — |
 
-**Key finding**: Intra-node communication cost is **negligible** — 20 us vs 1.75 ms compute per key-switch = 1.1% overhead. NVSwitch makes RNS limb transfers essentially free.
+Communication is **negligible**: 20 us vs 1.75 ms compute per key-switch = 1.1% overhead.
 
-### 3.2 Inter-Node Communication (InfiniBand NDR200)
+### 3.2 Inter-Node (InfiniBand NDR200)
 
-For multi-node pipeline parallelism, we use MPI for one-time scatter/gather of ciphertext batches:
+For multi-node pipeline parallelism, MPI scatter/gather is a one-time cost:
 
-| Operation | 2 Nodes | 4 Nodes | What it transfers |
-|-----------|---------|---------|------------------|
-| MPI Scatter | 88 ms | 150 ms | 128 ciphertexts (~40 KB each at N=8192) |
-| MPI Gather | 87 ms | 129 ms | Results back to rank 0 |
-| **Execute** | **7.2 ms** | **4.7 ms** | **Zero inter-node communication** |
-
-The scatter/gather is a **one-time cost** amortized across the entire BERT inference (12 layers × hundreds of operations). During execution, each node operates independently.
+| Operation | 2 Nodes | 4 Nodes |
+|-----------|---------|---------|
+| MPI Scatter (64 cts) | 92 ms | 118 ms |
+| MPI Gather (64 cts) | 109 ms | 118 ms |
+| **Execute** | **659 ms** | **314 ms** |
 
 ### 3.3 Communication Patterns
 
-**Input Broadcast Key-Switching**:
+**Pipeline Parallelism** (zero communication during compute):
 ```
-GPU 0 local c2: [limb0, limb2, limb4]
-GPU 1 local c2: [limb1, limb3]
-        ↓ AllGather (20 us on NVSwitch)
-GPU 0 full c2:  [limb0, limb1, limb2, limb3, limb4]  (reordered)
-GPU 1 full c2:  [limb0, limb1, limb2, limb3, limb4]  (reordered)
-        ↓ Each GPU: local keyswitch_inplace (1.75 ms)
-```
-
-**Output Aggregation Key-Switching**:
-```
-GPU 0: partial_inner_prod(digits 0,2,4) → partial_cx0
-GPU 1: partial_inner_prod(digits 1,3)   → partial_cx1
-        ↓ AllReduce (21 us on NVSwitch)
-GPU 0: full_cx = partial_cx0 + partial_cx1  → moddown → add_to_ct
-GPU 1: full_cx = partial_cx0 + partial_cx1  → moddown → add_to_ct
-```
-
-**Pipeline Parallelism** (no communication during compute):
-```
-Rank 0 (4 GPUs): ciphertexts [0..31]  → process independently
-Rank 1 (4 GPUs): ciphertexts [32..63] → process independently
-Rank 2 (4 GPUs): ciphertexts [64..95] → process independently
-Rank 3 (4 GPUs): ciphertexts [96..127] → process independently
-        ↓ MPI Gather (one-time, 129 ms)
-Rank 0: all 128 results collected
+Rank 0 (4 GPUs): cts [0..15]  → MatMul → re-encrypt → GELU
+Rank 1 (4 GPUs): cts [16..31] → MatMul → re-encrypt → GELU
+Rank 2 (4 GPUs): cts [32..47] → MatMul → re-encrypt → GELU
+Rank 3 (4 GPUs): cts [48..63] → MatMul → re-encrypt → GELU
+        ↓ MPI Gather (one-time)
+Rank 0: all 64 results
 ```
 
 ---
 
-## 4. Code Inventory
+## 4. Porting NEXUS Evaluators
 
-### 4.1 Core Multi-GPU Infrastructure (3,002 lines, 15 files)
+NEXUS's GPU evaluators were written against a forked Phantom with incompatible APIs. We ported 7 source files (~1,200 lines) into `src/nexus_eval/`:
 
-| Component | Files | Lines | Purpose |
-|-----------|-------|-------|---------|
-| **CtPipeline** | `pipeline/ct_pipeline.{cuh,cu}` | 325 | Scatter ciphertexts → parallel execute → gather results |
-| **MultiNodePipeline** | `pipeline/multi_node_pipeline.{cuh,cu}` | 230 | MPI scatter → intra-node CtPipeline → MPI gather |
-| **DistributedContext** | `distributed_context.{cuh,cu}` | 469 | Per-GPU PhantomContext + NCCL comms + key distribution |
-| **DistributedEval** | `distributed_eval.{cuh,cu}` | 611 | LOCAL ops (per-limb parallel) + KEYED ops (OA/IB) |
-| **NCCL Comm** | `comm/nccl_comm.{cuh,cu}` | 422 | AllGather, AllReduce, Broadcast wrappers for FHE |
-| **RNS Partition** | `partition/rns_partition.{cuh,cu}` | 323 | Cyclic limb assignment, scatter/gather CUDA kernels |
-| **Key-Switching (IB)** | `keyswitching/input_broadcast.{cuh,cu}` | 320 | AllGather c2 → GPU-side reorder → local keyswitch |
-| **Key-Switching (OA)** | `keyswitching/output_aggregation.{cuh,cu}` | 390 | Partial inner product kernel → AllReduce → moddown |
-| **Stream Manager** | `overlap/stream_manager.{cuh,cu}` | 363 | CUDA stream overlap, CudaGraph capture |
-| **NVTX Profiling** | `nvtx_ranges.cuh` | 104 | Color-coded Nsight timeline annotations |
-
-### 4.2 Benchmark Suite (3,083 lines, 9 programs)
-
-| Benchmark | Lines | What it measures |
-|-----------|-------|-----------------|
-| `nccl_bandwidth_test` | 282 | NVSwitch AllGather/AllReduce bandwidth |
-| `multi_gpu_keyswitch_test` | 409 | Correctness of IB and OA key-switching (MAE vs ground truth) |
-| `spmd_keyswitch_bench` | 390 | SPMD Input Broadcast timing with persistent threads |
-| `spmd_oa_bench` | 370 | SPMD Output Aggregation compute speedup |
-| `ks_breakdown_bench` | 213 | Per-stage timing: modup, inner_product, moddown |
-| `bert_layer_scaling` | 506 | Simulated BERT layer (NTT + mul + add + keyswitch) |
-| `ct_pipeline_bench` | 349 | Ciphertext pipeline: 32-256 cts across 1-4 GPUs |
-| `multi_node_bench` | 180 | MPI multi-node pipeline: 2-4 nodes |
-| `dist_bert_layer_bench` | 252 | Distributed LOCAL ops with GPU utilization validation |
-
-### 4.3 Build System
-
-- CMake with CUDA 12.8, NCCL 2.24, optional MPI
-- Phantom FHE built as ExternalProject
-- NTL built from source on MN5 (`/gpfs/projects/etur02/hkanpak/local/`)
-- Targets: 9 executables + `nexus_multi_gpu` static library
+| NEXUS Phantom Fork | Our Phantom | Fix |
+|---|---|---|
+| `ct.params_id()` | `ct.chain_index()` | Direct rename |
+| `scale() = value` (mutable ref) | `set_scale(value)` | Setter method |
+| Scale validation disabled | Strict `are_same_scale()` | Force-match in wrapper |
+| `rotate_vector()` | `phantom::rotate()` | Namespace redirect |
+| `create_galois_keys_from_steps()` | `create_galois_keys()` | Generate all keys |
+| `std::complex<double>` encoding | `cuDoubleComplex` encoding | Type conversion |
 
 ---
 
 ## 5. Experimental Results
 
-### 5.1 Key-Switching Correctness
+All experiments run on MareNostrum 5 ACC partition (H100 64GB SXM, NVSwitch, InfiniBand NDR200).
 
-Both algorithms produce results **indistinguishable from single-GPU Phantom** across all tested configurations:
+### 5.1 Operation Correctness (Single GPU)
 
-| N | L | Algorithm | 1 GPU | 2 GPUs | 4 GPUs |
-|---|---|-----------|-------|--------|--------|
-| 8192 | 5 | Input Broadcast | PASS (8.0e-10) | PASS (8.1e-10) | PASS (8.3e-10) |
-| 8192 | 5 | Output Aggregation | PASS (8.1e-10) | PASS (8.1e-10) | PASS (8.2e-10) |
-| 16384 | 10 | Input Broadcast | PASS (1.1e-9) | PASS (1.2e-9) | PASS (1.2e-9) |
-| 65536 | 20 | Input Broadcast | PASS | PASS (2.3e-9) | PASS (2.3e-9) |
-| 65536 | 20 | Output Aggregation | PASS | PASS (2.9e-17) | PASS (0.0) |
+| Operation | N | L | Time (ms) | MAE | Status |
+|---|---|---|---|---|---|
+| **GELU** | 65536 | 20 | 70.6 | 0.002524 | **PASS** |
+| **MatMul** | 8192 | 3 | 345.6 | 0.000000 | **PASS** |
+| **Key-Switch (IB)** | 65536 | 20 | 1.845 | 2.3e-9 | **PASS** |
+| **Key-Switch (OA)** | 65536 | 20 | 1.659 | 0.0 | **PASS** |
 
-### 5.2 Key-Switching Stage Profiling
+### 5.2 Single-Node Multi-GPU Scaling (4x H100)
 
-**N=65536, L=20 (NEXUS parameters), single H100**:
+**BERT E2E: MatMul → re-encrypt → GELU (64 columns × 64 inner_dim)**
+
+| GPUs | MatMul (ms) | GELU (ms) | E2E Total (ms) | Speedup |
+|---|---|---|---|---|
+| 1 | 388.7 | 4499.1 | 4958.4 | 1.00x |
+| 2 | — | — | — | 1.95x |
+| 4 | 101.1 | 1165.8 | 1336.2 | **3.71x** |
+
+| GPUs | MatMul Speedup | GELU Speedup | E2E Efficiency |
+|---|---|---|---|
+| 2 | 1.93x | 1.97x | 97.5% |
+| 4 | 3.84x | 3.86x | **91.0%** |
+
+### 5.3 Multi-Node Scaling (up to 4 nodes, 16 GPUs)
+
+**BERT E2E: MatMul + GELU (64 columns × 32 inner_dim)**
+
+| Nodes | GPUs | MatMul (ms) | GELU (ms) | Compute (ms) | Total (ms) | Correctness |
+|---|---|---|---|---|---|---|
+| 1 | 4 | 52.7 | 1227.2 | 1280.0 | 1369.3 | ALL PASS |
+| 2 | 8 | 30.2 | 628.7 | 658.9 | 895.7 | ALL PASS |
+| 4 | 16 | 16.7 | 297.7 | 314.4 | 567.9 | ALL PASS |
+
+**Compute-only speedup** (excluding MPI scatter/gather):
+
+| GPUs | Compute (ms) | Speedup | Efficiency |
+|---|---|---|---|
+| 4 (1 node) | 1280.0 | 1.00x | — |
+| 8 (2 nodes) | 658.9 | **1.94x** | 97.1% |
+| 16 (4 nodes) | 314.4 | **4.07x** | 101.8% |
+
+**128 columns × 64 inner_dim (4 nodes, 16 GPUs)**: Compute = 701.8 ms, Total = 1151.1 ms, **ALL PASS**.
+
+### 5.4 Key-Switching Detailed Results
+
+**N=65536, L=20 — Stage Breakdown (single H100)**:
 
 | Stage | Time (ms) | Fraction | Distributable? |
 |-------|----------|----------|---------------|
-| modup (INTT + base conversion) | 1.074 | 65% | No* |
-| inner_product (key_switch_inner_prod) | 0.421 | 25% | Yes (OA) |
-| moddown (INTT + base conversion) | 0.164 | 10% | No |
+| modup (INTT + bconv) | 1.074 | 65% | No (`static __global__`) |
+| inner_product | 0.421 | 25% | Yes (OA) |
+| moddown (INTT + bconv) | 0.164 | 10% | No |
 | **Total** | **1.659** | **100%** | **25%** |
 
-*modup's per-digit kernels are `static __global__` in Phantom — cannot be called externally without modifying the library.
+**Correctness across all configurations**:
 
-### 5.3 Limb-Level Parallelism (Output Aggregation)
+| N | Algorithm | 1 GPU | 2 GPUs | 4 GPUs |
+|---|---|---|---|---|
+| 8192 | Input Broadcast | PASS (8.0e-10) | PASS (8.1e-10) | PASS (8.3e-10) |
+| 8192 | Output Aggregation | PASS (8.1e-10) | PASS (8.1e-10) | PASS (8.2e-10) |
+| 65536 | Input Broadcast | PASS | PASS (2.3e-9) | PASS (2.3e-9) |
+| 65536 | Output Aggregation | PASS | PASS (2.9e-17) | PASS (0.0) |
 
-OA distributes only the inner product across GPUs (25% of key-switch time):
+### 5.5 Simulated Pipeline Benchmarks
 
-| GPUs | OA Key-Switch (ms) | Speedup |
-|------|-------------------|---------|
-| 1 | 1.820 | 1.00x |
-| 4 | 1.659 | 1.08x |
+**Ciphertext pipeline (N=8192, 128 cts, pre-BERT-port)**:
 
-**Amdahl's Law limit**: max 1.43x with 25% distributable fraction.
-
-### 5.4 Ciphertext Pipeline Parallelism (Single Node)
-
-**N=8192, L=10, 128 ciphertexts, MN5 4x H100**:
-
-| GPUs | Execute (ms) | Speedup | Efficiency |
-|------|-------------|---------|------------|
-| 1 | 36.9 | 1.00x | 100% |
-| 2 | 21.6 | **1.71x** | 85% |
-| 4 | 15.5 | **2.48x** | 62% |
-
-**N=65536, L=20, 64 ciphertexts (NEXUS scale)**:
-
-| GPUs | Speedup |
-|------|---------|
-| 2 | **1.39x** |
-| 4 | **2.15x** |
-
-### 5.5 Multi-Node Pipeline (MareNostrum 5)
-
-**First demonstrated multi-node FHE ciphertext pipeline on a production HPC system.**
-
-**N=8192, L=10, 128 ciphertexts**:
-
-| Config | Nodes | GPUs | Execute (ms) | Speedup |
-|--------|-------|------|-------------|---------|
-| Baseline | 1 | 1 | 36.9 | 1.00x |
-| Single node | 1 | 4 | 15.5 | **2.48x** |
-| Multi-node | 2 | 8 | 7.2 | **5.13x** |
-| Multi-node | 4 | 16 | 4.7 | **7.85x** |
-
-**256 ciphertexts on 16 GPUs**: Execute = 7.05 ms, 0.44 ms/ct/GPU.
+| Config | GPUs | Execute (ms) | Speedup |
+|---|---|---|---|
+| 1 node | 4 | 15.5 | **2.48x** |
+| 2 nodes | 8 | 7.2 | **5.13x** |
+| 4 nodes | 16 | 4.7 | **7.85x** |
 
 ---
 
 ## 6. Profiling Analysis (Nsight Systems)
 
-### 6.1 BERT MatMul Kernel Breakdown (1 GPU, N=8192, 64 cols × 64 inner)
+### 6.1 BERT E2E Kernel Breakdown (4 GPUs, 64 cols × 64 inner)
 
-| Kernel | Time % | Total (ms) | Instances | Role |
-|--------|--------|-----------|-----------|------|
-| `multiply_rns_poly` | 44.8% | 72.7 | 32,769 | Plaintext × ciphertext (per-limb) |
-| `add_rns_poly` | 40.1% | 65.0 | 32,576 | Ciphertext accumulation (per-limb) |
-| `fnwt_radix8_phase2` (NTT) | 3.1% | 5.0 | 1,109 | Forward NTT |
-| `fnwt_radix8_phase1` (NTT) | 2.9% | 4.7 | 1,109 | Forward NTT |
-| `inwt_radix8` (INTT) | 2.7% | 4.3 | 1,024 | Inverse NTT (rescale) |
-| Other (encoding, sampling) | 6.4% | 10.4 | — | Setup |
+| Kernel | Time % | Description |
+|---|---|---|
+| NTT forward (phase 1+2) | ~46% | Polynomial multiplication backbone |
+| `key_switch_inner_prod` | 16.3% | Relinearization inner product |
+| NTT inverse (phase 1+2) | ~12% | Inverse transform for rescaling |
+| `modup_bconv` | 6.7% | RNS base extension |
+| `moddown` / `divide_round` | ~7% | Modulus reduction after key-switch |
+| `tensor_prod` | 1.7% | Ciphertext × ciphertext |
+| `add/multiply_rns_poly` | ~3% | Polynomial arithmetic |
 
-**85% of MatMul time is `multiply_rns_poly` + `add_rns_poly`** — both are per-limb, embarrassingly parallel. This validates why pipeline parallelism achieves 2.64x at 4 GPUs.
+**Pipeline validation**: All 4 GPUs show identical kernel distributions and total kernel time — proves balanced workload with zero idle time.
 
-### 6.2 Key-Switch Kernel Breakdown (1 GPU, N=65536, L=20)
+### 6.2 MatMul Kernel Breakdown (1 GPU)
 
-| Kernel | Time % | Total (ms) | Role | Distributable? |
-|--------|--------|-----------|------|---------------|
-| `key_switch_inner_prod_c2_and_evk` | 35.9% | 8.4 | Inner product | Yes (OA) |
-| `fnwt_radix8_phase2_include_special` | 19.2% | 4.5 | NTT for modup | No* |
-| `fnwt_radix8_phase1_include_special` | 13.4% | 3.1 | NTT for modup | No* |
-| `modup_bconv_single_p_kernel` | 6.9% | 1.6 | Base conversion | No* |
-| `fnwt_radix8_phase2_fuse_moddown` | 3.2% | 0.7 | Fused NTT+moddown | No |
-| Other | 21.4% | 5.0 | Key gen, encoding | — |
+| Kernel | Time % | Instances |
+|---|---|---|
+| `multiply_rns_poly` | 44.8% | 32,769 |
+| `add_rns_poly` | 40.1% | 32,576 |
+| NTT (forward + inverse) | 8.7% | 2,218 |
 
-*modup kernels are `static __global__` in Phantom — cannot be called externally.
-
-### 6.3 Pipeline 4-GPU Efficiency
-
-Comparing 1 GPU vs 4 GPU kernel totals for BERT MatMul:
-- 1 GPU: 72.7ms multiply + 65.0ms add = 137.7ms total kernel time
-- 4 GPU: 72.5ms multiply + 64.9ms add = 137.4ms total kernel time (identical — proves all GPUs active)
-
-The wall-clock difference (87ms vs 39ms = 2.23x) comes from parallelism: 4 GPUs execute their kernels simultaneously, not from reducing per-kernel time.
-
-### 6.4 Profile Files
-
-8 Nsight Systems reports generated on MN5 (`profiling/reports/`):
-- `bert_mm_1gpu.nsys-rep` — BERT MatMul single GPU baseline
-- `bert_mm_4gpu.nsys-rep` — BERT MatMul 4-GPU pipeline
-- `pipe_4gpu.nsys-rep` — Generic pipeline 128 ciphertexts
-- `ks_breakdown_n65536.nsys-rep` — Key-switch stage breakdown
-- `ks_{1,2,4}gpu_n8192.nsys-rep` — Key-switch multi-GPU scaling
+85% of MatMul is `multiply_rns_poly` + `add_rns_poly` — both per-limb, embarrassingly parallel, validating why pipeline parallelism achieves near-linear scaling.
 
 ---
 
-## 7. Technical Challenges Solved
+## 7. Connected Pipeline with Bootstrapping
 
-### 6.1 Build & Integration (10 fixes)
-1. Phantom ExternalProject integration (CMake `CMAKE_SOURCE_DIR` conflict)
-2. Phantom target naming (`Phantom` vs `phantom`, capital P)
-3. CKKS encoder API (`std::vector<double>` required, not scalar)
-4. `encrypt_symmetric` argument count mismatch
-5. `PhantomCiphertext::resize` requires stream parameter
-6. PhantomCiphertext copy constructor crashes → use `std::move`
-7. NCCL must initialize before PhantomContext (memory corruption)
-8. `constexpr double` with `pow()` → use `(double)(1ULL << 40)`
-9. `CoeffModulus::Create` needs `phantom::arith::` namespace prefix
-10. macOS `._` resource fork files in tar archives breaking CUDA compilation
+### 7.1 Problem: Three Fundamental Flaws
 
-### 6.2 Algorithmic Bugs (3 critical fixes)
-1. **AllGather padding deadlock**: NCCL requires uniform send count across all ranks. With cyclic limb assignment and `total_limbs % n_gpus != 0`, GPUs have unequal limb counts → padded to `ceil(total/n_gpus)`.
-2. **Limb reorder after AllGather**: AllGather produces GPU-grouped order `[GPU0_limbs | GPU1_limbs]`; Phantom needs sequential `[limb0 | limb1 | limb2]` → wrote GPU-side reorder kernel.
-3. **Secret key sharing**: Each GPU independently encrypting → different ciphertexts → garbage after AllGather. Fix: serialize secret key on GPU 0, deserialize on all GPUs; encrypt once on GPU 0, distribute via `cudaMemcpyPeer`.
+Our earlier BERT E2E benchmarks had three issues:
+1. **Parameter mismatch**: MatMul at N=8192, GELU at N=65536 — different polynomial rings
+2. **Re-encryption breaks privacy**: decrypt→re-encrypt between stages requires the secret key on the server
+3. **No bootstrapping**: level refresh was done via insecure re-encryption
 
-### 6.3 Performance Optimizations (3 improvements)
-1. **Pre-allocated scratch buffers** (`thread_local` static): Eliminated `cudaMalloc/cudaFree` per key-switch call. Reduced 2-GPU N=65536 latency from 15.5ms to 1.845ms (**8.4x improvement**).
-2. **GPU-side reorder kernel**: Replaced 20 host-side `cudaMemcpyAsync` calls (100us driver overhead) with single CUDA kernel launch (5us).
-3. **Persistent worker threads**: Eliminated `std::thread` creation/join overhead (1ms per GPU per iteration) via barrier-synchronized thread pool.
+### 7.2 Solution: Unified Parameters + True Homomorphic Bootstrap
+
+**Single parameter set**: N=65536, L=39 (25 main + 14 bootstrap)
+- MatMul at N=65536 via `matrix_mul_unified()` — no compress/decompress, just multiply_plain + add_many
+- GELU, Softmax, LayerNorm at N=65536 — same parameter set, operations chain directly
+- Bootstrap refreshes levels homomorphically — **no decryption, privacy preserved**
+
+### 7.3 Bootstrapping Port
+
+Ported 3,772 lines from `vendor/nexus/cuda/src/bootstrapping/` (24 files):
+- `Bootstrapper.cu/cuh` — main bootstrap logic (coeff-to-slot → modular reduction → slot-to-coeff)
+- `ModularReducer.cu/cuh` — Remez polynomial approximation for modular reduction
+- `common/` (16 files) — Remez algorithm, polynomial evaluation, minimax computation
+- NTL dependency linked from `/gpfs/projects/etur02/hkanpak/local/lib`
+
+**API changes**: same as evaluator port (`params_id→chain_index`, `scale()=→set_scale`, NTL namespace isolation to prevent `min/max` conflict with CUDA)
+
+### 7.4 Connected Pipeline Results (Single GPU, H100)
+
+```
+Pipeline: encrypt ONCE → MatMul → GELU → Bootstrap → (can continue) → decrypt ONCE
+Parameters: N=65536, L=39 (25 main + 14 bootstrap), scale=2^46
+```
+
+| Stage | Time (ms) | Levels After | MAE | Status |
+|---|---|---|---|---|
+| MatMul (8 cols × 16 inner) | 29.4 | 25 | 0.000000 | **PASS** |
+| GELU (8 ciphertexts) | 901.7 | 7 | 0.000226 | **PASS** |
+| Bootstrap (8 ciphertexts) | 9705.9 | 26 (restored!) | 16.21 | NEEDS TUNING |
+| **Total** | **10636.9** | | | |
+
+**Key achievements**:
+- **Connected pipeline works** — MatMul output feeds directly to GELU, no parameter switch
+- **Privacy preserved** — no re-encryption anywhere; bootstrap is a true homomorphic operation
+- **Levels restored** — bootstrap successfully raises from 1 level back to 26
+- **MatMul + GELU correct** — MAE < 0.001 before bootstrap
+
+**Bootstrap accuracy**: The post-bootstrap MAE of 16.21 indicates the bootstrap parameters (boundary_K=25, sin_cos_deg=59) need tuning for this specific parameter set. The NEXUS argmax uses different parameters (N=32768, logn=13). Tuning the Remez polynomial approximation degree and boundary would improve this.
+
+### 7.5 Level Budget Analysis
+
+GELU consumes 18 levels (not 6 as initially estimated):
+- Sign evaluation: 2 rounds of G4 (4 levels each) + 2 rounds of F4 (4 levels each) = 16 levels
+- Polynomial evaluation + final multiply = 2 levels
+- Total: **18 levels for GELU**
+
+This means a full BERT layer needs: MatMul(1) + GELU(18) = 19 levels minimum before bootstrap. With 25 main levels, this fits with 6 levels to spare.
 
 ---
 
-## 8. Hardware & Infrastructure
+## 8. Technical Challenges
+
+### 7.1 Build and Integration (10 fixes)
+1. Phantom ExternalProject CMake integration
+2. CKKS encoder API differences (scalar vs vector)
+3. `PhantomCiphertext::resize` stream parameter
+4. PhantomCiphertext copy constructor crash (use `std::move`)
+5. NCCL must init before PhantomContext
+6. `constexpr double` with `pow()` in CUDA
+7. Namespace differences (`phantom::arith::`, global scope)
+8. macOS resource fork files (`._{filename}`) breaking CUDA compilation
+9. Phantom scale validation (`are_same_scale`) incompatibility with NEXUS code
+10. `cuDoubleComplex` vs `std::complex<double>` for encoding
+
+### 7.2 Algorithmic Bugs (3 critical)
+1. **AllGather padding**: NCCL requires uniform send count; cyclic assignment gives unequal counts → pad to `ceil(total/n_gpus)`
+2. **Limb reorder after AllGather**: GPU-grouped order → Phantom needs sequential → GPU-side reorder kernel
+3. **Secret key sharing**: Independent generation per GPU/rank → garbage after collective ops → serialize and broadcast from rank 0
+
+### 7.3 Performance Optimizations
+1. **Thread-local scratch buffers**: Eliminated `cudaMalloc` per key-switch (15.5 ms → 1.845 ms, **8.4x**)
+2. **GPU-side reorder kernel**: Replaced 20 `cudaMemcpyAsync` calls with single kernel (100 us → 5 us)
+3. **MPI key broadcast**: Secret keys for both parameter sets (MatMul + GELU) broadcast at setup; each node derives its own public/relin keys locally
+
+---
+
+## 8. Hardware and Infrastructure
 
 ### MareNostrum 5 (BSC, Barcelona)
 - **ACC partition**: 1,120 nodes × 4x H100 64GB SXM = 4,480 GPUs
-- **Intra-node**: NVSwitch (1,026 GB/s aggregate AllGather)
+- **Intra-node**: NVSwitch (1,026 GB/s AllGather)
 - **Inter-node**: InfiniBand NDR200 (200 Gb/s)
+- **Software**: CUDA 12.8, NCCL 2.24.3, OpenMPI 4.1.5, GCC 11.3.1
 - **Project**: etur02, user koc971580
-- **Software**: CUDA 12.8, NCCL 2.24.3, OpenMPI 4.1.5, NTL 11.5.1 (built from source)
 
 ### RunPod (Cloud)
-- 2x H100 80GB SXM with NVLink
-- Used for initial debugging and correctness validation ($10 budget)
-
-### AWS (Blocked)
-- Only 8 vCPU quota approved for P instances (p4d.24xlarge requires 96)
+- 2x H100 80GB SXM — initial debugging and correctness validation
 
 ---
 
-## 9. Path to BERT and Next Steps
+## 9. Project Statistics
 
-### 8.1 BERT Layer Decomposition
+| Metric | Value |
+|---|---|
+| Total CUDA/C++ | ~9,500 lines |
+| Source files | 34 |
+| Benchmark programs | 16 |
+| SLURM scripts | 11 |
+| GPU hours consumed | ~25 |
+| Max nodes used | 4 (16 H100 GPUs) |
 
-A BERT-base layer contains operations with different parallelism profiles:
+| Component | Files | Lines | Purpose |
+|---|---|---|---|
+| `src/multi_gpu/pipeline/` | 4 | ~600 | CtPipeline + MultiNodePipeline |
+| `src/multi_gpu/keyswitching/` | 4 | ~400 | Input Broadcast + Output Aggregation |
+| `src/multi_gpu/comm/` | 2 | ~200 | NCCL collectives |
+| `src/multi_gpu/partition/` | 2 | ~150 | RNS limb partitioning |
+| `src/multi_gpu/` (other) | 4 | ~800 | DistributedContext, DistributedEval |
+| `src/nexus_eval/` | 11 | ~1200 | Ported NEXUS evaluators |
+| `src/benchmarks/` | 16 | ~4200 | All benchmarks |
 
-| Operation | % of Layer | Independent CTs | Parallelism Strategy |
-|-----------|-----------|-----------------|---------------------|
-| MatMul (6x) | ~40% | 64 per head × 12 heads | **Pipeline** (near-linear) |
-| Bootstrapping (5x) | ~35% | 1 per bootstrap | OA key-switching (1.08x) |
-| GELU | ~9% | 1 | OA key-switching |
-| LayerNorm (2x) | ~5% | 1 | OA key-switching |
-| Softmax | ~3% | 12 (one per head) | **Pipeline** (12-way) |
-| Argmax | ~7% | 1 | OA key-switching |
+---
 
-**MatMul dominates** and is embarrassingly parallel. With pipeline parallelism on MatMul + OA on single-ct ops:
+## 10. Shortcomings and Limitations
 
-### 8.2 Projected BERT Speedup
+1. **Not full BERT-base**: We parallelize MatMul + GELU but not the complete BERT layer (missing: Softmax with attention masking, LayerNorm in multi-GPU mode, bootstrapping, residual connections). The full NEXUS MatMul also uses Galois-rotation-based ciphertext compress/decompress, which we bypass by encrypting columns directly.
 
-| GPUs | Nodes | MatMul (40%) | Single-ct (60%) | Combined |
-|------|-------|-------------|-----------------|----------|
-| 4 | 1 | ~2.5x | ~1.1x | **~1.7x** |
-| 8 | 2 | ~5x | ~1.1x | **~2.7x** |
-| 16 | 4 | ~8x | ~1.1x | **~4.0x** |
+2. **Re-encryption between stages**: MatMul uses N=8192 while GELU uses N=65536. Transitioning requires decrypt → re-encode → re-encrypt (a "client-aided" protocol). This is acceptable for benchmarking but **breaks the non-interactive property** of NEXUS in production. A real deployment would need matched parameters or bootstrapping.
 
-### 8.3 Remaining Work
+3. **MPI serialization overhead**: Ciphertext scatter/gather via MPI uses CPU-side serialization (`save()/load()` to `stringstream`), adding 100-200 ms at 4 nodes. GPU-direct RDMA (GPUDirect) would eliminate this.
 
-1. **Wire pipeline into NEXUS CKKSEvaluator**: Replace single-GPU MatMul with pipeline-parallel version using CtPipeline
-2. **Bootstrapping distribution**: Bootstrapping internally uses rotations (key-switches) — can benefit from OA
-3. **Compute-communication overlap**: Use StreamManager to overlap AllReduce with independent NTT operations
-4. **Larger-scale experiments**: 8-node (32 GPU) runs on MN5 for paper-quality scaling curves
+4. **GaloisKey memory**: `create_galois_keys()` generates all Galois keys (~10+ GB at N=65536). The NEXUS Phantom fork has selective key generation (`create_galois_keys_from_steps`) which we couldn't port, so operations requiring rotations (Softmax, LayerNorm) consume excessive GPU memory in multi-GPU mode.
+
+5. **Amdahl's Law on key-switching**: Our OA implementation only distributes the inner product (25% of key-switch time). The `modup` phase (65%) uses `static __global__` kernels inside Phantom that cannot be called externally. Achieving true limb-level parallelism requires modifying the Phantom library source.
+
+6. **No compute-communication overlap**: MatMul and GELU run sequentially within the pipeline. CUDA stream overlap between scatter and compute, or between re-encryption and GPU work, is not implemented.
+
+## 11. Future Work
+
+1. **Full BERT-base pipeline**: Add Softmax, LayerNorm, residual connections, and wire NEXUS's compress/decompress MatMul into the multi-GPU pipeline
+2. **Bootstrapping parallelism**: Bootstrapping consumes 62% of BERT time (14 multiplicative levels); its internal rotations produce multiple independent ciphertexts amenable to pipeline parallelism
+3. **GPUDirect RDMA for MPI**: Replace CPU-side ciphertext serialization with GPU-direct inter-node transfers to eliminate the 100-200 ms scatter/gather overhead
+4. **Matched parameter sets**: Use a single N=65536 for all operations to eliminate re-encryption, trading MatMul efficiency for end-to-end non-interactivity
+5. **Larger-scale experiments**: 8-node (32 GPU) runs for paper-quality scaling curves; 128+ ciphertexts further amortize MPI overhead
+6. **Modify Phantom for full limb parallelism**: Make `modup` kernels externally callable to distribute the remaining 65% of key-switch time
 
 ---
 

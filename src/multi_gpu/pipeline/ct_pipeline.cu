@@ -70,6 +70,8 @@ CtPipeline CtPipeline::create(
         }
 
         st.rk = new PhantomRelinKey(st.sk->gen_relinkey(*st.ctx));
+        st.pk = new PhantomPublicKey(st.sk->gen_publickey(*st.ctx));
+        st.gk = new PhantomGaloisKey();  // empty until enable_galois_keys()
         st.enc = new PhantomCKKSEncoder(*st.ctx);
     }
 
@@ -132,6 +134,34 @@ void CtPipeline::execute(GpuFn fn) {
     for (auto &t : threads) t.join();
 }
 
+void CtPipeline::execute_full(FullGpuFn fn) {
+    std::vector<std::thread> threads;
+
+    for (int g = 0; g < n_gpus_; g++) {
+        threads.emplace_back([this, g, &fn]() {
+            cudaSetDevice(g);
+            auto &st = states_[g];
+            fn(g, *st.ctx, *st.sk, *st.pk, *st.rk, *st.gk, *st.enc, st.local_cts);
+            cudaDeviceSynchronize();
+        });
+    }
+
+    for (auto &t : threads) t.join();
+}
+
+void CtPipeline::enable_galois_keys() {
+    if (galois_keys_enabled_) return;
+    for (int g = 0; g < n_gpus_; g++) {
+        cudaSetDevice(g);
+        auto &st = states_[g];
+        printf("[CtPipeline] Generating Galois keys on GPU %d...\n", g);
+        *st.gk = st.sk->create_galois_keys(*st.ctx);
+    }
+    galois_keys_enabled_ = true;
+    cudaSetDevice(0);
+    printf("[CtPipeline] Galois keys enabled on all %d GPUs\n", n_gpus_);
+}
+
 std::vector<PhantomCiphertext> CtPipeline::gather() {
     std::vector<PhantomCiphertext> result(total_cts_);
 
@@ -166,7 +196,9 @@ std::vector<PhantomCiphertext> CtPipeline::gather() {
 void CtPipeline::destroy() {
     for (auto &st : states_) {
         delete st.enc;
+        delete st.gk;
         delete st.rk;
+        delete st.pk;
         delete st.sk;
         delete st.ctx;
         st.local_cts.clear();
