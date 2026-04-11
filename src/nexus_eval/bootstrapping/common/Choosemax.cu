@@ -1,8 +1,4 @@
 #include "Choosemax.cuh"
-using namespace NTL;
-// Shadow NTL::min/max with CUDA versions to prevent conflict
-template<typename T> static inline T min(T a, T b) { return a < b ? a : b; }
-template<typename T> static inline T max(T a, T b) { return a > b ? a : b; }
 
 /**************************************************
  * find the index of minimum among c[0] ~ c[num-1]
@@ -18,6 +14,7 @@ int MinIndex(RR* c, int num) {
   }
   return min_index;
 }
+
 /******************************************************
  * find n indices of alternating sign whose sum is maximum among a[0] ~ a[m-1]
  * after executing this function, cur_index[0] ~ cur_index[n-1] become the indices of maximum sum
@@ -25,6 +22,7 @@ int MinIndex(RR* c, int num) {
 void MaxSubsetSum(RR* a, int m, int n, int* cur_index) {
   int cur_m, min_index;
   RR* adj_sum = new RR[m];
+
   cur_m = m;
   for (int i = 0; i <= m - 1; i++) cur_index[i] = i;
   while (cur_m > n) {
@@ -55,6 +53,7 @@ void MaxSubsetSum(RR* a, int m, int n, int* cur_index) {
     } else if (cur_m - n == 1) {
       min_index = MinIndex(a, cur_m);
       for (int i = min_index; i <= cur_m - 2; i++) cur_index[i] = cur_index[i + 1];
+
       cur_m -= 1;
     }
   }

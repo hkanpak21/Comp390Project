@@ -1,9 +1,5 @@
 // #include "Remez.h"
 #include "MinicompRemez.cuh"
-using namespace NTL;
-// Shadow NTL::min/max with CUDA versions to prevent conflict
-template<typename T> static inline T min(T a, T b) { return a < b ? a : b; }
-template<typename T> static inline T max(T a, T b) { return a > b ? a : b; }
 
 namespace minicomp {
 Remez::Remez(RR (*_func)(RR), size_t _inter_num, vector<RR> _inter_start, vector<RR> _inter_end, RR _sc, long _prec, long _deg, long _iter, int _type, RR _scale, bool _is_opt_sampling) {
@@ -18,16 +14,19 @@ Remez::Remez(RR (*_func)(RR), size_t _inter_num, vector<RR> _inter_start, vector
   inter_end = _inter_end;
   func = _func;
   is_opt_sampling = _is_opt_sampling;
+
   sam = new Point[deg + 2];
   coeff = vector<RR>(deg + 1, RR(0));
   ext = new Point[2 * deg];
   ext_maxsum_index = new int[deg + 2];
   temp_ext = new RR[2 * deg];
+
   v.SetLength(deg + 2);
   w.SetLength(deg + 2);
   v_0.SetLength(deg + 2);
   m.SetDims(deg + 2, deg + 2);
 }
+
 Remez::~Remez() {
   //	cout << "~Remez" << endl;
   delete[] sam;
@@ -37,6 +36,7 @@ Remez::~Remez() {
   delete[] temp_ext;
   //	cout << "~Remez finish" << endl;
 }
+
 void Remez::initialize() {
   size_t n, m, remain, t;
   n = deg + 1;
@@ -53,6 +53,7 @@ void Remez::initialize() {
     sam[m * (t - 1) + j].x = inter_start[t - 1] + (inter_end[t - 1] - inter_start[t - 1]) / static_cast<RR>(remain + 1) * static_cast<RR>(j + 1);
     sam[m * (t - 1) + j].y = (*func)(sam[m * (t - 1) + j].x);
   }
+
   // cout << "initialize points" << endl;
   // for(int i=0; i<n+1; i++) cout << sam[i].x << ", " << sam[i].y << endl;
 }
@@ -62,6 +63,7 @@ void Remez::getcoeffwitherr() {
     w[i] = sam[i].y;
   }
   RR var;
+
   // powereval
   if (type == 0) {
     for (long i = 0; i < deg + 2; i++) {
@@ -95,21 +97,26 @@ void Remez::getcoeffwitherr() {
       m[i][deg + 1] = 2 * (i % 2) - 1;
     }
   }
+
   RR deter;
   mat_RR mtrns;
   mat_RR minv;
+
   transpose(mtrns, m);
   inv(deter, minv, mtrns);
   v_0 = w * minv;
+
   for (int i = 0; i <= deg; i++) {
     coeff[i] = v_0[i];
   }
 }
+
 int Remez::getextreme() {
   // find extreme points
   Point* temp_ext = new Point[2 * deg];
   int temp_ext_count;
   ext_count = 0;
+
   for (size_t j = 0; j < inter_num; j++) {
     find_extreme(func, temp_ext, temp_ext_count, coeff, deg, inter_start[j], inter_end[j], prec, sc, type, scale, is_opt_sampling);
     for (int i = 0; i < temp_ext_count; i++) {
@@ -122,6 +129,7 @@ int Remez::getextreme() {
   // cout << "number of extreme points: " << ext_count << endl;
   // cout << "print extreme points" << endl;
   // for(size_t i=0; i<ext_count; i++) cout << ext[i].x << ", " << ext[i].y << endl;
+
   /*
   //	find_extreme(temp_ext, temp_ext_count, coeff, deg, first_inter_start, first_inter_end, prec, sc, type, scale);
           find_extreme(temp_ext, temp_ext_count, coeff, deg, inter_start[0], inter_end[0], prec, sc, type, scale);
@@ -131,6 +139,7 @@ int Remez::getextreme() {
                   ext[ext_count].locmm = temp_ext[i].locmm;
                   ext_count ++;
           }
+
   //	find_extreme(temp_ext, temp_ext_count, coeff, deg, second_inter_start, second_inter_end, prec, sc, type, scale);
           find_extreme(temp_ext, temp_ext_count, coeff, deg, inter_start[1], inter_end[1], prec, sc, type, scale);
           for(int i=0; i<temp_ext_count; i++) {
@@ -140,6 +149,7 @@ int Remez::getextreme() {
                   ext_count ++;
           }
   */
+
   // show error message
   if (ext_count < deg + 2) {
     cout << "Couldn't find all the extreme points! " << endl;
@@ -148,9 +158,11 @@ int Remez::getextreme() {
   }
   return 1;
 }
+
 void Remez::choosemaxs() {
   for (int i = 0; i < ext_count; i++) temp_ext[i] = abs(ext[i].y);
   MaxSubsetSum(temp_ext, ext_count, deg + 2, ext_maxsum_index);
+
   maxerr = RR(0);
   for (int i = 0; i < deg + 2; i++) {
     sam[i].x = ext[ext_maxsum_index[i]].x;
@@ -158,10 +170,12 @@ void Remez::choosemaxs() {
     if (maxerr < ext[ext_maxsum_index[i]].y) maxerr = ext[ext_maxsum_index[i]].y;
   }
 }
+
 bool Remez::test() {
   long it = 0;
   // int sum = 0;
   // RR* temp = new RR[deg+2];
+
   initialize();
   while (it < iter) {
     it++;
@@ -169,7 +183,9 @@ bool Remez::test() {
     getcoeffwitherr();
     if (getextreme() < 0) return false;
     choosemaxs();
+
     RR max, min;
+
     max = abs(ext[0].y);
     min = abs(ext[0].y);
     for (int i = 1; i < ext_count; i++) {
@@ -181,9 +197,11 @@ bool Remez::test() {
       break;
     }
   }
+
   // delete [] temp;
   return true;
 }
+
 void Remez::printgraph(ofstream& out, RR start, RR end, RR sc) {
   RR scan;
   scan = start;
@@ -192,18 +210,22 @@ void Remez::printgraph(ofstream& out, RR start, RR end, RR sc) {
     scan += sc;
   }
 }
+
 RR Remez::getmaxerr() {
   return maxerr;
 }
+
 void Remez::getcoeff(RR _coeff[]) {
   for (long i = 0; i < deg + 1; i++)
     _coeff[i] = coeff[i];
 }
+
 void Remez::getcoeff(vector<RR>& _coeff) {
   _coeff.clear();
   for (long i = 0; i < deg + 1; i++)
     _coeff.emplace_back(coeff[i]);
 }
+
 void Remez::getext_xpos(vector<RR>& _ext_xpos) {
   _ext_xpos.clear();
   for (int i = deg / 2 + 1; i < deg + 2; i++) _ext_xpos.emplace_back(sam[i].x);

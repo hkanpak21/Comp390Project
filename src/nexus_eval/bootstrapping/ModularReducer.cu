@@ -1,12 +1,4 @@
 #include "ModularReducer.cuh"
-using namespace NTL;
-// Shadow NTL::min/max with CUDA versions to prevent conflict
-template<typename T> static inline T min(T a, T b) { return a < b ? a : b; }
-template<typename T> static inline T max(T a, T b) { return a > b ? a : b; }
-
-using NTL::RR;
-using NTL::to_RR;
-using NTL::to_double;
 
 ModularReducer::ModularReducer(long _boundary_K, double _log_width, long _deg, long _num_double_formula, long _inverse_deg,
                                CKKSEvaluator *_ckks) : boundary_K(_boundary_K), log_width(_log_width), deg(_deg), num_double_formula(_num_double_formula), inverse_deg(_inverse_deg), ckks(_ckks) {

@@ -13,18 +13,18 @@
 #include "Point.cuh"
 
 using namespace std;
+using namespace NTL;
 
-
-NTL::RR fracpart(NTL::RR x);
-NTL::RR sqrtfracpart(NTL::RR x, NTL::RR a);
-NTL::RR fraccos(NTL::RR x, long scale);
-NTL::RR arcsin(NTL::RR x);
+RR fracpart(RR x);
+RR sqrtfracpart(RR x, RR a);
+RR fraccos(RR x, long scale);
+RR arcsin(RR x);
 bool yabscompare(Point a, Point b);
 bool ycompare(Point a, Point b);
 bool xcompare(Point a, Point b);
-bool isin(NTL::RR x, long K, NTL::RR width);
-NTL::RR chebeval(long deg, NTL::RR *coeff, NTL::RR val);
-void showgraph(ofstream &out, NTL::RR *coeff, long deg, long K, NTL::RR sc);
+bool isin(RR x, long K, RR width);
+RR chebeval(long deg, RR *coeff, RR val);
+void showgraph(ofstream &out, RR *coeff, long deg, long K, RR sc);
 bool oddevennextcombi(long *arr, long arrlen, long len);
 void oddbabycount(long &k, long &m, long deg);
 void babycount(long &k, long &m, long deg);
@@ -37,7 +37,7 @@ void mul(complex<double> *&rtn, complex<double> *&vec1, complex<double> *&vec2, 
 void mulinplace(complex<double> *&vec, complex<double> *&mulvec, long n);
 void constmul(complex<double> *&rtn, complex<double> *&vec, complex<double> constant, long n);
 void constmulinplace(complex<double> *&vec, complex<double> constant, long n);
-void text_to_array(ifstream &in, NTL::RR *&array, long n);
+void text_to_array(ifstream &in, RR *&array, long n);
 int giantstep(int M);
 void rotation(int logslot, int Nh, int shiftcount, const vector<complex<double>> &vec, vector<complex<double>> &rtnvec);
 

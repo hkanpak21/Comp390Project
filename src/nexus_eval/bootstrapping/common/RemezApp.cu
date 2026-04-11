@@ -1,8 +1,4 @@
 #include "RemezApp.cuh"
-using namespace NTL;
-// Shadow NTL::min/max with CUDA versions to prevent conflict
-template<typename T> static inline T min(T a, T b) { return a < b ? a : b; }
-template<typename T> static inline T max(T a, T b) { return a > b ? a : b; }
 
 RR GetError(int d, RR t, bool is_first_function, int type, RR scale) {
   Remez *rm;
@@ -12,6 +8,7 @@ RR GetError(int d, RR t, bool is_first_function, int type, RR scale) {
   long RRprec;
   int num;
   RR sc;
+
   size_t inter_num = 2;
   vector<RR> inter_start, inter_end;
   if (is_first_function == true) {
@@ -25,18 +22,22 @@ RR GetError(int d, RR t, bool is_first_function, int type, RR scale) {
     inter_end.emplace_back(RR(-1) + t);
     inter_end.emplace_back(RR(1) + t);
   }
+
   //  num & RRprec setting!!!
   num = 500;
   RRprec = 1500;  // for deg 64. RRprec >= 1500 approximately. But, if tau > 1/2, RRprec = 300 is ok.
+
   RR::SetPrecision(RRprec);
   sc = t / static_cast<RR>(num);
   //	rm = new Remez(t, is_first_function, sc, prec, d+1, iteration, type, scale);
   rm = new Remez(sgn, inter_num, inter_start, inter_end, sc, prec, d + 1, iteration, type, scale, true);
   rm->test();
   maxerr = rm->getmaxerr();
+
   delete rm;
   return maxerr;
 }
+
 RR GetErrorCoeff(int d, RR t, vector<RR> &coeff, bool is_first_function, int type, RR scale) {
   Remez *rm;
   RR maxerr;
@@ -46,6 +47,7 @@ RR GetErrorCoeff(int d, RR t, vector<RR> &coeff, bool is_first_function, int typ
   int num;
   ;
   RR sc;
+
   size_t inter_num = 2;
   vector<RR> inter_start, inter_end;
   if (is_first_function == true) {
@@ -59,9 +61,11 @@ RR GetErrorCoeff(int d, RR t, vector<RR> &coeff, bool is_first_function, int typ
     inter_end.emplace_back(RR(-1) + t);
     inter_end.emplace_back(RR(1) + t);
   }
+
   //  num & RRprec setting!!!
   num = 1000;
   RRprec = 300;
+
   RR::SetPrecision(RRprec);
   sc = t / static_cast<RR>(num);
   //	rm = new Remez(t, is_first_function, sc, prec, d+1, iteration, type, scale);
@@ -69,6 +73,7 @@ RR GetErrorCoeff(int d, RR t, vector<RR> &coeff, bool is_first_function, int typ
   rm->test();
   rm->getcoeff(coeff);
   maxerr = rm->getmaxerr();
+
   delete rm;
   return maxerr;
 }

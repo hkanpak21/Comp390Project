@@ -53,7 +53,7 @@ int main() {
     // The bootstrapper will consolidate via subsum.
     long logN = 15;
     long logn = logN - 2;                    // 13 (SPARSE mode)
-    long sparse_slots_val = 0;               // 0 = don't modify encoder (use all 16384 slots normally)
+    long sparse_slots_val = 1L << logn;       // 8192 — NEXUS uses sparse mode
     long logNh = logN - 1;                   // 14
 
     int logp = 46;
@@ -63,7 +63,7 @@ int main() {
     int main_mod_count = 17;
     int bs_mod_count = 14;
     int total_level = main_mod_count + bs_mod_count;
-    int secret_key_hw = 0;  // default
+    int secret_key_hw = 192;  // NEXUS uses h=192
 
     // Bootstrapping parameters
     long boundary_K = 25;
@@ -177,18 +177,24 @@ int main() {
     // ═══ Test 1: Simple bootstrap roundtrip ═══
     printf("=== Test 1: Bootstrap roundtrip ===\n");
 
-    // Create input — use slot_count for full mode
+    // Create input matching NEXUS convention:
+    // sparse_slots random values, repeated to fill slot_count
     size_t input_size = sparse_slots_val > 0 ? sparse_slots_val : slot_count;
     mt19937 rng(42);
     uniform_real_distribution<double> dist(-1.0, 1.0);
-    vector<double> input(input_size, 0.0);
-    for (auto &v : input) v = dist(rng);
+    vector<double> sparse_input(input_size, 0.0);
+    for (auto &v : sparse_input) v = dist(rng);
 
-    // Encrypt
+    // Fill full slot_count vector with repeated sparse pattern (NEXUS style)
+    vector<double> input(slot_count, 0.0);
+    for (size_t i = 0; i < slot_count; i++)
+        input[i] = sparse_input[i % input_size];
+
+    // Encrypt — call Phantom encoder directly (bypass our wrapper's resize)
     PhantomPlaintext plain_input;
     PhantomCiphertext cipher_input;
-    ckks_eval.encoder.encode(input, scale, plain_input);
-    ckks_eval.encryptor.encrypt(plain_input, cipher_input);
+    encoder.encode(context, input, scale, plain_input);
+    public_key.encrypt_asymmetric(context, plain_input, cipher_input);
 
     printf("  Encrypted: coeff_modulus_size = %zu\n", cipher_input.coeff_modulus_size());
 
@@ -198,9 +204,22 @@ int main() {
     }
     printf("  After mod-switch to main: coeff_modulus_size = %zu\n", cipher_input.coeff_modulus_size());
 
-    // Verify pre-bootstrap
-    double pre_mae = ckks_eval.calculate_MAE(input, cipher_input, input_size);
-    printf("  Pre-bootstrap MAE: %.9f\n", pre_mae);
+    // Verify pre-bootstrap — decode directly via Phantom encoder
+    {
+        PhantomPlaintext tmp_pt;
+        secret_key.decrypt(context, cipher_input, tmp_pt);
+        vector<double> dec_vals;
+        encoder.decode(context, tmp_pt, dec_vals);
+        printf("  Decoded %zu values (sparse_input has %zu)\n", dec_vals.size(), input_size);
+        double mae = 0;
+        size_t cmp = std::min(dec_vals.size(), input_size);
+        for (size_t i = 0; i < cmp; i++) mae += fabs(sparse_input[i] - dec_vals[i]);
+        mae /= cmp;
+        printf("  Pre-bootstrap MAE (direct decode): %.9f\n", mae);
+        // Print first 5 values
+        for (size_t i = 0; i < 5 && i < cmp; i++)
+            printf("    [%zu] expected=%.6f got=%.6f diff=%.6e\n", i, sparse_input[i], dec_vals[i], fabs(sparse_input[i]-dec_vals[i]));
+    }
     fflush(stdout);
 
     // Directly mod-switch to level 1 (no computation — test pure bootstrap)
@@ -261,7 +280,7 @@ int main() {
     printf("  Bootstrap Test Summary\n");
     printf("════════════════════════════════════════════════\n");
     printf("  N=%zu, sparse_slots=%ld, hamming=%d\n", poly_modulus_degree, sparse_slots_val, secret_key_hw);
-    printf("  Pre-bootstrap MAE:    %.9f\n", pre_mae);
+    printf("  Pre-bootstrap MAE:    (see direct decode above)\n");
     printf("  Post-bootstrap MAE:   %.9f %s\n", post_mae, post_mae < 0.01 ? "PASS" : "FAIL");
     printf("  Post-2nd-boot MAE:    %.9f %s\n", post_mae2, post_mae2 < 0.1 ? "PASS" : "FAIL");
     printf("  Bootstrap time:       %.1f ms\n", boot_ms);

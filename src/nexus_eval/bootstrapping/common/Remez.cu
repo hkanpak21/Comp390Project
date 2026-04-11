@@ -1,9 +1,6 @@
 #include <NTL/RR.h>
+
 #include "Remez.cuh"
-using namespace NTL;
-// Shadow NTL::min/max with CUDA versions to prevent conflict
-template<typename T> static inline T min(T a, T b) { return a < b ? a : b; }
-template<typename T> static inline T max(T a, T b) { return a > b ? a : b; }
 
 namespace boot {
 Remez::Remez(RemezParam _params, long _boundary_K, double _log_width, long _deg)
@@ -11,26 +8,35 @@ Remez::Remez(RemezParam _params, long _boundary_K, double _log_width, long _deg)
   width = to_RR(pow(2.0, -_log_width));
   sc = width / pow(2.0, params.log_scan_step_diff);
   approx = power2_RR(-params.log_approx_degree);
+
   max_err = 1000;
   min_err = 1;
+
   sample_point = new Point[deg + 2];
   extreme_point = new Point[2 * deg + 2 * boundary_K];
+
   coeff = new RR[deg + 1];
 }
+
 void Remez::better_initialize() {
   int* nodecount = new int[boundary_K];
   int deg_bdd = deg + 2;
+
   for (int i = 0; i < boundary_K; i++)
     nodecount[i] = 1;
   int tot_deg = 2 * boundary_K - 1;
   double err = pow(2.0, -log_width);
+
   RR::SetPrecision(params.RR_prec);
+
   double* bdd = new double[boundary_K];
+
   double temp = 0;
   for (int i = 1; i <= (2 * boundary_K - 1); i++)
     temp -= log2((double)i);
   temp += (2 * boundary_K - 1) * log2(2 * M_PI);
   temp += log2(err);
+
   for (int i = 0; i < boundary_K; i++) {
     bdd[i] = temp;
     for (int j = 1; j <= boundary_K - 1 - i; j++)
@@ -38,19 +44,24 @@ void Remez::better_initialize() {
     for (int j = 1; j <= boundary_K - 1 + i; j++)
       bdd[i] += log2((double)j + err);
   }
+
   int max_iter = 200;
   int iter;
+
   for (iter = 0; iter < max_iter; iter++) {
     if (tot_deg >= deg_bdd)
       break;
     int maxi = max_index(bdd, boundary_K);
+
     if (maxi != 0) {
       if ((tot_deg + 2) > deg_bdd)
         break;
+
       for (int i = 0; i < boundary_K; i++) {
         bdd[i] -= log2(tot_deg + 1);
         bdd[i] -= log2(tot_deg + 2);
         bdd[i] += 2.0 * log2(2.0 * M_PI);
+
         if (i != maxi) {
           bdd[i] += log2(abs((double)(i - maxi)) + err);
           bdd[i] += log2((double)(i + maxi) + err);
@@ -59,6 +70,7 @@ void Remez::better_initialize() {
           bdd[i] += log2(2.0 * (double)i + err);
         }
       }
+
       tot_deg += 2;
     } else {
       bdd[0] -= log2(tot_deg + 1);
@@ -69,19 +81,26 @@ void Remez::better_initialize() {
         bdd[i] += log2(2.0 * M_PI);
         bdd[i] += log2((double)i + err);
       }
+
       tot_deg += 1;
     }
+
     nodecount[maxi] += 1;
   }
+
   delete[] bdd;
+
   if (tot_deg == deg_bdd - 1) {
     nodecount[0]++;
     tot_deg++;
   }
+
   RR inter_size = RR(pow(2.0, -log_width));
+
   int cnt = 0;
   if ((nodecount[0] % 2) != 0)
     sample_point[cnt++].x = RR(0);
+
   for (int i = boundary_K - 1; i > 0; i--) {
     for (int j = 1; j <= nodecount[i]; j++) {
       RR temp = ((RR(2 * j - 1)) * ComputePi_RR()) / (RR(2 * nodecount[i]));
@@ -89,18 +108,23 @@ void Remez::better_initialize() {
       sample_point[cnt++].x = RR(-i) - inter_size * cos(temp);
     }
   }
+
   for (int j = 1; j <= (nodecount[0] / 2); j++) {
     RR temp = ((RR(2 * j - 1)) * ComputePi_RR()) / (RR(2 * nodecount[0]));
     sample_point[cnt++].x = inter_size * cos(temp);
     sample_point[cnt++].x = -inter_size * cos(temp);
   }
+
   sort(sample_point, sample_point + (deg + 2), xcompare);
+
   for (int i = 0; i < deg + 2; i++) {
     sample_point[i].y = function_value(sample_point[i].x);
     // std::cout << sample_point[i].x  << std::endl;
   }
+
   delete[] nodecount;
 }
+
 void Remez::initialize() {
   RR::SetPrecision(params.RR_prec);
   long* nodecount = new long[boundary_K];
@@ -148,18 +172,23 @@ void Remez::initialize() {
   //         cout << sample_point[j].x << endl;
   // }
 }
+
 void Remez::getcoeffwitherr() {
   RR::SetPrecision(params.RR_prec);
+
   vec_RR v, w, v_0;
   mat_RR m;
+
   v.SetLength(deg + 2);
   w.SetLength(deg + 2);
   v_0.SetLength(deg + 2);
   m.SetDims(deg + 2, deg + 2);
+
   for (long i = 0; i < deg + 2; i++) {
     v[i] = sample_point[i].x;
     w[i] = sample_point[i].y;
   }
+
   RR var;
   for (long i = 0; i < deg + 2; i++) {
     var = v[i];
@@ -182,6 +211,7 @@ void Remez::getcoeffwitherr() {
   current_err = floor(power2_RR(params.log_round_prec) * abs(v_0[deg + 1])) / power2_RR(params.log_round_prec);
   // cout << current_err << endl;
 }
+
 void Remez::getextreme_local(Point* local_extreme_point, long& local_extreme_count, long k) {
   RR::SetPrecision(params.RR_prec);
   RR::SetOutputPrecision(20);
@@ -191,17 +221,20 @@ void Remez::getextreme_local(Point* local_extreme_point, long& local_extreme_cou
   long tmpinc;
   RR scan_1;
   RR scan_2;
+
   scan_2 = k - width;
   // std::cout << "k = " << k << " width = " << width << std::endl;
   RR scan_y1;
   RR scan_y2;
   scan_y2 = chebeval(deg, coeff, scan_2 / boundary_K) - function_value(scan_2);
   local_extreme_count = 0;
+
   RR detail[3];
   RR prec_sc, prec_ext, prec_x, tmp;
   long prec_iter, prec_ind;
   bool prec_end;
   long tmp_inc;
+
   while (scan_2 < k + width + sc) {
     scan_1 = scan_2;
     scan_2 = scan_1 + sc;
@@ -213,6 +246,7 @@ void Remez::getextreme_local(Point* local_extreme_point, long& local_extreme_cou
       scan_2 = round(scan_2) + 1 - width;
       scan_y1 = chebeval(deg, coeff, scan_1 / boundary_K) - function_value(scan_1);
       scan_y2 = chebeval(deg, coeff, scan_2 / boundary_K) - function_value(scan_2);
+
       prec_end = false;
       prec_x = scan_1 - sc;
       while (!prec_end) {
@@ -245,6 +279,7 @@ void Remez::getextreme_local(Point* local_extreme_point, long& local_extreme_cou
           tmpinc = 1;
         else
           tmpinc = -1;
+
         // cout << "###" << inc_2 << " " << prec_ext << " " << tmpinc * prec_ext << endl;
         if (tmpinc * prec_ext >= current_err) {
           local_extreme_point[local_extreme_count].x = prec_x;
@@ -305,6 +340,7 @@ void Remez::getextreme_local(Point* local_extreme_point, long& local_extreme_cou
                 }
               }
             }
+
             if (inc_1 == 0 && prec_ind != 0) prec_end = false;
             prec_x = detail[prec_ind];
             prec_sc = prec_sc / 2;
@@ -329,6 +365,7 @@ void Remez::getextreme_local(Point* local_extreme_point, long& local_extreme_cou
               local_extreme_point[local_extreme_count].locmm = -1;
             else
               local_extreme_point[local_extreme_count].locmm = +1;
+
             // cout << extreme_point[local_extreme_count].x << " " << extreme_point[local_extreme_count].y << " " << extreme_point[local_extreme_count].locmm << endl;
             local_extreme_count++;
             // cout << "prec_end : " << prec_end << endl;
@@ -343,28 +380,35 @@ void Remez::getextreme_local(Point* local_extreme_point, long& local_extreme_cou
     }
   }
 }
+
 void Remez::getextreme() {
   Point** local_extreme_point_array = new Point*[2 * boundary_K - 1];
   for (int i = 0; i < 2 * boundary_K - 1; i++) {
     local_extreme_point_array[i] = new Point[4 * deg];
   }
   long* local_extreme_count_array = new long[2 * boundary_K - 1];
+
   vector<thread> vec_thr;
+
   for (int i = 0; i < 2 * boundary_K - 1; i++) {
     vec_thr.emplace_back(&Remez::getextreme_local, this, local_extreme_point_array[i], ref(local_extreme_count_array[i]), i - boundary_K + 1);
     // getextreme_local(local_extreme_point_array[i], local_extreme_count_array[i], i - boundary_K + 1);
   }
+
   for (auto& t : vec_thr)
     t.join();
+
   extreme_count = 0;
   for (int i = 0; i < 2 * boundary_K - 1; i++) {
     for (int j = 0; j < local_extreme_count_array[i]; j++) {
       extreme_point[extreme_count].x = local_extreme_point_array[i][j].x;
       extreme_point[extreme_count].y = local_extreme_point_array[i][j].y;
       extreme_point[extreme_count].locmm = local_extreme_point_array[i][j].locmm;
+
       extreme_count++;
     }
   }
+
   // cout << "ok" << endl;
   max_err = 0;
   for (long i = 0; i < extreme_count; i++) {
@@ -373,18 +417,22 @@ void Remez::getextreme() {
   }
   sort(extreme_point, extreme_point + extreme_count, xcompare);
   // cout << "**" << extreme_count << endl;
+
   for (int i = 0; i < 2 * boundary_K - 1; i++) {
     delete[] local_extreme_point_array[i];
   }
+
   delete[] local_extreme_point_array;
   delete[] local_extreme_count_array;
 }
+
 void Remez::choosemaxs() {
   RR::SetPrecision(params.RR_prec);
   Point* extract = new Point[extreme_count];
   long count = 0, ind = 0;
   max_err = RR(0);
   min_err = RR(1000);
+
   long* temparray = new long[extreme_count];
   long tempcount = 0;
   RR maxtempvalue;
@@ -395,6 +443,7 @@ void Remez::choosemaxs() {
       tempcount++;
       ind++;
     }
+
     else {
       if (extreme_point[ind].locmm * extreme_point[ind - 1].locmm == 1) {
         temparray[tempcount] = ind;
@@ -428,6 +477,7 @@ void Remez::choosemaxs() {
   extract[count].locmm = extreme_point[maxtemp].locmm;
   count++;
   tempcount = 0;
+
   // cout << count << " " << deg + 2 << endl;
   RR minsum;
   long minindex = 0;
@@ -445,6 +495,7 @@ void Remez::choosemaxs() {
         count--;
       }
     }
+
     else if (count == deg + 4) {
       for (long i = 0; i < count; i++) {
         if (minsum > abs(extract[i].y) + abs(extract[(i + 1) % count].y)) {
@@ -468,6 +519,7 @@ void Remez::choosemaxs() {
         count -= 2;
       }
     }
+
     else {
       for (long i = 0; i < count - 1; i++) {
         if (minsum > abs(extract[i].y) + abs(extract[i + 1].y)) {
@@ -504,13 +556,17 @@ void Remez::choosemaxs() {
     }
     if (min_err > abs(extract[i].y)) min_err = abs(extract[i].y);
   }
+
   delete[] extract;
   delete[] temparray;
 }
+
 void Remez::generate_optimal_poly(Polynomial& poly) {
   RR::SetOutputPrecision(17);
+
   better_initialize();
   long it = 0;
+
   while ((max_err - min_err) / min_err > approx) {
     getcoeffwitherr();
     getextreme();
@@ -522,14 +578,17 @@ void Remez::generate_optimal_poly(Polynomial& poly) {
     // cout << it << "th end" << endl;
     // cout << max_err << " " << min_err << endl;
   }
+
   // for(long i = 0; i < extreme_count; i++) {
   //         cout << extreme_point[i].x << " " << extreme_point[i].y << " " << extreme_point[i].locmm << endl;
   // }
   // cout << endl;
+
   // showcoeff();
   poly.set_polynomial(deg, coeff, "cheb");
   //	showgraph(out, coeff, deg, K, sc);
 }
+
 void Remez::showcoeff() {
   for (int i = 0; i < deg + 1; i++) {
     cout << i << " : " << coeff[i] << endl;

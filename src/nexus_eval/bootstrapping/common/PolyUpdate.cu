@@ -1,11 +1,8 @@
 #include <NTL/LLL.h>
 #include <NTL/RR.h>
 #include <NTL/mat_RR.h>
+
 #include "PolyUpdate.cuh"
-using namespace NTL;
-// Shadow NTL::min/max with CUDA versions to prevent conflict
-template<typename T> static inline T min(T a, T b) { return a < b ? a : b; }
-template<typename T> static inline T max(T a, T b) { return a > b ? a : b; }
 
 namespace minicomp {
 // n : odd
@@ -19,6 +16,7 @@ Tree::Tree() {
   tree[0] = -1;
   tree[1] = 0;
 }
+
 Tree::Tree(evaltype ty) {
   depth = 0;
   type = ty;
@@ -29,8 +27,10 @@ Tree::Tree(evaltype ty) {
   tree[0] = -1;
   tree[1] = 0;
 }
+
 Tree::Tree(Tree a, Tree b, int g) {
   if (a.type != b.type) throw std::invalid_argument("the types of two trees are not the same");
+
   if (a.depth > b.depth)
     depth = a.depth + 1;
   else
@@ -38,6 +38,7 @@ Tree::Tree(Tree a, Tree b, int g) {
   type = a.type;
   tree.resize(pow2(depth + 1), -1);
   tree[1] = g;
+
   for (int i = 1; i <= pow2(a.depth + 1) - 1; i++) {
     int temp = pow2(static_cast<int>(log(static_cast<double>(i)) / log(2.0)));
     tree[i + temp] = a.tree[i];
@@ -47,6 +48,7 @@ Tree::Tree(Tree a, Tree b, int g) {
     tree[i + 2 * temp] = b.tree[i];
   }
 }
+
 void Tree::clear() {
   depth = 0;
   type = evaltype::none;
@@ -54,6 +56,7 @@ void Tree::clear() {
   tree[0] = -1;
   tree[1] = 0;
 }
+
 void Tree::print() {
   cout << "depth of tree: " << depth << endl;
   for (int i = 0; i <= depth; i++) {
@@ -62,9 +65,11 @@ void Tree::print() {
     }
     cout << endl;
   }
+
   if (type == evaltype::oddbaby) {
     cout << "m: " << m << endl;
     cout << "l: " << l << endl;
+
     // number of nonscalar multiplications
     int nonscalar = m - 1 + pow2(l - 1) - 1;
     for (size_t i = 0; i < pow2(depth + 1); i++)
@@ -74,14 +79,17 @@ void Tree::print() {
   } else if (type == evaltype::baby) {
     cout << "m: " << m << endl;
     cout << "b: " << b << endl;
+
     // number of nonscalar multiplications
     int nonscalar = m + b - 2;
+
     for (size_t i = 0; i < pow2(depth + 1); i++)
       if (tree[i] > 0) nonscalar++;
     cout << "nonscalar: " << nonscalar << endl;
     cout << endl;
   }
 }
+
 // void Tree::babyprint()
 // {
 // 	cout << "depth of tree: " << depth << endl;
@@ -95,8 +103,10 @@ void Tree::print() {
 // 	}
 // 	cout << "m: " << m << endl;
 // 	cout << "b: " << b << endl;
+
 // 	// number of nonscalar multiplications
 // 	int nonscalar = m+b-2;
+
 // 	for(size_t i=0; i<pow2(depth+1); i++) if(tree[i]>0) nonscalar++;
 // 	cout << "nonscalar: " << nonscalar << endl;
 // 	cout << endl;
@@ -105,12 +115,14 @@ void Tree::merge(Tree a, Tree b, int g) {
   clear();
   if (a.type != b.type) throw std::invalid_argument("the types of two trees are not the same");
   type = a.type;
+
   if (a.depth > b.depth)
     depth = a.depth + 1;
   else
     depth = b.depth + 1;
   tree.resize(pow2(depth + 1), -1);
   tree[1] = g;
+
   for (int i = 1; i <= pow2(a.depth + 1) - 1; i++) {
     int temp = pow2(static_cast<int>(log(static_cast<double>(i)) / log(2.0)));
     tree[i + temp] = a.tree[i];
@@ -120,9 +132,11 @@ void Tree::merge(Tree a, Tree b, int g) {
     tree[i + 2 * temp] = b.tree[i];
   }
 }
+
 Polynomial::Polynomial() {
   deg = -1;
 }
+
 Polynomial::Polynomial(long _deg) {
   deg = _deg;
   for (int i = 0; i < deg + 1; i++) {
@@ -130,6 +144,7 @@ Polynomial::Polynomial(long _deg) {
     chebcoeff.emplace_back(RR(0));
   }
 }
+
 Polynomial::Polynomial(long _deg, vector<RR> _coeff, string tag) {
   deg = _deg;
   if (tag == "power") {
@@ -140,6 +155,7 @@ Polynomial::Polynomial(long _deg, vector<RR> _coeff, string tag) {
     for (int i = 0; i < deg + 1; i++) coeff.emplace_back(RR(0));
   }
 }
+
 Polynomial::Polynomial(long _deg, RR *_coeff, string tag) {
   deg = _deg;
   if (tag == "power") {
@@ -150,9 +166,11 @@ Polynomial::Polynomial(long _deg, RR *_coeff, string tag) {
     for (int i = 0; i < deg + 1; i++) coeff.emplace_back(RR(0));
   }
 }
+
 void Polynomial::get_coeff(vector<RR> &_coeff) {
   _coeff = coeff;
 }
+
 void Polynomial::showcoeff() {
   for (int i = 0; i < deg + 1; i++) {
     //	cout << "x^" << i << " : " << coeff[i] << endl;
@@ -160,15 +178,18 @@ void Polynomial::showcoeff() {
   }
   cout << endl;
 }
+
 void Polynomial::showchebcoeff() {
   for (int i = 0; i < deg + 1; i++) {
     cout << "term " << i << " : " << chebcoeff[i] << endl;
   }
   cout << endl;
 }
+
 void Polynomial::chebround(Polynomial &poly, long bitprec) {
   RR expprec;
   pow(expprec, static_cast<RR>(2.0), static_cast<RR>(bitprec));
+
   deg = poly.deg;
   coeff.clear();
   chebcoeff.clear();
@@ -177,6 +198,7 @@ void Polynomial::chebround(Polynomial &poly, long bitprec) {
     chebcoeff.emplace_back(floor(poly.chebcoeff[i] * expprec + static_cast<RR>(0.5)) / expprec);
   }
 }
+
 void Polynomial::copy(Polynomial poly) {
   deg = poly.deg;
   coeff.clear();
@@ -186,11 +208,13 @@ void Polynomial::copy(Polynomial poly) {
     chebcoeff.emplace_back(poly.chebcoeff[i]);
   }
 }
+
 void Polynomial::power_to_cheb() {
   Polynomial chebbasis, tmp(deg);
   for (int i = 0; i <= deg; i++) {
     tmp.coeff[i] = coeff[i];
   }
+
   for (int i = deg; i >= 0; i--) {
     chebyshev(chebbasis, i);
     chebcoeff[i] = tmp.coeff[i] / chebbasis.coeff[i];
@@ -200,6 +224,7 @@ void Polynomial::power_to_cheb() {
     subtinplace(tmp, chebbasis);
   }
 }
+
 void Polynomial::cheb_to_power() {
   Polynomial chebbasis, tmp(deg);
   for (int i = 0; i <= deg; i++) {
@@ -209,15 +234,18 @@ void Polynomial::cheb_to_power() {
     }
     addinplace(tmp, chebbasis);
   }
+
   for (int i = 0; i <= deg; i++) {
     coeff[i] = tmp.coeff[i];
   }
 }
+
 void Polynomial::power_to_cheb_scale(RR scale) {
   Polynomial chebbasis, tmp(deg);
   for (int i = 0; i <= deg; i++) {
     tmp.coeff[i] = coeff[i];
   }
+
   for (int i = deg; i >= 0; i--) {
     chebyshev_scale(chebbasis, i, scale);
     chebcoeff[i] = tmp.coeff[i] / chebbasis.coeff[i];
@@ -227,6 +255,7 @@ void Polynomial::power_to_cheb_scale(RR scale) {
     subtinplace(tmp, chebbasis);
   }
 }
+
 void Polynomial::cheb_to_power_scale(RR scale) {
   Polynomial chebbasis, tmp(deg);
   for (int i = 0; i <= deg; i++) {
@@ -236,10 +265,12 @@ void Polynomial::cheb_to_power_scale(RR scale) {
     }
     addinplace(tmp, chebbasis);
   }
+
   for (int i = 0; i <= deg; i++) {
     coeff[i] = tmp.coeff[i];
   }
 }
+
 // coeff should be set
 RR Polynomial::evaluate(RR input) {
   RR rtn = RR(0);
@@ -250,6 +281,7 @@ RR Polynomial::evaluate(RR input) {
   }
   return rtn;
 }
+
 RR Polynomial::evaluate_cheb(RR input) {
   RR rtn = RR(0), val = input;
   if (deg == 0)
@@ -268,6 +300,7 @@ RR Polynomial::evaluate_cheb(RR input) {
   }
   return rtn;
 }
+
 void mul(Polynomial &rtn, Polynomial &a, Polynomial &b) {
   rtn.deg = a.deg + b.deg;
   rtn.coeff.resize(a.deg + b.deg + 1);
@@ -279,12 +312,14 @@ void mul(Polynomial &rtn, Polynomial &a, Polynomial &b) {
     }
   }
 }
+
 void mul(Polynomial &rtn, Polynomial &a, RR b) {
   rtn.deg = a.deg;
   rtn.coeff.resize(a.deg + 1);
   rtn.chebcoeff.resize(a.deg + 1, RR(0));
   for (long i = 0; i <= rtn.deg; i++) rtn.coeff[i] = a.coeff[i] * b;
 }
+
 void add(Polynomial &rtn, Polynomial &a, Polynomial &b) {
   if (a.deg >= b.deg) {
     rtn.copy(Polynomial(a.deg, a.coeff, "power"));
@@ -294,6 +329,7 @@ void add(Polynomial &rtn, Polynomial &a, Polynomial &b) {
     for (int i = 0; i <= a.deg; i++) rtn.coeff[i] += a.coeff[i];
   }
 }
+
 void subt(Polynomial &rtn, Polynomial &a, Polynomial &b) {
   if (a.deg >= b.deg) {
     rtn.copy(Polynomial(a.deg, a.coeff, "power"));
@@ -304,25 +340,30 @@ void subt(Polynomial &rtn, Polynomial &a, Polynomial &b) {
     for (int i = 0; i <= a.deg; i++) rtn.coeff[i] += a.coeff[i];
   }
 }
+
 void mulinplace(Polynomial &a, Polynomial &b) {
   Polynomial rtn;
   mul(rtn, a, b);
   a.copy(rtn);
 }
+
 void addinplace(Polynomial &a, Polynomial &b) {
   Polynomial rtn;
   add(rtn, a, b);
   a.copy(rtn);
 }
+
 void subtinplace(Polynomial &a, Polynomial &b) {
   Polynomial rtn;
   subt(rtn, a, b);
   a.copy(rtn);
 }
+
 void divide_poly(Polynomial &quotient, Polynomial &remainder, Polynomial &target, Polynomial &divider) {
   if (target.deg < divider.deg) {
     quotient.copy(Polynomial(0));
     quotient.coeff[0] = 0;
+
     remainder.copy(Polynomial(target.deg, target.coeff, "power"));
   } else {
     quotient.copy(Polynomial(target.deg - divider.deg));
@@ -339,6 +380,7 @@ void divide_poly(Polynomial &quotient, Polynomial &remainder, Polynomial &target
     remainder.copy(Polynomial(divider.deg - 1, tmp.coeff, "power"));
   }
 }
+
 // coeff를 업데이트한다. 즉, power basis의 계수들을 구해준다. chebcoeff는 따로 구해주어야한다.
 void chebyshev(Polynomial &rtn, long deg) {
   if (deg == 0) {
@@ -352,10 +394,12 @@ void chebyshev(Polynomial &rtn, long deg) {
     Polynomial iden2(1);
     iden2.coeff[0] = RR(0);
     iden2.coeff[1] = RR(2);
+
     Polynomial tmp1(0), tmp2(1), tmp3;
     tmp1.coeff[0] = RR(1);
     tmp2.coeff[0] = RR(0);
     tmp2.coeff[1] = RR(1);
+
     for (int i = 2; i <= deg; i++) {
       mul(tmp3, iden2, tmp2);
       subt(rtn, tmp3, tmp1);
@@ -364,6 +408,7 @@ void chebyshev(Polynomial &rtn, long deg) {
     }
   }
 }
+
 // scale = K
 void chebyshev_scale(Polynomial &rtn, long deg, RR scale) {
   if (deg == 0) {
@@ -377,10 +422,12 @@ void chebyshev_scale(Polynomial &rtn, long deg, RR scale) {
     Polynomial iden2(1);
     iden2.coeff[0] = RR(0);
     iden2.coeff[1] = RR(2.0) / RR(scale);
+
     Polynomial tmp1(0), tmp2(1), tmp3;
     tmp1.coeff[0] = RR(1);
     tmp2.coeff[0] = RR(0);
     tmp2.coeff[1] = RR(1) / RR(scale);
+
     for (int i = 2; i <= deg; i++) {
       mul(tmp3, iden2, tmp2);
       subt(rtn, tmp3, tmp1);
@@ -389,18 +436,21 @@ void chebyshev_scale(Polynomial &rtn, long deg, RR scale) {
     }
   }
 }
+
 void power_to_cheb_int(Polynomial &q, int type, RR scale) {
   if (type == 1)
     q.power_to_cheb();
   else if (type == 2)
     q.power_to_cheb_scale(scale);
 }
+
 void cheb_to_power_int(Polynomial &qround, int type, RR scale) {
   if (type == 1)
     qround.cheb_to_power();
   else if (type == 2)
     qround.cheb_to_power_scale(scale);
 }
+
 void eval_divide(Polynomial &pround, Polynomial &qround, Polynomial &rround, Polynomial &Ti, int type, RR scale) {
   Polynomial temp1;
   mul(temp1, qround, Ti);
@@ -410,6 +460,7 @@ void eval_divide(Polynomial &pround, Polynomial &qround, Polynomial &rround, Pol
   else if (type == 2)
     pround.power_to_cheb_scale(scale);
 }
+
 void geneTi(Polynomial &Ti, int deg, int type, RR scale) {
   if (type == 1) {
     chebyshev(Ti, deg);
@@ -419,6 +470,7 @@ void geneTi(Polynomial &Ti, int deg, int type, RR scale) {
     Ti.power_to_cheb_scale(scale);
   }
 }
+
 void print_text_chebcoeff(ofstream &out, Polynomial &q) {
   for (int i = 0; i <= q.deg; i++) out << q.chebcoeff[i] << endl;
 }
@@ -426,6 +478,7 @@ void print_text_chebcoeff(ofstream &out, Polynomial &q) {
 // {
 // 	vector<Polynomial> T;
 // 	for(int i=0; i<100; i++) T.emplace_back(Polynomial(0));
+
 // 	long m = tree.m, l = tree.l, b = tree.b;
 // 	if(eval_type == evaltype::baby)
 // 	{
@@ -457,14 +510,17 @@ void print_text_chebcoeff(ofstream &out, Polynomial &q) {
 // 		}
 // 	}
 // 	else throw std::invalid_argument("evaluation type is not correct");
+
 // //	long m = tree.m, l = tree.l;
 // 	// generate Tis.  compute all Tis including needless Tis.
+
 // 	// decompose setting
 // 	vector<Polynomial> pt;
 // 	for(int i=0; i<pow2(tree.depth+1); i++) pt.emplace_back(Polynomial(0));
 // 	pt[1].copy(Polynomial(deg, coeff, "cheb"));
 // 	if(type == 1) pt[1].cheb_to_power();
 // 	else if(type == 2) pt[1].cheb_to_power_scale(scale);
+
 // 	// decompose
 // 	for(int i=0; i<= tree.depth; i++)
 // 	{
@@ -473,12 +529,15 @@ void print_text_chebcoeff(ofstream &out, Polynomial &q) {
 // 			if(tree.tree[j]>0) divide_poly(pt[2*j+1], pt[2*j], pt[j], T[tree.tree[j]]);		// pt[j]'s chebcoeff not set
 // 		}
 // 	}
+
 // 	for(int i=0; i<pow2(tree.depth+1); i++) if(tree.tree[i] == 0) power_to_cheb_int(pt[i], type, scale);
 // 	for(int i=0; i<pow2(tree.depth+1); i++) if(tree.tree[i] == 0) print_text_chebcoeff(out, pt[i]);
 // }
+
 void poly_decompose_integrate(int deg, int input_type, RR input_scale, vector<RR> &coeff, Tree &tree, evaltype eval_type, int output_type, RR output_scale, ofstream &out_decomp_coeff) {
   vector<Polynomial> T;
   for (int i = 0; i < 100; i++) T.emplace_back(Polynomial(0));
+
   long m = tree.m, l = tree.l, b = tree.b;
   if (eval_type == evaltype::baby) {
     for (int i = 1; i <= b; i++) {
@@ -503,9 +562,11 @@ void poly_decompose_integrate(int deg, int input_type, RR input_scale, vector<RR
     }
   } else
     throw std::invalid_argument("evaluation type is not correct");
+
   // decompose setting
   vector<Polynomial> pt;
   for (int i = 0; i < pow2(tree.depth + 1); i++) pt.emplace_back(Polynomial(0));
+
   // input polynomial setting
   if (input_type == 0)
     pt[1].copy(Polynomial(deg, coeff, "power"));
@@ -515,15 +576,18 @@ void poly_decompose_integrate(int deg, int input_type, RR input_scale, vector<RR
     pt[1].cheb_to_power();  // input_type = 0 means power basis, no need to perform cheb_to_power
   else if (input_type == 2)
     pt[1].cheb_to_power_scale(input_scale);
+
   cout << "coeff print" << endl;
   for (auto num : pt[1].coeff) cout << num << " ";
   cout << endl;
+
   // decompose (power basis operation)
   for (int i = 0; i <= tree.depth; i++) {
     for (int j = pow2(i); j < pow2(i + 1); j++) {
       if (tree.tree[j] > 0) divide_poly(pt[2 * j + 1], pt[2 * j], pt[j], T[tree.tree[j]]);  // pt[j]'s chebcoeff not set
     }
   }
+
   for (int i = 0; i < pow2(tree.depth + 1); i++)
     if (tree.tree[i] == 0) power_to_cheb_int(pt[i], output_type, output_scale);
   for (int i = 0; i < pow2(tree.depth + 1); i++)
