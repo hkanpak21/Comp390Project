@@ -322,7 +322,7 @@ void dist_rotate_vector_inplace(
     const PhantomGaloisKey &galois_keys)
 {
     gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        rotate_inplace(pctx, ct, steps, galois_keys);
+        rotate_vector_inplace(pctx, ct, steps, galois_keys);
     });
 }
 

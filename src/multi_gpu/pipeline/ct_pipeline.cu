@@ -76,6 +76,9 @@ CtPipeline CtPipeline::create(
     }
 
     cudaSetDevice(0);
+    // Reset default_stream back to GPU 0 for the main thread
+    phantom::util::global_variables::default_stream =
+        std::make_unique<phantom::util::cuda_stream_wrapper>();
     return pipe;
 }
 
@@ -140,6 +143,9 @@ void CtPipeline::execute_full(FullGpuFn fn) {
     for (int g = 0; g < n_gpus_; g++) {
         threads.emplace_back([this, g, &fn]() {
             cudaSetDevice(g);
+            // Initialize per-thread default_stream on this GPU
+            phantom::util::global_variables::default_stream =
+                std::make_unique<phantom::util::cuda_stream_wrapper>();
             auto &st = states_[g];
             fn(g, *st.ctx, *st.sk, *st.pk, *st.rk, *st.gk, *st.enc, st.local_cts);
             cudaDeviceSynchronize();
@@ -160,6 +166,19 @@ void CtPipeline::enable_galois_keys() {
     galois_keys_enabled_ = true;
     cudaSetDevice(0);
     printf("[CtPipeline] Galois keys enabled on all %d GPUs\n", n_gpus_);
+}
+
+void CtPipeline::enable_galois_keys_from_steps(const std::vector<int> &steps) {
+    if (galois_keys_enabled_) return;
+    for (int g = 0; g < n_gpus_; g++) {
+        cudaSetDevice(g);
+        auto &st = states_[g];
+        printf("[CtPipeline] Generating selective Galois keys on GPU %d (%zu steps)...\n", g, steps.size());
+        *st.gk = st.sk->create_galois_keys_from_steps(*st.ctx, steps);
+    }
+    galois_keys_enabled_ = true;
+    cudaSetDevice(0);
+    printf("[CtPipeline] Selective Galois keys enabled on all %d GPUs\n", n_gpus_);
 }
 
 std::vector<PhantomCiphertext> CtPipeline::gather() {

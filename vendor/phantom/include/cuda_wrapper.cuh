@@ -47,7 +47,7 @@ namespace phantom::util {
     class cuda_stream_wrapper {
     public:
         cuda_stream_wrapper() {
-            cudaSetDevice(0); // TODO: remove me
+            // cudaSetDevice(0); // Removed: breaks multi-GPU
             cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         }
 

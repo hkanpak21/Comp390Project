@@ -96,6 +96,9 @@ public:
     // Must be called after create() and before execute_full().
     void enable_galois_keys();
 
+    // Enable selective Galois keys from rotation steps on all GPUs.
+    void enable_galois_keys_from_steps(const std::vector<int> &steps);
+
     void destroy();
 
 private:
