@@ -294,24 +294,24 @@ int main(int argc, char **argv) {
             // matches computational intensity for speedup measurement
             for (auto &ct : local) {
                 // Level 1: x^2
-                PhantomCiphertext x2 = phantom::multiply(c, ct, ct);
-                phantom::relinearize_inplace(c, x2, r);
-                phantom::rescale_to_next_inplace(c, x2);
+                PhantomCiphertext x2 = ::multiply(c, ct, ct);
+                ::relinearize_inplace(c, x2, r);
+                ::rescale_to_next_inplace(c, x2);
 
                 // Level 2: x^4
-                PhantomCiphertext x4 = phantom::multiply(c, x2, x2);
-                phantom::relinearize_inplace(c, x4, r);
-                phantom::rescale_to_next_inplace(c, x4);
+                PhantomCiphertext x4 = ::multiply(c, x2, x2);
+                ::relinearize_inplace(c, x4, r);
+                ::rescale_to_next_inplace(c, x4);
 
                 // Level 3: x^8
-                PhantomCiphertext x8 = phantom::multiply(c, x4, x4);
-                phantom::relinearize_inplace(c, x8, r);
-                phantom::rescale_to_next_inplace(c, x8);
+                PhantomCiphertext x8 = ::multiply(c, x4, x4);
+                ::relinearize_inplace(c, x8, r);
+                ::rescale_to_next_inplace(c, x8);
 
                 // Level 4: x^16
-                PhantomCiphertext x16 = phantom::multiply(c, x8, x8);
-                phantom::relinearize_inplace(c, x16, r);
-                phantom::rescale_to_next_inplace(c, x16);
+                PhantomCiphertext x16 = ::multiply(c, x8, x8);
+                ::relinearize_inplace(c, x16, r);
+                ::rescale_to_next_inplace(c, x16);
 
                 ct = std::move(x16);
             }

@@ -2,14 +2,7 @@
  * ckks_evaluator.cuh
  *
  * Ported from vendor/nexus/cuda/src/ckks_evaluator.cuh
- * Adapted to work with our Phantom build (vendor/phantom/).
- *
- * Key API changes from NEXUS's Phantom fork:
- *   params_id() → chain_index()
- *   parms_id()  → chain_index()
- *   rotate_vector → rotate
- *   create_galois_keys_from_steps/elts → create_galois_keys (all keys)
- *   context_data.chain_depth() → ct.chain_index()
+ * Uses NEXUS Phantom fork (vendor/phantom/) with save/load backported.
  */
 
 #pragma once
@@ -132,24 +125,24 @@ class Evaluator {
 
   // Mod switch
   inline void mod_switch_to_next_inplace(PhantomCiphertext &ct) {
-    phantom::mod_switch_to_next_inplace(*context, ct);
+    ::mod_switch_to_next_inplace(*context, ct);
   }
 
   inline void mod_switch_to_inplace(PhantomCiphertext &ct, size_t chain_index) {
-    phantom::mod_switch_to_inplace(*context, ct, chain_index);
+    ::mod_switch_to_inplace(*context, ct, chain_index);
   }
 
   inline void mod_switch_to_inplace(PhantomPlaintext &pt, size_t chain_index) {
-    phantom::mod_switch_to_inplace(*context, pt, chain_index);
+    ::mod_switch_to_inplace(*context, pt, chain_index);
   }
 
   inline void rescale_to_next_inplace(PhantomCiphertext &ct) {
-    phantom::rescale_to_next_inplace(*context, ct);
+    ::rescale_to_next_inplace(*context, ct);
   }
 
   // Relinearization
   inline void relinearize_inplace(PhantomCiphertext &ct, const PhantomRelinKey &relin_keys) {
-    phantom::relinearize_inplace(*context, ct, relin_keys);
+    ::relinearize_inplace(*context, ct, relin_keys);
   }
 
   // Multiplication
@@ -174,23 +167,23 @@ class Evaluator {
     if (ct1.scale() != ct2.scale()) {
       ct1.set_scale(ct2.scale());
     }
-    phantom::multiply_inplace(*context, ct1, ct2);
+    ::multiply_inplace(*context, ct1, ct2);
   }
 
   inline void multiply_plain(PhantomCiphertext &ct, PhantomPlaintext &plain, PhantomCiphertext &dest) {
-    dest = phantom::multiply_plain(*context, ct, plain);
+    dest = ::multiply_plain(*context, ct, plain);
   }
 
   inline void multiply_plain_inplace(PhantomCiphertext &ct, PhantomPlaintext &plain) {
     if (ct.scale() != plain.scale()) {
       const_cast<double&>(plain.scale()) = ct.scale();
     }
-    phantom::multiply_plain_inplace(*context, ct, plain);
+    ::multiply_plain_inplace(*context, ct, plain);
   }
 
   // Addition
   inline void add_plain(const PhantomCiphertext &ct, PhantomPlaintext &plain, PhantomCiphertext &dest) {
-    dest = phantom::add_plain(*context, ct, plain);
+    dest = ::add_plain(*context, ct, plain);
   }
 
   inline void add_plain_inplace(PhantomCiphertext &ct, PhantomPlaintext &plain) {
@@ -198,14 +191,14 @@ class Evaluator {
     if (ct.scale() != plain.scale()) {
       const_cast<double&>(plain.scale()) = ct.scale();
     }
-    phantom::add_plain_inplace(*context, ct, plain);
+    ::add_plain_inplace(*context, ct, plain);
   }
 
   inline void add(PhantomCiphertext &ct1, const PhantomCiphertext &ct2, PhantomCiphertext &dest) {
     if (ct1.scale() != ct2.scale()) {
       ct1.set_scale(ct2.scale());
     }
-    dest = phantom::add(*context, ct1, ct2);
+    dest = ::add(*context, ct1, ct2);
   }
 
   inline void add_inplace(PhantomCiphertext &ct1, const PhantomCiphertext &ct2) {
@@ -214,7 +207,7 @@ class Evaluator {
     if (ct1.scale() != ct2.scale()) {
       ct1.set_scale(ct2.scale());
     }
-    phantom::add_inplace(*context, ct1, ct2);
+    ::add_inplace(*context, ct1, ct2);
   }
 
   inline void add_many(vector<PhantomCiphertext> &cts, PhantomCiphertext &dest) {
@@ -236,7 +229,7 @@ class Evaluator {
     if (ct.scale() != plain.scale()) {
       const_cast<double&>(plain.scale()) = ct.scale();
     }
-    phantom::sub_plain_inplace(*context, ct, plain);
+    ::sub_plain_inplace(*context, ct, plain);
   }
 
   inline void sub(PhantomCiphertext &ct1, const PhantomCiphertext &ct2, PhantomCiphertext &dest) {
@@ -253,18 +246,16 @@ class Evaluator {
     if (ct1.scale() != ct2.scale()) {
       ct1.set_scale(ct2.scale());
     }
-    phantom::sub_inplace(*context, ct1, ct2);
+    ::sub_inplace(*context, ct1, ct2);
   }
 
-  // Rotation — PORTED: rotate_vector → phantom::rotate
+  // Rotation
   inline void rotate_vector(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys, PhantomCiphertext &dest) {
-    dest = phantom::rotate(*context, ct, steps, galois_keys);
-    cudaStreamSynchronize(ct.data_ptr().get_stream());
+    dest = ::rotate_vector(*context, ct, steps, galois_keys);
   }
 
   inline void rotate_vector_inplace(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys) {
-    phantom::rotate_inplace(*context, ct, steps, galois_keys);
-    cudaStreamSynchronize(ct.data_ptr().get_stream());
+    ::rotate_vector_inplace(*context, ct, steps, galois_keys);
   }
 
   // Negation
@@ -274,18 +265,28 @@ class Evaluator {
   }
 
   inline void negate_inplace(PhantomCiphertext &ct) {
-    phantom::negate_inplace(*context, ct);
+    ::negate_inplace(*context, ct);
   }
 
   // Galois
   inline void apply_galois(PhantomCiphertext &ct, uint32_t elt, PhantomGaloisKey &galois_keys, PhantomCiphertext &dest) {
-    dest = phantom::apply_galois(*context, ct, elt, galois_keys);
+    dest = ::apply_galois(*context, ct, elt, galois_keys);
   }
 
   inline void apply_galois_inplace(PhantomCiphertext &ct, int step, PhantomGaloisKey &galois_keys) {
-    auto coeff_count = context->get_context_data(0).parms().poly_modulus_degree();
-    auto elt = phantom::util::get_elt_from_step(step, coeff_count);
-    phantom::apply_galois_inplace(*context, ct, elt, galois_keys);
+    auto N = context->get_context_data(0).parms().poly_modulus_degree();
+    uint32_t m = 2 * (uint32_t)N;
+    uint32_t elt;
+    if (step == 0) {
+      elt = m - 1; // conjugation
+    } else {
+      uint32_t gen = 5;
+      int abs_step = step < 0 ? -step : step;
+      elt = 1;
+      for (int i = 0; i < abs_step; i++) elt = (elt * gen) % m;
+      if (step < 0) elt = (m + 1 - elt) % m; // inverse
+    }
+    ::apply_galois_inplace(*context, ct, elt, galois_keys);
   }
 
   // Complex Conjugate — needed by bootstrapping (slottocoeff_full_3, etc.)
@@ -295,9 +296,7 @@ class Evaluator {
   }
 
   inline void complex_conjugate_inplace(PhantomCiphertext &ct, const PhantomGaloisKey &galois_keys) {
-    auto N = context->get_context_data(0).parms().poly_modulus_degree();
-    uint32_t conj_elt = 2 * N - 1;
-    phantom::apply_galois_inplace(*context, ct, conj_elt, galois_keys);
+    ::complex_conjugate_inplace(*context, ct, galois_keys);
   }
 
   // NTT transforms
@@ -389,7 +388,7 @@ class Evaluator {
   void multiply_inplace_reduced_error(PhantomCiphertext &ct1, const PhantomCiphertext &ct2, const PhantomRelinKey &relin_keys);
 
   inline void double_inplace(PhantomCiphertext &ct) const {
-    phantom::add_inplace(*context, ct, ct);
+    ::add_inplace(*context, ct, ct);
   }
 
   template <typename T, typename = std::enable_if_t<std::is_same<std::remove_cv_t<T>, double>::value || std::is_same<std::remove_cv_t<T>, std::complex<double>>::value>>

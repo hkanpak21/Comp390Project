@@ -169,7 +169,7 @@ void keyswitching_input_broadcast(
     }
 
     // Step 3: Phantom keyswitch_inplace
-    phantom::keyswitch_inplace(phantom_ctx, encrypted, tl_full_c2,
+    ::keyswitch_inplace(phantom_ctx, encrypted, tl_full_c2,
                                relin_keys, /*is_relin=*/true, s);
 
     CUDA_CHECK(cudaStreamSynchronize(s));
@@ -197,7 +197,7 @@ void rotation_input_broadcast(
 
     // For rotation, apply_galois_inplace handles everything internally.
     // We just need to gather the full ciphertext first.
-    phantom::apply_galois_inplace(phantom_ctx, encrypted, galois_elt, galois_keys);
+    ::apply_galois_inplace(phantom_ctx, encrypted, galois_elt, galois_keys);
     CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
