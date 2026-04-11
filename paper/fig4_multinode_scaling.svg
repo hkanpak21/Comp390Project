@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="550" height="350" font-family="Segoe UI, Arial, sans-serif">
+<rect width="550" height="350" fill="#F5F8FC" rx="8"/>
+<text x="275" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="#2C3E50">Multi-Node Weak Scaling (4 heads/node, H100)</text>
+<line x1="90" y1="280.0" x2="520" y2="280.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="82" y="284.0" text-anchor="end" font-size="11" fill="#2C3E50">0</text>
+<line x1="90" y1="227.72727272727272" x2="520" y2="227.72727272727272" stroke="#DCE6F0" stroke-width="1"/>
+<text x="82" y="231.72727272727272" text-anchor="end" font-size="11" fill="#2C3E50">500</text>
+<line x1="90" y1="175.45454545454544" x2="520" y2="175.45454545454544" stroke="#DCE6F0" stroke-width="1"/>
+<text x="82" y="179.45454545454544" text-anchor="end" font-size="11" fill="#2C3E50">1000</text>
+<line x1="90" y1="123.18181818181819" x2="520" y2="123.18181818181819" stroke="#DCE6F0" stroke-width="1"/>
+<text x="82" y="127.18181818181819" text-anchor="end" font-size="11" fill="#2C3E50">1500</text>
+<line x1="90" y1="70.9090909090909" x2="520" y2="70.9090909090909" stroke="#DCE6F0" stroke-width="1"/>
+<text x="82" y="74.9090909090909" text-anchor="end" font-size="11" fill="#2C3E50">2000</text>
+<text x="35" y="165" text-anchor="middle" font-size="12" fill="#2C3E50" transform="rotate(-90,35,165)">Time (ms)</text>
+<rect x="173.33333333333331" y="111.20090909090911" width="90" height="168.7990909090909" fill="#4682B4" rx="3"/>
+<text x="218.33333333333331" y="199.60045454545457" text-anchor="middle" font-size="11" fill="white" font-weight="bold">1615ms</text>
+<text x="218.33333333333331" y="98.52772727272729" text-anchor="middle" font-size="11" font-weight="bold" fill="#2C3E50">1659ms</text>
+<text x="218.33333333333331" y="298" text-anchor="middle" font-size="11" fill="#2C3E50">1 Node</text>
+<text x="218.33333333333331" y="312" text-anchor="middle" font-size="11" fill="#2C3E50">4 GPUs</text>
+<rect x="346.66666666666663" y="106.41272727272727" width="90" height="173.58727272727273" fill="#4682B4" rx="3"/>
+<text x="391.66666666666663" y="197.20636363636362" text-anchor="middle" font-size="11" fill="white" font-weight="bold">1660ms</text>
+<rect x="346.66666666666663" y="88.37863636363636" width="90" height="18.03409090909091" fill="#5B9BD5" rx="3"/>
+<text x="391.66666666666663" y="101.39568181818181" text-anchor="middle" font-size="9" fill="white">172ms</text>
+<rect x="346.66666666666663" y="79.36681818181818" width="90" height="9.011818181818184" fill="#B0C4DE" rx="3"/>
+<text x="391.66666666666663" y="71.36681818181818" text-anchor="middle" font-size="11" font-weight="bold" fill="#2C3E50">1919ms</text>
+<text x="391.66666666666663" y="298" text-anchor="middle" font-size="11" fill="#2C3E50">2 Nodes</text>
+<text x="391.66666666666663" y="312" text-anchor="middle" font-size="11" fill="#2C3E50">8 GPUs</text>
+<rect x="90" y="328" width="12" height="12" fill="#4682B4" rx="2"/>
+<text x="106" y="338" font-size="11" fill="#2C3E50">Compute</text>
+<rect x="220" y="328" width="12" height="12" fill="#5B9BD5" rx="2"/>
+<text x="236" y="338" font-size="11" fill="#2C3E50">Scatter</text>
+<rect x="350" y="328" width="12" height="12" fill="#B0C4DE" rx="2"/>
+<text x="366" y="338" font-size="11" fill="#2C3E50">Gather</text>
+<line x1="90" y1="280" x2="520" y2="280" stroke="#2C3E50" stroke-width="1.5"/>
+<line x1="90" y1="50" x2="90" y2="280" stroke="#2C3E50" stroke-width="1.5"/>
+</svg>

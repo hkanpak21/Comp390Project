@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="450" height="280" font-family="Segoe UI, Arial, sans-serif">
+<rect width="450" height="280" fill="#F5F8FC" rx="8"/>
+<text x="225" y="30" text-anchor="middle" font-size="15" font-weight="bold" fill="#2C3E50">Per-GPU Compute Time (4-GPU, 4 heads)</text>
+<line x1="80" y1="230.0" x2="420" y2="230.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="234.0" text-anchor="end" font-size="11" fill="#2C3E50">0</text>
+<line x1="80" y1="180.0" x2="420" y2="180.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="184.0" text-anchor="end" font-size="11" fill="#2C3E50">500</text>
+<line x1="80" y1="130.0" x2="420" y2="130.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="134.0" text-anchor="end" font-size="11" fill="#2C3E50">1000</text>
+<line x1="80" y1="80.0" x2="420" y2="80.0" stroke="#DCE6F0" stroke-width="1"/>
+<text x="72" y="84.0" text-anchor="end" font-size="11" fill="#2C3E50">1500</text>
+<rect x="100.0" y="79.20000000000002" width="60" height="150.79999999999998" fill="#4682B4" rx="3"/>
+<text x="130.0" y="73.20000000000002" text-anchor="middle" font-size="11" font-weight="bold" fill="#2C3E50">1508ms</text>
+<text x="130.0" y="248" text-anchor="middle" font-size="11" fill="#2C3E50">GPU 0</text>
+<rect x="180.0" y="78.80000000000001" width="60" height="151.2" fill="#5B9BD5" rx="3"/>
+<text x="210.0" y="72.80000000000001" text-anchor="middle" font-size="11" font-weight="bold" fill="#2C3E50">1512ms</text>
+<text x="210.0" y="248" text-anchor="middle" font-size="11" fill="#2C3E50">GPU 1</text>
+<rect x="260.0" y="80.20000000000002" width="60" height="149.79999999999998" fill="#B0C4DE" rx="3"/>
+<text x="290.0" y="74.20000000000002" text-anchor="middle" font-size="11" font-weight="bold" fill="#2C3E50">1498ms</text>
+<text x="290.0" y="248" text-anchor="middle" font-size="11" fill="#2C3E50">GPU 2</text>
+<rect x="340.0" y="79.5" width="60" height="150.5" fill="#8FAECC" rx="3"/>
+<text x="370.0" y="73.5" text-anchor="middle" font-size="11" font-weight="bold" fill="#2C3E50">1505ms</text>
+<text x="370.0" y="248" text-anchor="middle" font-size="11" fill="#2C3E50">GPU 3</text>
+<text x="225" y="270" text-anchor="middle" font-size="11" fill="#36648B">Max variance: 0.9% — balanced workload</text>
+<line x1="80" y1="230" x2="420" y2="230" stroke="#2C3E50" stroke-width="1.5"/>
+<line x1="80" y1="50" x2="80" y2="230" stroke="#2C3E50" stroke-width="1.5"/>
+</svg>
