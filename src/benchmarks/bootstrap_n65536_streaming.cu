@@ -112,10 +112,9 @@ int main() {
         ckks_eval.evaluator.mod_switch_to_next_inplace(ct);
     printf("[Test] Encrypted: coeff_modulus_size=%zu\n", ct.coeff_modulus_size());
 
-    // ═══ Free PK and RK to reclaim memory ═══
+    // ═══ Free PK only (RK is needed by mod_reducer for polynomial evaluation) ═══
     { PhantomPublicKey empty; public_key = std::move(empty); }
-    { PhantomRelinKey empty; relin_keys = std::move(empty); }
-    print_mem("After freeing PK + RK");
+    print_mem("After freeing PK (keeping RK for bootstrap polynomial eval)");
 
     // ═══ Initialize bootstrapper (computes LT coeffs on CPU) ═══
     printf("[Setup] Initializing bootstrapper...\n"); fflush(stdout);
