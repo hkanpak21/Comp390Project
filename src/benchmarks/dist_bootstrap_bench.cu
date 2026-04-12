@@ -63,7 +63,7 @@ using nexus_multi_gpu::DistributedCiphertext;
 // ---------------------------------------------------------------------------
 // Timing helper
 // ---------------------------------------------------------------------------
-struct Timer {
+struct BenchTimer {
     using clock = std::chrono::high_resolution_clock;
     clock::time_point t0;
     void start() { t0 = clock::now(); }
@@ -141,7 +141,7 @@ static double run_single_gpu_bootstrap(
     bs.addLeftRotKeys_Linear_to_vector_3(steps);
 
     // Deduplicate steps and build galois elements
-    set<int> step_set(steps.begin(), steps.end());
+    std::set<int> step_set(steps.begin(), steps.end());
     steps.assign(step_set.begin(), step_set.end());
     auto all_elts = ::get_elts_from_steps(steps, static_cast<size_t>(N));
     ctx.setup_galois_tool(all_elts);
@@ -160,7 +160,8 @@ static double run_single_gpu_bootstrap(
     enc.encode(ctx, plain, scale, pt);
     PhantomCiphertext ct;
     eval.encryptor.encrypt(pt, ct);
-    for (int i = 0; i < BS_MOD; i++) eval.evaluator.mod_switch_to_next_inplace(ct);
+    // Bootstrap requires coeff_modulus_size() == 1 (all regular primes consumed)
+    while (ct.coeff_modulus_size() > 1) eval.evaluator.mod_switch_to_next_inplace(ct);
 
     // Warm-up (skip first run)
     {
@@ -169,7 +170,7 @@ static double run_single_gpu_bootstrap(
     }
     cudaDeviceSynchronize();
 
-    Timer t; t.start();
+    BenchTimer t; t.start();
     PhantomCiphertext bs_out;
     bs.bootstrap_3(bs_out, ct);
     cudaDeviceSynchronize();
@@ -230,15 +231,20 @@ static double run_dks_bootstrap(
 
     // Deduplicate steps
     {
-        set<int> step_set(steps.begin(), steps.end());
+        std::set<int> step_set(steps.begin(), steps.end());
         steps.assign(step_set.begin(), step_set.end());
     }
     long N_val = 1L << LOG_N;
     auto all_elts = ::get_elts_from_steps(steps, static_cast<size_t>(N_val));
 
-    // MUST set up galois tool BEFORE generating galois keys
+    // MUST set up galois tool BEFORE generating galois keys.
+    // Also set up on dctx.context(0) — dist_rotate_output_aggregation uses
+    // dctx.context(0)'s galois tool to compute the Galois permutation index.
+    // Without this, gelt_idx is wrong → apply_galois_ntt uses wrong permutation
+    // → potentially out-of-bounds key access → cudaMemcpyPeer "invalid argument".
     ctx0.setup_galois_tool(all_elts);
     gk0.resize_slots(all_elts.size());
+    dctx.context(0).setup_galois_tool(all_elts);
 
     size_t num_keys = all_elts.size();
 
@@ -255,7 +261,7 @@ static double run_dks_bootstrap(
     // ── Build DistGaloisKeyStore (sharded across GPUs) ──
     printf("  Building sharded Galois key store (%zu keys × %d GPUs)...\n",
            num_keys, n_gpus);
-    Timer setup_timer; setup_timer.start();
+    BenchTimer setup_timer; setup_timer.start();
 
     DistGaloisKeyStore dks;
     dks.generate(ctx0, sk0, n_gpus, num_keys);
@@ -274,7 +280,7 @@ static double run_dks_bootstrap(
     cudaSetDevice(0);
 
     // Register DKS store with distributed_eval
-    dist_set_galois_key_store(&dks, [&](int step) -> size_t {
+    nexus_multi_gpu::dist_set_galois_key_store(&dks, [&](int step) -> size_t {
         auto it = step_to_idx.find(step);
         if (it == step_to_idx.end())
             throw std::runtime_error("Unknown rotation step in DKS map");
@@ -288,7 +294,8 @@ static double run_dks_bootstrap(
     enc0.encode(ctx0, plain, SCALE, pt);
     PhantomCiphertext ct0;
     eval0.encryptor.encrypt(pt, ct0);
-    for (int i = 0; i < BS_MOD; i++) eval0.evaluator.mod_switch_to_next_inplace(ct0);
+    // Bootstrap requires coeff_modulus_size() == 1
+    while (ct0.coeff_modulus_size() > 1) eval0.evaluator.mod_switch_to_next_inplace(ct0);
 
     // Convert to DistributedCiphertext
     DistributedCiphertext dct = DistributedCiphertext::from_single_gpu(dctx, ct0, 0);
@@ -319,7 +326,7 @@ static double run_dks_bootstrap(
         DistributedCiphertext dct_rot = DistributedCiphertext::from_single_gpu(dctx, ct0, 0);
 
         for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
-        Timer rt; rt.start();
+        BenchTimer rt; rt.start();
 
         PhantomGaloisKey dummy_gk;
         nexus_multi_gpu::dist_rotate_vector_inplace(dctx, dct_rot, step, dummy_gk);
@@ -355,7 +362,7 @@ static double run_dks_bootstrap(
 
     // Clean up
     dks.destroy();
-    dist_set_galois_key_store(nullptr, {});
+    nexus_multi_gpu::dist_set_galois_key_store(nullptr, {});
     dctx.destroy();
 
     return proj_bootstrap_ms;
@@ -370,7 +377,7 @@ int main(int argc, char **argv) {
 
     int device_count = 0;
     cudaGetDeviceCount(&device_count);
-    max_gpus = min(max_gpus, device_count);
+    max_gpus = std::min(max_gpus, device_count);
 
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║   multiNEXUS DKS Benchmark — N=65536, Sparse Bootstrap  ║\n");
@@ -397,7 +404,7 @@ int main(int argc, char **argv) {
     printf("  %-10s %-20s %-15s %-10s\n",
            "GPUs", "Proj. Bootstrap (ms)", "Speedup", "Mem/GPU");
 
-    for (int ng : {1, 2, 4}) {
+    for (int ng : {2, 4}) {   // 1-GPU DKS skipped: no sharding benefit, OOMs at N=65536
         if (ng > max_gpus) continue;
         double proj_ms = run_dks_bootstrap(ng, parms, sk_str, SCALE, baseline_ms);
 

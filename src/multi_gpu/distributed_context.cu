@@ -16,6 +16,9 @@
 
 #include <cstdio>
 #include <cassert>
+#ifdef USE_MPI
+#include <mpi.h>
+#endif
 
 #define CUDA_CHECK(cmd) do {                                             \
     cudaError_t e = (cmd);                                               \
@@ -85,9 +88,14 @@ DistributedContext DistributedContext::create(
         }
     }
 
-    // Create per-GPU PhantomContexts
+    // Create per-GPU PhantomContexts.
+    // IMPORTANT: Create GPU 0 LAST so that PhantomContext's constructor
+    // leaves global_variables::default_stream pointing at GPU 0's stream.
+    // (Each PhantomContext ctor calls `default_stream = make_unique<stream_wrapper>()`
+    // on the current device — if GPU 0 is created last, callers that use
+    // default_stream (e.g. PhantomSecretKey ctor) get a valid GPU-0 stream.)
     ctx.contexts_.resize(n_gpus);
-    for (int g = 0; g < n_gpus; g++) {
+    for (int g = n_gpus - 1; g >= 0; g--) {
         CUDA_CHECK(cudaSetDevice(ctx.device_ids_[g]));
         ctx.contexts_[g] = std::make_unique<PhantomContext>(parms);
     }
@@ -98,12 +106,93 @@ DistributedContext DistributedContext::create(
         ctx.key_sets_[g].device_id = ctx.device_ids_[g];
     }
 
-    // Restore device 0
+    // Restore device 0 (also the last device set above, but be explicit)
     CUDA_CHECK(cudaSetDevice(ctx.device_ids_[0]));
 
     printf("[DistributedContext] Created with %d GPUs\n", n_gpus);
     return ctx;
 }
+
+// ---------------------------------------------------------------------------
+// DistributedContext::create_multinode  (MPI + cross-node NCCL)
+// ---------------------------------------------------------------------------
+#ifdef USE_MPI
+DistributedContext DistributedContext::create_multinode(
+    const phantom::EncryptionParameters &parms,
+    int gpus_per_node,
+    MPI_Comm mpi_comm)
+{
+    int mpi_rank, mpi_size;
+    MPI_Comm_rank(mpi_comm, &mpi_rank);
+    MPI_Comm_size(mpi_comm, &mpi_size);
+
+    int total_gpus = mpi_size * gpus_per_node;
+
+    DistributedContext ctx;
+    ctx.n_gpus_             = gpus_per_node;     // local GPUs on this node
+    ctx.total_gpus_         = total_gpus;
+    ctx.global_rank_offset_ = mpi_rank * gpus_per_node;
+    ctx.parms_              = parms;
+
+    // Local device IDs: 0 .. gpus_per_node-1
+    ctx.device_ids_.resize(gpus_per_node);
+    for (int g = 0; g < gpus_per_node; g++) ctx.device_ids_[g] = g;
+
+    // ── NCCL unique ID: rank 0 generates, broadcast to all MPI ranks ──
+    ncclUniqueId nccl_id;
+    if (mpi_rank == 0) NCCL_CHECK(ncclGetUniqueId(&nccl_id));
+    MPI_Bcast(&nccl_id, sizeof(ncclUniqueId), MPI_BYTE, 0, mpi_comm);
+
+    // ── Create one NCCL communicator per local GPU, spanning all nodes ──
+    // Global GPU rank for local GPU g = mpi_rank * gpus_per_node + g
+    ctx.comms_.resize(gpus_per_node);
+    NCCL_CHECK(ncclGroupStart());
+    for (int g = 0; g < gpus_per_node; g++) {
+        int global_rank = mpi_rank * gpus_per_node + g;
+        CUDA_CHECK(cudaSetDevice(g));
+        NCCL_CHECK(ncclCommInitRank(&ctx.comms_[g], total_gpus, nccl_id, global_rank));
+    }
+    NCCL_CHECK(ncclGroupEnd());
+
+    // ── Per-GPU streams ──
+    ctx.streams_.resize(gpus_per_node);
+    for (int g = 0; g < gpus_per_node; g++) {
+        CUDA_CHECK(cudaSetDevice(g));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.streams_[g], cudaStreamNonBlocking));
+    }
+
+    // ── Enable intra-node peer access ──
+    for (int i = 0; i < gpus_per_node; i++) {
+        CUDA_CHECK(cudaSetDevice(i));
+        for (int j = 0; j < gpus_per_node; j++) {
+            if (i == j) continue;
+            int can_access = 0;
+            cudaDeviceCanAccessPeer(&can_access, i, j);
+            if (can_access) cudaDeviceEnablePeerAccess(j, 0);
+        }
+    }
+
+    // ── Per-GPU PhantomContexts (local only) ──
+    // GPU 0 created LAST so default_stream stays on GPU 0 (see create() comment).
+    ctx.contexts_.resize(gpus_per_node);
+    for (int g = gpus_per_node - 1; g >= 0; g--) {
+        CUDA_CHECK(cudaSetDevice(g));
+        ctx.contexts_[g] = std::make_unique<PhantomContext>(parms);
+    }
+
+    ctx.key_sets_.resize(gpus_per_node);
+    for (int g = 0; g < gpus_per_node; g++)
+        ctx.key_sets_[g].device_id = g;
+
+    CUDA_CHECK(cudaSetDevice(0));
+
+    MPI_Barrier(mpi_comm);
+    if (mpi_rank == 0)
+        printf("[DistributedContext] Multi-node: %d nodes × %d GPUs/node = %d total GPUs\n",
+               mpi_size, gpus_per_node, total_gpus);
+    return ctx;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Key distribution (shallow copy)
