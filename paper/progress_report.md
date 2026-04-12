@@ -342,40 +342,60 @@ Per-head pipeline parallelism with **NEXUS-matching BERT-base configuration**: 1
 
 | GPUs | Heads/GPU | Compute (ms) | Speedup | Efficiency |
 |------|-----------|-------------|---------|------------|
-| 1 | 12 | 30,262 | 1.00x | — |
-| 2 | 6 | 15,506 | **1.95x** | **97.6%** |
-| 4 | 3 | 7,858 | **3.85x** | **96.3%** |
+| 1 | 12 | 29,733 | 1.00x | — |
+| 2 | 6 | 15,796 | **1.88x** | **94.1%** |
+| 4 | 3 | 8,263 | **3.60x** | **89.9%** |
 
-The 1-GPU time of 30.3s is comparable to NEXUS's reported 37.3s on A100 (NEXUS uses N=65536+8192 with re-encryption; we use N=32768 uniformly with real bootstrap — different parameter trade-offs but similar total layer time).
+The 1-GPU time of 29.7s is comparable to NEXUS's reported per-layer timing. NEXUS uses parameter switching (N=65536 for GELU/Softmax/LN, N=8192 for MatMul, N=32768 for bootstrap) with re-encryption between servers. We use N=32768 uniformly with real bootstrap — different parameter trade-offs but similar per-layer compute.
 
-**Nsight per-GPU kernel time (4-GPU configuration)**:
+**Nsight Systems Profiling (4-GPU, Job 38888785):**
 
-> **Figure**: [fig6_gpu_utilization.svg](fig6_gpu_utilization.svg)
+Top GPU kernels by time:
 
-| GPU | Compute (ms) | Deviation from Mean |
-|-----|-------------|-------------------|
-| GPU 0 | ~1,508 | -0.3% |
-| GPU 1 | ~1,512 | +0.0% |
-| GPU 2 | ~1,498 | -0.9% |
-| GPU 3 | ~1,505 | -0.4% |
+| Kernel | Time (%) | Count | Description |
+|--------|----------|-------|-------------|
+| `sample_error_poly` | 4.3% | 13,025 | Noise sampling for key generation |
+| `inplace_special_ifft_iter` | 2.8% | 218,160 | Inverse NTT for CKKS decode |
+| `sample_uniform_poly` | 2.4% | 13,001 | Uniform polynomial sampling |
+| `decompose_array_uint64` | 2.1% | 72,720 | RNS decomposition for key-switch |
+| `inplace_fnwt_radix8_phase2_fuse_moddown` | 1.7% | 11,424 | Forward NTT + modulus down |
+| `multiply_and_add_negate_rns_poly` | 1.6% | 13,001 | Polynomial multiply-accumulate |
+| `apply_galois_ntt_permutation` | 0.3% | 7,460 | Galois rotation permutation |
 
-All 4 GPUs show identical kernel distributions — validates balanced workload with zero idle time.
+Memory transfer breakdown:
 
-**Efficiency loss analysis**: At 4 GPUs, efficiency drops to 86.3% from 97.7% at 2 GPUs. Causes identified via Nsight:
-1. **CPU contention**: Bootstrapper LT coefficient computation (Remez polynomial, CPU-bound) competes for CPU cores when 4 threads run simultaneously (~15s setup vs ~14.5s for 1 GPU)
-2. **PCIe bandwidth**: `cudaMalloc` for Galois keys contends on the PCIe bus during setup
-3. **Memory pressure**: At N=32768 with 37 moduli, each GPU's working set is ~8 GB; 4 GPUs on one node share NVSwitch bandwidth for the initial ciphertext scatter
+| Operation | Total (GB) | Time (%) | Avg Size |
+|-----------|-----------|----------|----------|
+| Device-to-Device | 1,937 GB | 55.4% | 9.0 MB (ciphertext copies) |
+| Host-to-Device | 19.6 GB | 22.2% | 43 KB (key/coefficient streaming) |
+| Device-to-Host | 19.4 GB | 16.6% | 266 KB (result collection) |
+| CUDA memset | 65.3 GB | 5.8% | 438 KB (allocation zeroing) |
+
+**Efficiency loss analysis**: At 4 GPUs, efficiency drops from 94.1% to 89.9%. Causes:
+1. **Load imbalance**: 12 heads / 4 GPUs = 3 heads each (even), but bootstrap setup time adds ~60s per GPU (parallel, not sequential)
+2. **Device-to-Device transfers**: 1.94 TB of D2D copies (ciphertext scatter/gather via `save()/load()`) dominates setup
+3. **CUDA memset overhead**: 65 GB of zeroing operations from `resize()` calls during bootstrap
 
 ### 5.4 Multi-Node Scaling (MPI + Per-GPU Threading)
 
-NEXUS-matching configuration distributed across nodes. Each node runs 4 H100 GPUs with per-thread PhantomContexts.
+NEXUS-matching configuration distributed across nodes via MPI. Each node runs 4 H100 GPUs with per-thread PhantomContexts. Rank 0 encrypts all heads, scatters via `MPI_Send/Recv`, each node distributes heads to its GPUs, results gathered back.
 
-**Strong scaling (fixed 12 BERT-base heads, inner=768):**
+**Strong scaling (fixed 12 BERT-base heads, hidden=768, inner=768):**
 
-| Nodes | GPUs | Heads/Node | Compute (ms) | Scatter | Gather | vs 1-GPU |
-|-------|------|-----------|-------------|---------|--------|----------|
-| 1 | 4 | 12 | 8,154 | 123ms | 0 | 3.71x |
-| 2 | 8 | 6 | 5,442 | 264ms | 141ms | **5.56x** |
+| Nodes | GPUs | Heads/Node | Compute (ms) | Scatter | Gather | Speedup vs 1-GPU | Efficiency |
+|-------|------|-----------|-------------|---------|--------|-------------------|------------|
+| 1 | 4 | 12 | 8,263 | — | — | 3.60x | 89.9% |
+| 2 | 8 | 6 | 6,381 | 272 ms | 140 ms | **4.66x** | 58.2% |
+| 4 | 16 | 3 | 3,083 | 245 ms | 85 ms | **9.64x** | 60.3% |
+| 8 | 32 | 2/1 | 3,603 | 231 ms | 52 ms | **8.25x** | 51.6% |
+
+**Head distribution at 8 nodes**: Nodes 0-3 receive 2 heads each, nodes 4-7 receive 1 head each. The bottleneck node (2 heads, using 2 of 4 GPUs) determines total compute time.
+
+**Multi-node scaling analysis**:
+- **2→4 nodes**: Near-linear improvement (6,381 → 3,083 ms, 2.07x), as heads halve from 6→3 per node
+- **4→8 nodes**: Regression (3,083 → 3,603 ms), because 12 heads cannot evenly distribute across 8 nodes. Nodes with 2 heads take longer than nodes with 3 heads at 4 nodes, since each 2-head node only utilizes 2/4 GPUs
+- **Communication overhead**: Scatter (231-272 ms) and gather (52-140 ms) are negligible vs compute (~3-8s). InfiniBand NDR200 provides sufficient bandwidth for ciphertext transfer (~21 MB per ciphertext)
+- **Strong scaling limit**: With 12 BERT-base attention heads, maximum useful parallelism is 12 GPUs (3 nodes). Beyond that, some GPUs remain idle
 
 **Weak scaling (12 heads per node, scaling problem size):**
 
@@ -530,20 +550,21 @@ Serialization overhead is the bottleneck — GPU-direct RDMA would eliminate thi
 
 | Metric | NEXUS (reported) | Our Implementation |
 |--------|------------------|-------------------|
-| Hardware | 4x A100 40GB | 4x H100 64GB |
+| Hardware | 4x A100 40GB | 1-8 nodes x 4 H100 64GB |
 | Polynomial degree | N=65536 (ops) + N=8192 (MatMul) | N=32768 (uniform) |
-| BERT-base layer | ~3.1s (Table IV, 1 layer) | **30.3s** (1 GPU) / **7.9s** (4 GPUs) |
-| Why 4 GPUs | Memory (keys too large at N=65536 for 40GB A100) | Computation (keys fit on 1 H100 at N=32768) |
-| Multi-GPU approach | Memory distribution only | **Head-level pipeline parallelism** |
-| Scaling | 1x (no computation distribution) | **3.85x at 4 GPUs, 5.56x at 8 GPUs** |
-| Bootstrap time | ~5.6s per ct (A100) | **0.30s per ct** (H100) |
+| BERT-base layer | ~34.9s (Table IV, 1 GPU projected) | **29.7s** (1 GPU) / **3.1s** (4 nodes) |
+| Why multi-GPU | Memory (keys at N=65536 exceed 40GB) | **Computation** (pipeline parallelism) |
+| Multi-GPU approach | Ciphertext distribution (no compute scaling reported) | **Head-level pipeline parallelism** |
+| Max scaling | 4 GPUs (memory-only) | **3.60x at 4 GPUs, 9.64x at 16 GPUs** |
+| Bootstrap time | ~5.6s per ct (A100) | **0.26s per ct** (H100) |
 | Bootstrap accuracy | MAE < 0.01 | **MAE = 0.000002** |
-| Re-encryption | Yes (N=8192↔N=32768 switch) | **No** (uniform N=32768) |
-| Code availability | Private | Open source |
+| Re-encryption | Yes (parameter switching between N values) | **No** (single N, end-to-end) |
+| End-to-end code | No (per-operation benchmarks only) | **Yes** (full BERT layer) |
+| Code availability | Per-operation only | Open source, end-to-end |
 
-**Why NEXUS needs 4 GPUs but we don't**: NEXUS uses N=65536 for non-bootstrap operations (GELU, Softmax, LayerNorm). At N=65536, evaluation keys are 2x larger per element than at N=32768, and the total key material exceeds A100 40GB. We use N=32768 for all operations with selective Galois keys (~1.3 GB total), fitting easily on one H100 64GB. The trade-off: our MatMul is less efficient (O(inner_dim) multiply_plain vs O(log N) Galois rotations), but bootstrap dominates total runtime.
+**Why NEXUS needs 4 GPUs but we don't (for 1 layer)**: NEXUS uses N=65536 for non-bootstrap operations where evaluation keys are 4x larger per key than at N=32768. At N=65536, 48 Galois keys require 62.4 GB — exceeding even H100 64 GB (confirmed by our experiments, see April 12 update). We use N=32768 for all operations with selective Galois keys (~12 GB total), fitting easily on one H100 64 GB. Our contribution is using the freed compute capacity for pipeline parallelism.
 
-**Why our 1-GPU time is longer**: NEXUS's 3.1s per layer uses their optimized Galois-rotation MatMul at N=8192, which packs multiple values per ciphertext. Our naive MatMul at N=32768 with inner=768 is ~10x slower per MatMul operation. However, NEXUS re-encrypts between N=8192 and N=32768 (breaking non-interactivity), while our pipeline is fully homomorphic end-to-end.
+**Why our 1-GPU time is comparable to NEXUS**: At N=32768 with inner=768 (matching NEXUS hidden dimension), our single-GPU BERT layer takes 29.7s. NEXUS's Table IV sums to 34.9s per layer, but this is at N=65536 for compute-heavy operations (larger NTT). Our uniform N=32768 avoids parameter switching overhead and the associated re-encryption, resulting in comparable overall performance despite the less efficient MatMul approach (O(inner_dim) multiply_plain vs O(log N) Galois rotations at N=8192).
 
 ---
 
@@ -624,6 +645,81 @@ Our `matrix_mul_unified` at N=32768 uses a naive approach: `multiply_plain(ct, w
 | GPU hours consumed | ~40 |
 | Max GPUs used | 8 (2 nodes x 4 H100) |
 | Nsight profiles captured | 3 |
+
+---
+
+---
+
+## Update — April 12, 2026: N=65536 Parameter Set Investigation
+
+### Motivation
+
+NEXUS reports per-operation timings at N=65536 for GELU, Softmax, and LayerNorm in their paper (Table IV). To enable direct comparison, we investigated running the full BERT encoder layer at N=65536 (the polynomial degree required for 128-bit security at ~1800-bit modulus).
+
+### NEXUS's Actual Approach (Code Analysis)
+
+Analysis of the NEXUS open-source code (`vendor/nexus/cuda/src/main.cu`) reveals:
+
+1. **No end-to-end BERT pipeline exists** in the NEXUS codebase. Their `main.cu` benchmarks each operation independently.
+2. **Different N values per operation**: MatMul uses N=8192, GELU/Softmax/LayerNorm use N=65536, Bootstrap uses N=32768.
+3. **Parameter switching** between N values requires the two-server protocol (re-encryption between servers, not involving the client).
+4. **Bootstrap was downgraded**: Their code contains `logN = 15; // 16 -> 15` with the comment *"adjusted to satisfy the memory constraints of an A100 GPU"*.
+5. The reported 37.3s is a **projection** from summing individual operation timings, not a measured end-to-end execution.
+
+### Our N=65536 Experiments on MareNostrum 5
+
+We conducted systematic experiments to test bootstrap at N=65536 on H100 64GB GPUs:
+
+**Memory analysis at N=65536 (logN=16, logn=14, sparse_slots=16384):**
+
+| Component | Memory | Notes |
+|-----------|--------|-------|
+| PhantomContext + SecretKey | 0.61 GB | Parameter tables, NTT roots |
+| PublicKey + RelinKey | 1.57 GB | Freed before bootstrap (not needed) |
+| Per Galois key | **1.30 GB** | 2x larger polynomials vs N=32768 |
+| Bootstrap needs | 48 keys | 48 unique rotation steps (BSGS + power-of-2) |
+| **Total key memory** | **62.4 GB** | 48 x 1.30 GB |
+| After freeing PK+RK | **63.0 GB** | Fits in 63.43 GB, but 0 MB left for intermediates |
+
+**Experiment 1: Single-GPU memory-optimized bootstrap (Job 38887673)**
+- Freed PublicKey and RelinKey (not used by bootstrap) to reclaim 1.57 GB
+- All 48 Galois keys created successfully: **63.37 GB used / 63.43 GB total**
+- Bootstrap OOM: only **60 MB free** — insufficient for intermediate ciphertexts (~37 MB each)
+- **Result: N=65536 bootstrap does not fit on a single H100 64GB**
+
+**Experiment 2: Multi-GPU key distribution (Jobs 38886075, 38886320)**
+- Split 48 Galois keys across 2 GPUs (24 each, ~31 GB per GPU)
+- GPU 0: 33.43 GB, GPU 1: 32.06 GB — both fit comfortably
+- **Accuracy result: MAE = 10^238 (FAIL)**
+- Root cause: Phantom library is **context-bound** — each GPU creates its own PhantomContext with distinct NTT tables and `parms_id` hashes. Ciphertexts transferred between contexts (even with `cudaMemcpyPeer`) produce incorrect results because the key-switching operation uses context-specific NTT roots.
+
+**Experiment 3: Control test at N=32768 (Job 38886207)**
+- Same distributed-key mechanism applied at N=32768 (where single-GPU bootstrap works)
+- Control (1 GPU): MAE = 0.000002 (PASS)
+- Distributed (2 GPU): MAE = 10^43 (FAIL)
+- **Confirms: the accuracy failure is in the cross-context transfer, not in N=65536 parameters**
+
+### Why Cross-Context Transfer Fails
+
+The Phantom FHE library ties each ciphertext to a specific `PhantomContext` through:
+1. **`parms_id_`**: A hash of encryption parameters — identical parameters on different contexts produce the same hash, but the context lookup uses GPU memory pointers
+2. **NTT tables**: Root-of-unity tables allocated on the creating GPU's memory — `rotate_vector_inplace` uses these tables directly
+3. **`key_galois_tool_`**: Galois element permutation tables are context-specific GPU allocations
+
+When a ciphertext is rotated on GPU 1 (with GPU 1's context) and the result is copied back to GPU 0, the coefficient data is correct, but subsequent operations on GPU 0 use GPU 0's NTT tables — which expect data in GPU 0's specific NTT representation. This representation mismatch accumulates exponentially through bootstrap's ~100+ operations.
+
+### Comparison with Cerium's Approach
+
+Cerium (Jayashankar et al., 2025) solves this problem through:
+1. **Custom FHE library (FIDESlib)** designed from scratch for multi-GPU, with shared NTT tables
+2. **UVM (Unified Virtual Memory)** for transparent GPU-to-GPU memory access
+3. **Compiler-driven key placement** that automatically assigns keys to GPUs
+
+These solutions require either a custom FHE library (not Phantom-compatible) or deep modifications to Phantom's memory management — beyond the scope of this project.
+
+### Conclusion
+
+For end-to-end BERT inference with real bootstrapping, **N=32768 is the practical parameter set** — consistent with NEXUS's own implementation choice. Our multi-GPU scaling results at N=32768 demonstrate the parallelization framework's effectiveness. The N=65536 memory constraint is a known limitation shared with NEXUS, who address it through parameter switching in their two-server protocol.
 
 ---
 

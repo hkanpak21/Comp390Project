@@ -141,7 +141,7 @@ endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(NCCL_FOUND)
-    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode)
+    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bootstrap_test_n65536 bootstrap_distkey_test bootstrap_n65536_streaming bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode)
         if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/${bench}.cu)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)

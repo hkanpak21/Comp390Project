@@ -163,6 +163,21 @@ public:
 
     explicit PhantomContext(const phantom::EncryptionParameters &params);
 
+    // Setup Galois permutation tables for given elements WITHOUT generating keys
+    // Used for key streaming: set up the element→index mapping, then load keys on demand
+    // NOTE: assumes is_bfv=false (CKKS only) — simplification to avoid forward-declaration issues
+    void setup_galois_tool(const std::vector<uint32_t> &elts) {
+        const auto &s = phantom::util::global_variables::default_stream->get_stream();
+        int log_n = phantom::arith::get_power_of_two(poly_degree_);
+        key_galois_tool_.reset();
+        key_galois_tool_ = std::make_unique<PhantomGaloisTool>(elts, log_n, s, /*is_bfv=*/false);
+    }
+
+    // Convert rotation steps to Galois elements using existing tool
+    std::vector<uint32_t> steps_to_elts(const std::vector<int> &steps) const {
+        return key_galois_tool_->get_elts_from_steps(steps);
+    }
+
     PhantomContext(const PhantomContext &) = delete;
 
     void operator=(const PhantomContext &) = delete;

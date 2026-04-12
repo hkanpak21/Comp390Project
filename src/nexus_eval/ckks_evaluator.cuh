@@ -8,6 +8,12 @@
 #pragma once
 
 #include <complex>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <thread>
 #include <vector>
 
 #include "context.cuh"
@@ -116,12 +122,269 @@ class Evaluator {
   PhantomContext *context;
   PhantomCKKSEncoder *encoder;
 
+  // Multi-GPU key distribution support with persistent worker thread
+  // Heap-allocated to keep Evaluator copyable
+  struct RemoteGPU {
+    int device_id = -1;
+    PhantomContext *context = nullptr;
+    PhantomGaloisKey *galois_keys = nullptr;
+    std::set<uint32_t> galois_elts;
+
+    std::thread worker;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool ready = false, done = false, shutdown = false;
+
+    // Work items: source ct info (on local GPU)
+    uint64_t *src_data_ptr = nullptr;
+    int src_dev = -1;
+    size_t src_size = 0, src_chain_index = 0;
+    size_t src_coeff_mod_size = 0, src_poly_mod_degree = 0;
+    double src_scale = 1.0;
+    bool src_is_ntt = true;
+    int rotation_step = 0;
+    bool is_conjugate = false;
+    // Result info (on remote GPU)
+    uint64_t *result_data_ptr = nullptr;
+    double result_scale = 1.0;
+    bool result_is_ntt = true;
+  };
+  std::shared_ptr<RemoteGPU> remote;  // shared_ptr keeps Evaluator copyable
+  int local_device = -1;
+
+  // ── CPU-side key streaming (for N=65536 where all keys don't fit on GPU) ──
+  // Forward declaration — actual type is ::GaloisKeyStore
+  void *key_store_ = nullptr;
+  PhantomGaloisKey *streaming_galois_keys_ = nullptr;  // galois_keys we populate on demand
+
+  uint32_t m_val = 0;  // 2*N, set from encoder slot_count
+
+  // Convert rotation step to Galois element
+  static uint32_t step_to_elt(int step, uint32_t m) {
+    if (step == 0) return m - 1;
+    uint32_t gen = 5;
+    int abs_step = step < 0 ? -step : step;
+    uint32_t elt = 1;
+    for (int i = 0; i < abs_step; i++) elt = (uint64_t(elt) * gen) % m;
+    if (step < 0) elt = (m + 1 - elt) % m;
+    return elt;
+  }
+
  public:
   Evaluator() = default;
   Evaluator(PhantomContext *context, PhantomCKKSEncoder *encoder) {
     this->context = context;
     this->encoder = encoder;
+    this->m_val = (uint32_t)(encoder->slot_count() * 4);  // m = 2*N = 4*slots
+    cudaGetDevice(&local_device);
   }
+
+  // Full setup: create context, keys, and worker all in the SAME thread
+  // This ensures thread_local default_stream is consistent
+  void setup_remote_gpu_full(int remote_device, const EncryptionParameters &parms,
+                             const std::string &sk_data, const std::vector<int> &remote_steps) {
+    remote = std::make_shared<RemoteGPU>();
+    remote->device_id = remote_device;
+    for (int step : remote_steps) {
+      remote->galois_elts.insert(step_to_elt(step, m_val));
+    }
+
+    // Signal that worker is initialized
+    std::mutex init_mtx;
+    std::condition_variable init_cv;
+    bool init_done = false;
+
+    auto r = remote;
+    remote->worker = std::thread([r, &parms, &sk_data, &remote_steps,
+                                  &init_mtx, &init_cv, &init_done]() {
+      cudaSetDevice(r->device_id);
+
+      // Create ALL GPU resources in this thread
+      r->context = new PhantomContext(parms);
+      PhantomCKKSEncoder enc(*r->context);
+
+      PhantomSecretKey sk;
+      { std::stringstream ss(sk_data); sk.load(ss); }
+
+      r->galois_keys = new PhantomGaloisKey(
+          sk.create_galois_keys_from_steps(*r->context, const_cast<std::vector<int>&>(remote_steps)));
+
+      // Signal init complete
+      { std::lock_guard<std::mutex> lock(init_mtx); init_done = true; }
+      init_cv.notify_one();
+
+      // Persistent ciphertext on this GPU (reused across rotations)
+      PhantomCiphertext local_ct;
+
+      // Enter work loop
+      while (true) {
+        std::unique_lock<std::mutex> lock(r->mtx);
+        r->cv.wait(lock, [&r]{ return r->ready || r->shutdown; });
+        if (r->shutdown) break;
+
+        // Step 1: Copy ciphertext FROM source GPU to this GPU
+        local_ct.resize(*r->context, r->src_chain_index, r->src_size, cudaStreamPerThread);
+        size_t total = r->src_size * r->src_coeff_mod_size * r->src_poly_mod_degree;
+        cudaMemcpyPeer(local_ct.data(), r->device_id,
+                       r->src_data_ptr, r->src_dev,
+                       total * sizeof(uint64_t));
+        cudaStreamSynchronize(cudaStreamPerThread);
+        local_ct.set_scale(r->src_scale);
+        local_ct.set_ntt_form(r->src_is_ntt);
+
+        // Step 2: Rotate on this GPU
+        if (r->is_conjugate) {
+          ::complex_conjugate_inplace(*r->context, local_ct, *r->galois_keys);
+        } else {
+          ::rotate_vector_inplace(*r->context, local_ct, r->rotation_step, *r->galois_keys);
+        }
+        cudaDeviceSynchronize();
+
+        // Step 3: Expose result pointer for the caller to copy back
+        r->result_data_ptr = local_ct.data();
+        r->result_scale = local_ct.scale();
+        r->result_is_ntt = local_ct.is_ntt_form();
+
+        r->ready = false;
+        r->done = true;
+        lock.unlock();
+        r->cv.notify_one();
+      }
+
+      // Cleanup
+      delete r->galois_keys;
+      delete r->context;
+    });
+
+    // Wait for initialization
+    { std::unique_lock<std::mutex> lock(init_mtx);
+      init_cv.wait(lock, [&]{ return init_done; }); }
+  }
+
+  // Setup remote GPU for key distribution — launches persistent worker thread
+  void setup_remote_gpu(int remote_device, PhantomContext *remote_ctx,
+                        PhantomGaloisKey *remote_gk, const std::vector<int> &remote_steps) {
+    remote = std::make_shared<RemoteGPU>();
+    remote->device_id = remote_device;
+    remote->context = remote_ctx;
+    remote->galois_keys = remote_gk;
+    for (int step : remote_steps) {
+      remote->galois_elts.insert(step_to_elt(step, m_val));
+    }
+
+    // Launch persistent worker thread on remote GPU
+    auto r = remote;  // capture shared_ptr
+    remote->worker = std::thread([r]() {
+      cudaSetDevice(r->device_id);
+      PhantomCiphertext local_ct;
+
+      while (true) {
+        std::unique_lock<std::mutex> lock(r->mtx);
+        r->cv.wait(lock, [&r]{ return r->ready || r->shutdown; });
+        if (r->shutdown) break;
+
+        // Copy in
+        local_ct.resize(*r->context, r->src_chain_index, r->src_size, cudaStreamPerThread);
+        size_t total = r->src_size * r->src_coeff_mod_size * r->src_poly_mod_degree;
+        cudaMemcpyPeer(local_ct.data(), r->device_id, r->src_data_ptr, r->src_dev,
+                       total * sizeof(uint64_t));
+        cudaStreamSynchronize(cudaStreamPerThread);
+        local_ct.set_scale(r->src_scale);
+        local_ct.set_ntt_form(r->src_is_ntt);
+
+        // Rotate
+        if (r->is_conjugate) {
+          ::complex_conjugate_inplace(*r->context, local_ct, *r->galois_keys);
+        } else {
+          ::rotate_vector_inplace(*r->context, local_ct, r->rotation_step, *r->galois_keys);
+        }
+        cudaDeviceSynchronize();
+
+        // Expose result
+        r->result_data_ptr = local_ct.data();
+        r->result_scale = local_ct.scale();
+        r->result_is_ntt = local_ct.is_ntt_form();
+
+        r->ready = false;
+        r->done = true;
+        lock.unlock();
+        r->cv.notify_one();
+      }
+    });
+  }
+
+  void shutdown_remote_gpu() {
+    if (remote && remote->device_id >= 0 && remote->worker.joinable()) {
+      { std::lock_guard<std::mutex> lock(remote->mtx); remote->shutdown = true; }
+      remote->cv.notify_one();
+      remote->worker.join();
+    }
+  }
+
+  // Copy ciphertext between GPUs using cudaMemcpyPeer (NVLink-fast)
+  // Uses resize(context, chain_index) to properly initialize parms_id on target
+  static void cross_gpu_copy(PhantomCiphertext &src, int src_dev,
+                             PhantomCiphertext &dst, int dst_dev,
+                             PhantomContext &dst_ctx) {
+    cudaSetDevice(dst_dev);
+    // Allocate with correct parms_id from destination context
+    dst.resize(dst_ctx, src.chain_index(), src.size(), cudaStreamPerThread);
+    // Copy raw coefficient data via NVLink (no serialize/deserialize)
+    size_t total = src.size() * src.coeff_modulus_size() * src.poly_modulus_degree();
+    cudaMemcpyPeer(dst.data(), dst_dev, src.data(), src_dev, total * sizeof(uint64_t));
+    cudaDeviceSynchronize();
+    // Copy metadata
+    dst.set_scale(src.scale());
+    dst.set_ntt_form(src.is_ntt_form());
+  }
+
+  void remote_rotate(PhantomCiphertext &ct, int steps, bool conjugate, PhantomCiphertext &dest) {
+    // Send work to persistent worker: it handles copy-in, rotate, copy-out
+    // Pass source data pointer and metadata for the worker to copy
+    {
+      std::lock_guard<std::mutex> lock(remote->mtx);
+      remote->src_data_ptr = ct.data();
+      remote->src_dev = local_device;
+      remote->src_size = ct.size();
+      remote->src_chain_index = ct.chain_index();
+      remote->src_coeff_mod_size = ct.coeff_modulus_size();
+      remote->src_poly_mod_degree = ct.poly_modulus_degree();
+      remote->src_scale = ct.scale();
+      remote->src_is_ntt = ct.is_ntt_form();
+      remote->rotation_step = steps;
+      remote->is_conjugate = conjugate;
+      remote->done = false;
+      remote->ready = true;
+    }
+    remote->cv.notify_one();
+
+    // Wait for result
+    {
+      std::unique_lock<std::mutex> lock(remote->mtx);
+      remote->cv.wait(lock, [this]{ return remote->done; });
+    }
+
+    // Copy result from remote GPU back to local GPU
+    cudaSetDevice(local_device);
+    dest.resize(*context, ct.chain_index(), ct.size(), cudaStreamPerThread);
+    size_t total = ct.size() * ct.coeff_modulus_size() * ct.poly_modulus_degree();
+    cudaMemcpyPeer(dest.data(), local_device,
+                   remote->result_data_ptr, remote->device_id,
+                   total * sizeof(uint64_t));
+    cudaDeviceSynchronize();
+    dest.set_scale(remote->result_scale);
+    dest.set_ntt_form(remote->result_is_ntt);
+  }
+
+  bool has_remote_gpu() const { return remote && remote->device_id >= 0; }
+
+  // Enable CPU-side key streaming mode
+  void enable_key_streaming(void *store, PhantomGaloisKey *gk) {
+    key_store_ = store;
+    streaming_galois_keys_ = gk;
+  }
+
+  bool has_key_streaming() const { return key_store_ != nullptr; }
 
   // Mod switch
   inline void mod_switch_to_next_inplace(PhantomCiphertext &ct) {
@@ -249,14 +512,39 @@ class Evaluator {
     ::sub_inplace(*context, ct1, ct2);
   }
 
-  // Rotation
+  // Rotation — with key streaming and multi-GPU support
   inline void rotate_vector(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys, PhantomCiphertext &dest) {
+    if (key_store_) {
+      ensure_key_loaded(steps, galois_keys);
+    }
+    if (remote && remote->device_id >= 0) {
+      uint32_t elt = step_to_elt(steps, m_val);
+      if (remote->galois_elts.count(elt)) {
+        remote_rotate(ct, steps, false, dest);
+        return;
+      }
+    }
     dest = ::rotate_vector(*context, ct, steps, galois_keys);
   }
 
   inline void rotate_vector_inplace(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys) {
+    if (key_store_) {
+      ensure_key_loaded(steps, galois_keys);
+    }
+    if (remote && remote->device_id >= 0) {
+      uint32_t elt = step_to_elt(steps, m_val);
+      if (remote->galois_elts.count(elt)) {
+        PhantomCiphertext dest;
+        remote_rotate(ct, steps, false, dest);
+        ct = std::move(dest);
+        return;
+      }
+    }
     ::rotate_vector_inplace(*context, ct, steps, galois_keys);
   }
+
+  // Load the Galois key for a given rotation step from CPU to GPU
+  void ensure_key_loaded(int steps, PhantomGaloisKey &galois_keys);
 
   // Negation
   inline void negate(PhantomCiphertext &ct, PhantomCiphertext &dest) {
@@ -291,11 +579,24 @@ class Evaluator {
 
   // Complex Conjugate — needed by bootstrapping (slottocoeff_full_3, etc.)
   inline void complex_conjugate(PhantomCiphertext &ct, const PhantomGaloisKey &galois_keys, PhantomCiphertext &dest) {
+    if (key_store_) {
+      ensure_key_loaded(0, const_cast<PhantomGaloisKey&>(galois_keys));  // step=0 → conjugation
+    }
+    if (remote && remote->device_id >= 0) {
+      uint32_t conj_elt = m_val - 1;
+      if (remote->galois_elts.count(conj_elt)) {
+        remote_rotate(ct, 0, true, dest);
+        return;
+      }
+    }
     dest = ct;
-    complex_conjugate_inplace(dest, galois_keys);
+    ::complex_conjugate_inplace(*context, dest, galois_keys);
   }
 
   inline void complex_conjugate_inplace(PhantomCiphertext &ct, const PhantomGaloisKey &galois_keys) {
+    if (key_store_) {
+      ensure_key_loaded(0, const_cast<PhantomGaloisKey&>(galois_keys));
+    }
     ::complex_conjugate_inplace(*context, ct, galois_keys);
   }
 

@@ -5,14 +5,33 @@
  * API changes: params_id() → chain_index(), chain_depth() → chain_index()
  */
 
+#include <algorithm>
 #include <iostream>
 
 #include "ckks_evaluator.cuh"
+#include "galois_key_store.cuh"
 #include "utils.cuh"
 
 using namespace phantom::arith;
 using namespace phantom::util;
 using namespace nexus;
+
+// Implement key streaming intercept — finds Galois element index and loads key on demand
+void nexus::Evaluator::ensure_key_loaded(int steps, PhantomGaloisKey &galois_keys) {
+    GaloisKeyStore *store = static_cast<GaloisKeyStore *>(key_store_);
+    uint32_t target_elt = step_to_elt(steps, m_val);
+
+    // Find the element's index in the context's galois tool
+    auto &elts = context->key_galois_tool_->galois_elts();
+    auto it = std::find(elts.begin(), elts.end(), target_elt);
+    if (it == elts.end()) {
+        fprintf(stderr, "[KeyStore] ERROR: galois element %u (step %d) not in tool\n",
+                target_elt, steps);
+        return;
+    }
+    size_t idx = std::distance(elts.begin(), it);
+    store->load_key_to_gpu(idx, galois_keys);
+}
 
 void CKKSEvaluator::print_decoded_pt(PhantomPlaintext &pt, int num) {
   vector<double> v;

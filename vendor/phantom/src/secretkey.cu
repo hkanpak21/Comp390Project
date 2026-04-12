@@ -534,6 +534,32 @@ PhantomGaloisKey PhantomSecretKey::create_galois_keys(const PhantomContext &cont
     return galois_keys;
 }
 
+PhantomRelinKey PhantomSecretKey::generate_single_galois_key(const PhantomContext &context, size_t galois_elt_idx) const {
+    auto &key_context_data = context.get_context_data(0);
+    auto &key_parms = key_context_data.parms();
+    auto &key_modulus = key_parms.coeff_modulus();
+    auto &key_galois_tool = context.key_galois_tool_;
+    auto poly_degree = key_parms.poly_modulus_degree();
+    auto key_mod_size = key_modulus.size();
+
+    const auto &s = phantom::util::global_variables::default_stream->get_stream();
+
+    auto &galois_elts = key_galois_tool->galois_elts();
+    auto galois_elt = galois_elts[galois_elt_idx];
+
+    if (!(galois_elt & 1) || (galois_elt >= poly_degree << 1)) {
+        throw std::invalid_argument("Galois element is not valid");
+    }
+
+    auto rotated_secret_key = make_cuda_auto_ptr<uint64_t>(key_mod_size * poly_degree, s);
+    key_galois_tool->apply_galois_ntt(secret_key_array_.get(), key_mod_size, galois_elt_idx,
+                                       rotated_secret_key.get(), s);
+
+    PhantomRelinKey relin_key;
+    generate_one_kswitch_key(context, rotated_secret_key.get(), relin_key, s);
+    return relin_key;
+}
+
 PhantomGaloisKey PhantomSecretKey::create_galois_keys_from_elts(PhantomContext &context, const std::vector<uint32_t> &elts) const {
     const auto &s = phantom::util::global_variables::default_stream->get_stream();
 

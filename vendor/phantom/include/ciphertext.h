@@ -233,6 +233,7 @@ public:
 
     // ── Serialization (backported for multi-GPU/MPI support) ────────────────
     void save(std::ostream &stream) const {
+        stream.write(reinterpret_cast<const char *>(&parms_id_), sizeof(parms_id_));
         stream.write(reinterpret_cast<const char *>(&chain_index_), sizeof(std::size_t));
         stream.write(reinterpret_cast<const char *>(&size_), sizeof(std::size_t));
         stream.write(reinterpret_cast<const char *>(&poly_modulus_degree_), sizeof(std::size_t));
@@ -252,6 +253,7 @@ public:
     }
 
     void load(std::istream &stream) {
+        stream.read(reinterpret_cast<char *>(&parms_id_), sizeof(parms_id_));
         stream.read(reinterpret_cast<char *>(&chain_index_), sizeof(std::size_t));
         stream.read(reinterpret_cast<char *>(&size_), sizeof(std::size_t));
         stream.read(reinterpret_cast<char *>(&poly_modulus_degree_), sizeof(std::size_t));

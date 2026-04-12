@@ -5,11 +5,10 @@
 
 # ── Modules ───────────────────────────────────────────────────────────────────
 module purge
-module load cuda/12.3
-module load nccl/2.20.5-cuda12.3
-module load openmpi/4.1.5-cuda12.3
-module load cmake/3.27.4
-module load python/3.11.5   # For plot scripts
+module load cuda/12.8
+module load cmake/3.30.5
+module load nccl/2.24.3-1
+module load openmpi            # For multi-node MPI
 
 # ── NCCL / InfiniBand environment ────────────────────────────────────────────
 export NCCL_DEBUG=WARN

@@ -70,6 +70,7 @@ namespace phantom::util {
         T *ptr_ = nullptr;
         size_t n_ = 0;
         cudaStream_t cudaStream_ = nullptr;
+        bool owns_ = true;  // if false, destructor won't free (non-owning wrapper)
 
     public:
         cuda_auto_ptr() = default;
@@ -78,6 +79,15 @@ namespace phantom::util {
             ptr_ = ptr;
             n_ = n;
             cudaStream_ = stream;
+            owns_ = true;
+        }
+
+        // Non-owning constructor (for external buffer wrappers)
+        cuda_auto_ptr(T *ptr, size_t n, const cudaStream_t &stream, bool owns) {
+            ptr_ = ptr;
+            n_ = n;
+            cudaStream_ = stream;
+            owns_ = owns;
         }
 
         // copy constructor
@@ -107,15 +117,15 @@ namespace phantom::util {
 
         // move constructor
         cuda_auto_ptr(cuda_auto_ptr &&dyingObj) noexcept {
-            // share the underlying pointer
             this->ptr_ = dyingObj.ptr_;
             this->n_ = dyingObj.n_;
             this->cudaStream_ = dyingObj.cudaStream_;
+            this->owns_ = dyingObj.owns_;
 
-            // reset the dying object
             dyingObj.ptr_ = nullptr;
             dyingObj.n_ = 0;
             dyingObj.cudaStream_ = nullptr;
+            dyingObj.owns_ = true;
         }
 
         // move assignment
@@ -129,11 +139,12 @@ namespace phantom::util {
             this->ptr_ = dyingObj.ptr_;
             this->n_ = dyingObj.n_;
             this->cudaStream_ = dyingObj.cudaStream_;
+            this->owns_ = dyingObj.owns_;
 
-            // reset the dying object
             dyingObj.ptr_ = nullptr;
             dyingObj.n_ = 0;
             dyingObj.cudaStream_ = nullptr;
+            dyingObj.owns_ = true;
 
             return *this;
         }
@@ -167,14 +178,18 @@ namespace phantom::util {
             if (ptr_ == nullptr) {
                 return;
             }
-            auto err = cudaFreeAsync(ptr_, cudaStream_);
-            if (err != cudaSuccess) {
-                std::cerr << "Error freeing " << n_ << " * " << sizeof(T) << " bytes at " << ptr_
-                          << " on stream " << cudaStream_ << std::endl;
-                std::cerr << "Error code: " << cudaGetErrorString(err) << std::endl;
+            if (owns_) {
+                auto err = cudaFreeAsync(ptr_, cudaStream_);
+                if (err != cudaSuccess) {
+                    std::cerr << "Error freeing " << n_ << " * " << sizeof(T) << " bytes at " << ptr_
+                              << " on stream " << cudaStream_ << std::endl;
+                    std::cerr << "Error code: " << cudaGetErrorString(err) << std::endl;
+                }
             }
+            ptr_ = nullptr;
             n_ = 0;
             cudaStream_ = nullptr;
+            owns_ = true;
         }
     };
 

@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
 
     PerfTimer timer, total_timer;
 
-    // ═══ Parameters matching NEXUS bootstrap config ═══
+    // ═══ Parameters matching NEXUS bootstrap config (N=32768) ═══
     long logN = 15;
     long logn = logN - 2;          // 13
     long logNh = logN - 1;         // 14

@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     MPI_Init(&argc,&argv);
     int rank,world; MPI_Comm_rank(MPI_COMM_WORLD,&rank); MPI_Comm_size(MPI_COMM_WORLD,&world);
 
-    int gpn=4, heads=16, inner=16, seq=16, hidden=64;
+    int gpn=4, heads=12, inner=768, seq=128, hidden=768;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--gpus-per-node")&&i+1<argc) gpn=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--heads")&&i+1<argc) heads=atoi(argv[++i]);
@@ -71,21 +71,32 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--seq-len")&&i+1<argc) seq=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--hidden")&&i+1<argc) hidden=atoi(argv[++i]);
     }
-    int total_gpus=world*gpn, per_rank=heads/world;
+    int total_gpus=world*gpn;
+
+    // Distribute heads evenly with remainder handling
+    // e.g. 12 heads across 8 nodes: ranks 0-3 get 2 heads, ranks 4-7 get 1 head
+    vector<int> heads_per_rank(world);
+    for(int i=0;i<heads;i++) heads_per_rank[i%world]++;
+    int my_heads=heads_per_rank[rank];
+    int my_start=0;
+    for(int r=0;r<rank;r++) my_start+=heads_per_rank[r];
 
     if(rank==0){
         printf("════════════════════════════════════════════════════════════\n");
         printf("  BERT Encoder Layer — Multi-Node Real Bootstrap\n");
-        printf("  %d nodes × %d GPUs = %d GPUs, heads=%d (%d/node)\n",world,gpn,total_gpus,heads,per_rank);
+        printf("  %d nodes × %d GPUs = %d GPUs, heads=%d\n",world,gpn,total_gpus,heads);
+        printf("  Head distribution:");
+        for(int r=0;r<world;r++) printf(" node%d=%d",r,heads_per_rank[r]);
+        printf("\n");
         printf("════════════════════════════════════════════════════════════\n\n");
     }
 
     PerfTimer timer;
 
-    // ═══ Parameters ═══
-    long logN=15, logn=logN-2, logNh=logN-1;
-    size_t N=1ULL<<logN;
-    long sparse_slots_val=1L<<logn;
+    // ═══ Parameters matching NEXUS bootstrap config (N=32768) ═══
+    long logN=15, logn=logN-2, logNh=logN-1;  // logn=13, logNh=14
+    size_t N=1ULL<<logN;                       // 32768
+    long sparse_slots_val=1L<<logn;            // 8192
     int logp=46, logq=51, log_special=51;
     int main_mod=21, bs_mod=14;
     int total_level=main_mod+bs_mod;
@@ -155,44 +166,54 @@ int main(int argc, char **argv) {
             for(int j=0;j<bs_mod;j++) eval0.evaluator.mod_switch_to_next_inplace(all[i]);
         }
         // Keep rank 0's share
-        for(int i=0;i<per_rank;i++){
+        for(int i=0;i<my_heads;i++){
             stringstream ss; all[i].save(ss);
             local_ct_data.push_back(ss.str());
         }
-        // Send to other ranks
+        // Send to other ranks (each gets heads_per_rank[r] heads)
+        int offset=heads_per_rank[0];
         for(int r=1;r<world;r++){
-            vector<PhantomCiphertext> b(all.begin()+r*per_rank,all.begin()+(r+1)*per_rank);
-            string d=ser_cts(b); int sz=d.size();
-            MPI_Send(&sz,1,MPI_INT,r,0,MPI_COMM_WORLD);
-            MPI_Send(d.data(),sz,MPI_CHAR,r,1,MPI_COMM_WORLD);
+            int cnt=heads_per_rank[r];
+            if(cnt>0){
+                vector<PhantomCiphertext> b(all.begin()+offset,all.begin()+offset+cnt);
+                string d=ser_cts(b); int sz=d.size();
+                MPI_Send(&sz,1,MPI_INT,r,0,MPI_COMM_WORLD);
+                MPI_Send(d.data(),sz,MPI_CHAR,r,1,MPI_COMM_WORLD);
+            } else {
+                int sz=0; MPI_Send(&sz,1,MPI_INT,r,0,MPI_COMM_WORLD);
+            }
+            offset+=cnt;
         }
     } else {
         int sz; MPI_Recv(&sz,1,MPI_INT,0,0,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-        string d(sz,'\0'); MPI_Recv(&d[0],sz,MPI_CHAR,0,1,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-        auto cts=deser_cts(d);
-        for(auto &ct:cts){
-            stringstream ss; ct.save(ss);
-            local_ct_data.push_back(ss.str());
+        if(sz>0){
+            string d(sz,'\0'); MPI_Recv(&d[0],sz,MPI_CHAR,0,1,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+            auto cts=deser_cts(d);
+            for(auto &ct:cts){
+                stringstream ss; ct.save(ss);
+                local_ct_data.push_back(ss.str());
+            }
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
     double scatter_ms=timer.elapsed_ms();
-    if(rank==0) printf("[1] Scatter: %.1f ms (%d heads/node)\n",scatter_ms,per_rank);
+    if(rank==0) printf("[1] Scatter: %.1f ms (max %d heads/node)\n",scatter_ms,heads_per_rank[0]);
 
     // ═══ Per-node multi-GPU compute ═══
     timer.start();
 
-    // Assign heads to GPUs within this node
+    // Assign heads to GPUs within this node (round-robin)
     int local_heads = (int)local_ct_data.size();
-    vector<vector<int>> gpu_heads(gpn);
-    for(int i=0;i<local_heads;i++) gpu_heads[i%gpn].push_back(i);
+    int active_gpus = std::min(gpn, local_heads); // don't spawn threads for idle GPUs
+    vector<vector<int>> gpu_heads(active_gpus);
+    for(int i=0;i<local_heads;i++) gpu_heads[i%active_gpus].push_back(i);
 
-    vector<vector<string>> gpu_results(gpn);
+    vector<vector<string>> gpu_results(active_gpus);
     vector<thread> threads;
     atomic<int> setup_done{0};
     PerfTimer compute_timer;
 
-    for(int g=0;g<gpn;g++){
+    for(int g=0;g<active_gpus;g++){
         threads.emplace_back([&,g](){
             cudaSetDevice(g);
             PhantomContext ctx(parms);
@@ -228,8 +249,8 @@ int main(int argc, char **argv) {
             le.decryptor.create_galois_keys_from_steps(gsteps,*le.galois_keys);
 
             int my_count=setup_done.fetch_add(1)+1;
-            while(setup_done.load()<gpn){/* spin */}
-            if(my_count==gpn) compute_timer.start();
+            while(setup_done.load()<active_gpus){/* spin */}
+            if(my_count==active_gpus) compute_timer.start();
 
             GELUEvaluator lg(le); SoftmaxEvaluator ls(le); LNEvaluator ll(le); MMEvaluator lm(le);
 
@@ -289,7 +310,7 @@ int main(int argc, char **argv) {
         });
     }
     for(auto &t:threads) t.join();
-    double compute_ms=compute_timer.elapsed_ms();
+    double compute_ms = (active_gpus > 0) ? compute_timer.elapsed_ms() : 0.0;
     MPI_Barrier(MPI_COMM_WORLD);
     double node_ms=timer.elapsed_ms();
 
@@ -297,13 +318,15 @@ int main(int argc, char **argv) {
     timer.start();
     if(rank==0){
         for(int r=1;r<world;r++){
-            int sz; MPI_Recv(&sz,1,MPI_INT,r,0,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-            string d(sz,'\0'); MPI_Recv(&d[0],sz,MPI_CHAR,r,1,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+            if(heads_per_rank[r]>0){
+                int sz; MPI_Recv(&sz,1,MPI_INT,r,0,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                string d(sz,'\0'); MPI_Recv(&d[0],sz,MPI_CHAR,r,1,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+            }
         }
-    } else {
+    } else if(my_heads>0){
         // Collect all GPU results for this rank
         vector<PhantomCiphertext> results;
-        for(int g=0;g<gpn;g++){
+        for(int g=0;g<active_gpus;g++){
             for(auto &s:gpu_results[g]){
                 PhantomCiphertext ct; stringstream ss(s); ct.load(ss);
                 results.push_back(std::move(ct));
@@ -317,16 +340,24 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double gather_ms=timer.elapsed_ms();
 
+    // Collect max compute time across all ranks (bottleneck determines wall time)
+    double max_compute=0;
+    MPI_Reduce(&compute_ms,&max_compute,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+
     if(rank==0){
         printf("\n════════════════════════════════════════════════\n");
         printf("  Multi-Node BERT Encoder — Real Bootstrap\n");
         printf("════════════════════════════════════════════════\n");
         printf("  Nodes: %d, GPUs: %d, Heads: %d\n",world,total_gpus,heads);
-        printf("  Scatter:   %8.1f ms\n",scatter_ms);
-        printf("  Compute:   %8.1f ms (per-node, %d heads)\n",compute_ms,per_rank);
-        printf("  Node total:%8.1f ms (includes setup)\n",node_ms);
-        printf("  Gather:    %8.1f ms\n",gather_ms);
-        printf("  Total:     %8.1f ms\n",scatter_ms+node_ms+gather_ms);
+        printf("  Head distribution:");
+        for(int r=0;r<world;r++) printf(" node%d=%d",r,heads_per_rank[r]);
+        printf("\n");
+        printf("  Scatter:      %8.1f ms\n",scatter_ms);
+        printf("  Compute(max): %8.1f ms (bottleneck node)\n",max_compute);
+        printf("  Compute(r0):  %8.1f ms (rank 0, %d heads)\n",compute_ms,my_heads);
+        printf("  Node total:   %8.1f ms (includes setup)\n",node_ms);
+        printf("  Gather:       %8.1f ms\n",gather_ms);
+        printf("  Total:        %8.1f ms\n",scatter_ms+node_ms+gather_ms);
         printf("════════════════════════════════════════════════\n");
     }
 

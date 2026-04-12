@@ -110,6 +110,74 @@ public:
     [[nodiscard]] inline auto public_keys_ptr() const {
         return public_keys_ptr_.get();
     }
+
+    // ── CPU-side key streaming support ──────────────────────────────────
+    [[nodiscard]] size_t dnum() const { return public_keys_.size(); }
+
+    [[nodiscard]] size_t component_size(size_t i) const {
+        return public_keys_[i].get_n();
+    }
+
+    // Copy all GPU key data to CPU pinned memory
+    void copy_to_host(std::vector<std::vector<uint64_t>> &host_data) const {
+        host_data.resize(public_keys_.size());
+        for (size_t i = 0; i < public_keys_.size(); i++) {
+            size_t n = public_keys_[i].get_n();
+            host_data[i].resize(n);
+            cudaMemcpy(host_data[i].data(), public_keys_[i].get(),
+                       n * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        }
+        cudaDeviceSynchronize();
+    }
+
+    // Load key data from CPU pinned memory back to GPU
+    // Uses Phantom's default_stream to match other operations
+    void load_from_host(const std::vector<std::vector<uint64_t>> &host_data,
+                        const cudaStream_t & /*unused*/) {
+        // Use Phantom's default stream to avoid cross-stream visibility issues
+        const auto &stream = phantom::util::global_variables::default_stream->get_stream();
+        public_keys_.resize(host_data.size());
+        std::vector<uint64_t *> ptrs(host_data.size());
+        for (size_t i = 0; i < host_data.size(); i++) {
+            size_t n = host_data[i].size();
+            public_keys_[i] = phantom::util::make_cuda_auto_ptr<uint64_t>(n, stream);
+            cudaMemcpyAsync(public_keys_[i].get(), host_data[i].data(),
+                            n * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
+            ptrs[i] = public_keys_[i].get();
+        }
+        // Rebuild pointer array on GPU
+        public_keys_ptr_ = phantom::util::make_cuda_auto_ptr<uint64_t *>(ptrs.size(), stream);
+        cudaMemcpyAsync(public_keys_ptr_.get(), ptrs.data(),
+                        ptrs.size() * sizeof(uint64_t *), cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);
+        gen_flag_ = true;
+    }
+
+    // Free GPU memory (keep object valid but empty)
+    void free_gpu_data() {
+        public_keys_.clear();
+        public_keys_ptr_.reset();
+    }
+
+    // Point at externally-owned GPU buffers (does NOT take ownership)
+    // Used for key streaming with pre-allocated reusable buffers
+    void set_external_buffers(const std::vector<void *> &buffers, uint64_t **ptr_array) {
+        // Release any owned buffers first
+        public_keys_.clear();
+        public_keys_ptr_.reset();
+
+        // Create non-owning wrappers via a custom deleter (no-op)
+        public_keys_.resize(buffers.size());
+        for (size_t i = 0; i < buffers.size(); i++) {
+            // cuda_auto_ptr constructor with nullptr stream means it won't free
+            public_keys_[i] = phantom::util::cuda_auto_ptr<uint64_t>(
+                (uint64_t *)buffers[i], 0, (cudaStream_t)0, /*owns=*/false);
+        }
+        // public_keys_ptr_ wraps the externally-owned ptr array
+        public_keys_ptr_ = phantom::util::cuda_auto_ptr<uint64_t *>(
+            ptr_array, buffers.size(), (cudaStream_t)0, /*owns=*/false);
+        gen_flag_ = true;
+    }
 };
 
 /** PhantomGaloisKey stores Galois keys.
@@ -142,6 +210,20 @@ public:
     [[nodiscard]] auto &get_relin_keys(size_t index) const {
         return relin_keys_.at(index);
     }
+
+    // ── Key streaming support ───────────────────────────────────────────
+    // Mutable access to load/unload individual keys
+    PhantomRelinKey &get_mutable_relin_key(size_t index) {
+        return relin_keys_.at(index);
+    }
+
+    // Pre-allocate slots without generating keys
+    void resize_slots(size_t n) {
+        relin_keys_.resize(n);
+        gen_flag_ = true;
+    }
+
+    [[nodiscard]] size_t num_keys() const { return relin_keys_.size(); }
 };
 
 /** PhantomSecretKey contains the secret key in RNS and NTT form
@@ -220,7 +302,11 @@ public:
 
     [[nodiscard]] PhantomGaloisKey create_galois_keys_from_elts(PhantomContext &context,const std::vector<uint32_t> &elts) const;
 
-    [[nodiscard]] PhantomGaloisKey create_galois_keys_from_steps(PhantomContext &context, const std::vector<int> &steps) const; 
+    [[nodiscard]] PhantomGaloisKey create_galois_keys_from_steps(PhantomContext &context, const std::vector<int> &steps) const;
+
+    // Generate a single Galois key for one rotation step index
+    // context.key_galois_tool_ must already be set up with all elements
+    [[nodiscard]] PhantomRelinKey generate_single_galois_key(const PhantomContext &context, size_t galois_elt_idx) const;
 
     /** Encrypt zero using the secret key, the ciphertext is in NTT form
      * @param[in] context PhantomContext

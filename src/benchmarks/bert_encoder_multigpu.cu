@@ -51,8 +51,8 @@ struct PerfTimer {
 };
 
 int main(int argc, char **argv) {
-    int n_gpus = 1, n_heads = 4, inner = 16, seq_len = 16;
-    int hidden = 64;
+    int n_gpus = 4, n_heads = 12, inner = 768, seq_len = 128;
+    int hidden = 768;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--n-gpus") && i+1 < argc) n_gpus = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--heads") && i+1 < argc) n_heads = atoi(argv[++i]);
@@ -67,17 +67,27 @@ int main(int argc, char **argv) {
 
     printf("════════════════════════════════════════════════════════════\n");
     printf("  BERT Encoder Layer — Multi-GPU Real Bootstrap (%d GPUs)\n", n_gpus);
-    printf("  heads=%d, hidden=%d, inner=%d, seq=%d\n", n_heads, hidden, inner, seq_len);
+    printf("  N=%zu, heads=%d, hidden=%d, inner=%d, seq=%d\n", N, n_heads, hidden, inner, seq_len);
     printf("════════════════════════════════════════════════════════════\n\n");
+
+    // Memory monitoring helper
+    auto print_mem = [](int gpu, const char* label) {
+        size_t free_m, total_m;
+        cudaSetDevice(gpu);
+        cudaMemGetInfo(&free_m, &total_m);
+        printf("[GPU %d] %s: %.2f/%.2f GB used\n", gpu, label,
+               (total_m-free_m)/(1024.0*1024.0*1024.0), total_m/(1024.0*1024.0*1024.0));
+    };
+    print_mem(0, "Initial");
 
     PerfTimer timer;
 
-    // ═══ Parameters matching NEXUS bootstrap config ═══
+    // ═══ Parameters matching NEXUS bootstrap config (N=32768) ═══
     long logN = 15;
-    long logn = logN - 2;
-    long logNh = logN - 1;
-    size_t N = 1ULL << logN;
-    long sparse_slots_val = 1L << logn;
+    long logn = logN - 2;                    // 13 (sparse_slots = 8192)
+    long logNh = logN - 1;                   // 14
+    size_t N = 1ULL << logN;                 // 32768
+    long sparse_slots_val = 1L << logn;      // 8192
 
     int logp = 46, logq = 51, log_special = 51;
     int main_mod = 21, bs_mod = 14;
