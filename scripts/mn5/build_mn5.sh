@@ -1,11 +1,29 @@
 #!/bin/bash
 # Build script for MN5
-# Usage: bash scripts/mn5/build_mn5.sh
+# Usage: bash scripts/mn5/build_mn5.sh [--with-mpi]
+#
+# Default: builds single-node and multi-GPU targets WITHOUT MPI.
+# This avoids the Intel-compiled libmpi.so linker error on MN5 ACC partition.
+# Pass --with-mpi to also build multi-node targets (requires correct OpenMPI module).
 
 set -e
 
+WITH_MPI=0
+for arg in "$@"; do
+    [[ "$arg" == "--with-mpi" ]] && WITH_MPI=1
+done
+
+# Load modules — do NOT load openmpi for the default build (causes Intel linker error)
 module purge
-module load cuda/12.8 cmake/3.30.5 nccl/2.24.3-1 openmpi
+if [[ $WITH_MPI -eq 1 ]]; then
+    module load cuda/12.8 cmake/3.30.5 nccl/2.24.3-1 openmpi
+    MPI_FLAG="-DNEXUS_USE_MPI=ON"
+    echo "Building WITH MPI support (multi-node targets enabled)"
+else
+    module load cuda/12.8 cmake/3.30.5 nccl/2.24.3-1
+    MPI_FLAG="-DNEXUS_USE_MPI=OFF"
+    echo "Building WITHOUT MPI (single-node + multi-GPU only; avoids Intel linker error)"
+fi
 
 PROJECT=/gpfs/projects/etur02/hkanpak/Comp390Project
 cd ${PROJECT}
@@ -18,23 +36,24 @@ mkdir -p build && cd build
 
 cmake .. \
     -DCMAKE_CUDA_ARCHITECTURES=90 \
-    -DUSE_MPI=ON \
+    ${MPI_FLAG} \
     -DCMAKE_BUILD_TYPE=Release \
     -DNTL_DIR=/gpfs/projects/etur02/hkanpak/local
 
-make -j$(nproc) \
-    bootstrap_test_n65536 \
-    bert_encoder_multigpu bert_encoder_multinode \
-    bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 \
-    dist_bootstrap_bench bert_dks_multigpu \
-    llama_layer_multigpu_n65536 llama_layer_multinode_n65536 \
-    2>&1 | tail -40
+# Single-node and multi-GPU targets (always built)
+SINGLE_NODE_TARGETS="bootstrap_test_n65536 dist_bootstrap_bench bert_dks_multigpu llama_dks_multigpu bert_encoder_multigpu bert_encoder_multigpu_n65536 llama_layer_multigpu_n65536"
+
+if [[ $WITH_MPI -eq 1 ]]; then
+    MULTINODE_TARGETS="bert_dks_multinode bert_encoder_multinode bert_encoder_multinode_n65536 llama_layer_multinode_n65536"
+    ALL_TARGETS="${SINGLE_NODE_TARGETS} ${MULTINODE_TARGETS}"
+else
+    ALL_TARGETS="${SINGLE_NODE_TARGETS}"
+fi
+
+make -j$(nproc) ${ALL_TARGETS} 2>&1 | tail -50
 
 echo ""
 echo "Build complete. Binaries:"
-ls -la bin/bootstrap_test_n65536 \
-       bin/bert_encoder_multigpu bin/bert_encoder_multinode \
-       bin/bert_encoder_multigpu_n65536 bin/bert_encoder_multinode_n65536 \
-       bin/dist_bootstrap_bench bin/bert_dks_multigpu \
-       bin/llama_layer_multigpu_n65536 bin/llama_layer_multinode_n65536 \
-       2>/dev/null || echo "Check build errors above"
+for t in ${ALL_TARGETS}; do
+    ls -la bin/${t} 2>/dev/null || echo "  MISSING: bin/${t}"
+done

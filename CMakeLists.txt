@@ -22,6 +22,12 @@ endif()
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
+# ── Options ───────────────────────────────────────────────────────────────────
+# Set -DNEXUS_USE_MPI=OFF to disable MPI entirely (avoids Intel-compiled libmpi.so
+# linker errors on MN5 when the default openmpi module is INTEL-compiled).
+# Single-node and multi-GPU benchmarks do NOT need MPI.
+option(NEXUS_USE_MPI "Enable MPI for multi-node support" ON)
+
 # ── Find packages ─────────────────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
 
@@ -37,7 +43,67 @@ else()
 endif()
 
 # MPI (needed for multi-node NCCL init)
+# On MN5: load the GCC-compiled OpenMPI module so MPI_ROOT is set correctly.
+# Do NOT use the INTEL-compiled OpenMPI (OPENMPI/4.1.5/INTEL) — it requires
+# Intel runtime libs (libintlc.so.5, libimf.so) that are not in the standard path.
+# Build with -DNEXUS_USE_MPI=OFF to skip MPI entirely (for single-node benchmarks).
+if(NOT NEXUS_USE_MPI)
+    set(MPI_FOUND FALSE)
+    message(STATUS "MPI disabled (NEXUS_USE_MPI=OFF) — multi-node benchmarks will not build")
+else()
 find_package(MPI COMPONENTS CXX)
+if(NOT MPI_FOUND)
+    # Try mpicc/mpicxx wrapper programs first — they know their own flags
+    find_program(MPICC_EXEC  mpicc  HINTS $ENV{MPI_ROOT}/bin /usr/bin)
+    find_program(MPICXX_EXEC mpicxx HINTS $ENV{MPI_ROOT}/bin /usr/bin)
+    if(MPICC_EXEC)
+        execute_process(COMMAND ${MPICC_EXEC} --showme:incdirs
+            OUTPUT_VARIABLE _mpi_inc OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        execute_process(COMMAND ${MPICC_EXEC} --showme:libdirs
+            OUTPUT_VARIABLE _mpi_libdir OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        execute_process(COMMAND ${MPICC_EXEC} --showme:libs
+            OUTPUT_VARIABLE _mpi_libs OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    # Fallback: use only $ENV{MPI_ROOT} — set by the correct module on compute nodes
+    # (Never use hardcoded Intel-compiled paths like OPENMPI/4.1.5/INTEL)
+    find_path(MPI_MANUAL_INCLUDE mpi.h
+        HINTS ${_mpi_inc}
+              $ENV{MPI_ROOT}/include
+              /usr/include/mpi
+              /usr/include/openmpi)
+    find_library(MPI_MANUAL_LIB mpi
+        HINTS ${_mpi_libdir}
+              $ENV{MPI_ROOT}/lib
+              $ENV{MPI_ROOT}/lib64
+              /usr/lib64 /usr/lib)
+    if(MPI_MANUAL_INCLUDE AND MPI_MANUAL_LIB)
+        set(MPI_FOUND TRUE)
+        if(NOT TARGET MPI::MPI_CXX)
+            add_library(MPI::MPI_CXX INTERFACE IMPORTED)
+        endif()
+        # Build full link flags from wrapper output if available
+        if(_mpi_libs)
+            string(REPLACE " " ";" _mpi_libs_list "${_mpi_libs}")
+            set(_mpi_link_libs "")
+            foreach(_lib ${_mpi_libs_list})
+                string(STRIP "${_lib}" _lib)
+                if(_lib)
+                    list(APPEND _mpi_link_libs "-l${_lib}")
+                endif()
+            endforeach()
+            if(_mpi_libdir)
+                set(_mpi_link_libs "-L${_mpi_libdir};${_mpi_link_libs}")
+            endif()
+        else()
+            set(_mpi_link_libs "${MPI_MANUAL_LIB}")
+        endif()
+        set_target_properties(MPI::MPI_CXX PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${MPI_MANUAL_INCLUDE}"
+            INTERFACE_LINK_LIBRARIES "${_mpi_link_libs}")
+        message(STATUS "MPI manual fallback: headers=${MPI_MANUAL_INCLUDE} lib=${MPI_MANUAL_LIB}")
+    endif()
+endif()
+endif() # NEXUS_USE_MPI
 
 # ── Vendor submodules ─────────────────────────────────────────────────────────
 # NEXUS (builds its own SEAL 4.1 + GPU inference)
@@ -148,7 +214,7 @@ endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(NCCL_FOUND)
-    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bootstrap_test_n65536 bootstrap_distkey_test bootstrap_n65536_streaming rotate_stream_test bert_encoder_n65536 bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 llama_layer_multigpu_n65536 llama_layer_multinode_n65536 bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode dist_bootstrap_bench bert_dks_multigpu)
+    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bootstrap_test_n65536 bootstrap_distkey_test bootstrap_n65536_streaming rotate_stream_test bert_encoder_n65536 bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 llama_layer_multigpu_n65536 llama_layer_multinode_n65536 bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode dist_bootstrap_bench bert_dks_multigpu bert_dks_multinode llama_dks_multigpu)
         if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/${bench}.cu)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)
@@ -162,9 +228,14 @@ if(NCCL_FOUND)
             endif()
             target_include_directories(${bench} PRIVATE
                 ${PHANTOM_ROOT}/include
+                src
                 src/nexus_eval
                 src/nexus_eval/bootstrapping
                 src/nexus_eval/bootstrapping/common
+                src/multi_gpu
+                src/multi_gpu/keyswitching
+                src/multi_gpu/comm
+                src/multi_gpu/partition
                 /gpfs/projects/etur02/hkanpak/local/include
             )
             set_target_properties(${bench} PROPERTIES
