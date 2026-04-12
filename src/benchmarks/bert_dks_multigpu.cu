@@ -32,11 +32,13 @@
 #include <thread>
 #include <mutex>
 #include <map>
+#include <set>
 #include <sstream>
 #include <random>
 #include <string>
 #include <chrono>
 #include <stdexcept>
+#include <algorithm>
 #include <functional>
 
 #include "phantom.h"
@@ -47,6 +49,8 @@
 
 #include "bootstrapping/Bootstrapper.cuh"
 #include "ckks_evaluator.cuh"
+#include "galois_key_store.cuh"
+#include "galois.cuh"
 
 #include "multi_gpu/distributed_context.cuh"
 #include "multi_gpu/distributed_eval.cuh"
@@ -175,7 +179,9 @@ static LayerTimes run_bert_layer_dks(
 
         cudaDeviceSynchronize();
         t.start();
-        bs.bootstrap_3(ct, ks);
+        PhantomCiphertext bs_out;
+        bs.bootstrap_3(bs_out, ct);
+        ct = bs_out;
         cudaDeviceSynchronize();
         out_ms += t.elapsed_ms();
 
@@ -346,15 +352,37 @@ int main(int argc, char **argv) {
     steps.push_back(-SEQ_LEN);
     steps.push_back(-HIDDEN);
     bs.addLeftRotKeys_Linear_to_vector_3(steps);
-    size_t num_keys = steps.size();
 
+    // Deduplicate: galois tool and key stores work on unique elements only
+    {
+        set<int> step_set(steps.begin(), steps.end());
+        steps.assign(step_set.begin(), step_set.end());
+    }
+    long N_val = 1L << LOG_N;
+    auto all_elts = ::get_elts_from_steps(steps, static_cast<size_t>(N_val));
+
+    // MUST set up galois tool BEFORE generating any galois keys
+    ctx0.setup_galois_tool(all_elts);
+    gk0.resize_slots(all_elts.size());
+
+    size_t num_keys = all_elts.size();
+
+    // Build step → key_idx map (galois_elt index, not raw step index)
+    // The galois tool stores galois elements; generate_single_galois_key uses elt_idx.
+    // We map: rotation step → galois element → index in galois_elts array.
+    auto &gelts = ctx0.key_galois_tool()->galois_elts();
     map<int, size_t> step_to_idx;
-    for (size_t i = 0; i < steps.size(); i++) step_to_idx[steps[i]] = i;
+    for (size_t i = 0; i < steps.size(); i++) {
+        uint32_t elt = ctx0.key_galois_tool()->get_elt_from_step(steps[i]);
+        auto it2 = std::find(gelts.begin(), gelts.end(), elt);
+        if (it2 != gelts.end())
+            step_to_idx[steps[i]] = static_cast<size_t>(std::distance(gelts.begin(), it2));
+    }
 
     // ── Create DistributedContext ──
     DistributedContext dctx = DistributedContext::create(parms, n_gpus);
 
-    // ── Build sharded key store ──
+    // ── Build sharded key store (galois tool must already be set up) ──
     printf("[Setup] Building DistGaloisKeyStore (%zu keys × %d GPUs)...\n",
            num_keys, n_gpus);
     DistGaloisKeyStore dks;
@@ -363,6 +391,7 @@ int main(int argc, char **argv) {
     // Also build single-GPU CPU key store (for fallback / non-bootstrap ops)
     GaloisKeyStore ks_cpu;
     ks_cpu.generate_all_keys(ctx0, sk0, num_keys);
+    eval0.evaluator.enable_key_streaming(&ks_cpu, &gk0);
 
     // Register DKS
     dist_set_galois_key_store(&dks, [&](int step) -> size_t {

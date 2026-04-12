@@ -22,8 +22,19 @@ cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DNTL_DIR=/gpfs/projects/etur02/hkanpak/local
 
-make -j$(nproc) bootstrap_test_n65536 bert_encoder_multigpu bert_encoder_multinode 2>&1 | tail -20
+make -j$(nproc) \
+    bootstrap_test_n65536 \
+    bert_encoder_multigpu bert_encoder_multinode \
+    bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 \
+    dist_bootstrap_bench bert_dks_multigpu \
+    llama_layer_multigpu_n65536 llama_layer_multinode_n65536 \
+    2>&1 | tail -40
 
 echo ""
 echo "Build complete. Binaries:"
-ls -la bin/bootstrap_test_n65536 bin/bert_encoder_multigpu bin/bert_encoder_multinode 2>/dev/null || echo "Check build errors above"
+ls -la bin/bootstrap_test_n65536 \
+       bin/bert_encoder_multigpu bin/bert_encoder_multinode \
+       bin/bert_encoder_multigpu_n65536 bin/bert_encoder_multinode_n65536 \
+       bin/dist_bootstrap_bench bin/bert_dks_multigpu \
+       bin/llama_layer_multigpu_n65536 bin/llama_layer_multinode_n65536 \
+       2>/dev/null || echo "Check build errors above"
