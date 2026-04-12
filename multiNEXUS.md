@@ -328,8 +328,8 @@ Fill the "Outcome" column as each step is executed.
 | 5 | `DistGaloisKeyStore` — shard generation, GPU storage | Step 4 | `[x]` | `dist_galois_key_store.cuh` — 50 keys/P per GPU |
 | 6 | `galois_oa.cu` — distributed rotation (perm + DKS + scatter) | Step 5 | `[x]` | `galois_oa.cu/cuh` — 4-phase pipeline |
 | 7 | `dist_set_galois_key_store` hook in `distributed_eval.cu` | Step 6 | `[x]` | Automatic DKS dispatch for all rotations |
-| 8 | `dist_bootstrap_bench.cu` — rotation correctness + timing sweep | Step 7 | `[ ]` | Run on MN5: target avg_rot < 60 ms on 4×H100 |
-| 9 | `bert_dks_multigpu.cu` — full BERT layer with DKS bootstrap | Step 8 | `[ ]` | Run on MN5: target layer < 85s on 4×H100 |
+| 8 | `dist_bootstrap_bench.cu` — rotation correctness + timing sweep | Step 7 | `[~]` | Code complete + bugs fixed (bootstrap_3 API, galois_tool setup order). Use `slurm_dks_bootstrap.sh` on MN5. |
+| 9 | `bert_dks_multigpu.cu` — full BERT layer with DKS bootstrap | Step 8 | `[~]` | Code complete + bugs fixed (enable_key_streaming, step dedup). Use `slurm_bert_dks.sh` on MN5. |
 | 10 | Fill Table 4.1 and 4.2 with measured numbers | Step 9 | `[ ]` | Update this file with actual results |
 | 11 | Multi-node extension: NCCL cross-node AllReduce | Step 10 | `[ ]` | MN5, 2-4 nodes, 16-32 GPUs |
 | 12 | LLaMA layer with DKS | Step 11 | `[ ]` | Structural extension of BERT DKS |
