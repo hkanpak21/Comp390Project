@@ -204,9 +204,14 @@ static double run_dks_bootstrap(
     // Create DistributedContext
     DistributedContext dctx = DistributedContext::create(parms, n_gpus);
 
-    // Restore SK on GPU 0 and generate PKs/RKs
+    // Use dctx.context(0) by REFERENCE — do NOT create a new PhantomContext here.
+    // Creating a new PhantomContext after DistributedContext::create() overwrites the
+    // thread-local default_stream, destroying the stream that dctx.context(0)'s internal
+    // CudaAutoPtr members hold. When dctx is later destroyed, those CudaAutoPtr destructors
+    // call cudaFreeAsync with the stale stream handle → invalid device context → segfault.
+    // (bert_dks_multigpu.cu uses the same pattern and is crash-free for this reason.)
     cudaSetDevice(0);
-    PhantomContext ctx0(parms);
+    PhantomContext &ctx0 = dctx.context(0);   // reference, no new stream created
     PhantomCKKSEncoder enc0(ctx0);
     PhantomSecretKey sk0;
     { stringstream ss(sk_str); sk0.load(ss); }

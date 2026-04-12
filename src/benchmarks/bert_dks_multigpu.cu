@@ -190,22 +190,30 @@ static LayerTimes run_bert_layer_dks(
         }
     };
 
+    MMEvaluator     mme(eval);
+    GELUEvaluator   ge(eval);
+    SoftmaxEvaluator se(eval);
+    LNEvaluator     lne(eval);
+
     // ─── Self-Attention ───
     t.start();
-    // Q, K, V projections
-    PhantomCiphertext Q, K, V;
-    {
-        MMEvaluator mme(eval);
-        mme.matrix_mul(Wq, vector<vector<double>>(), Q, X, INNER);
-        mme.matrix_mul(Wk, vector<vector<double>>(), K, X, INNER);
-        mme.matrix_mul(Wv, vector<vector<double>>(), V, X, INNER);
-    }
+    // Q, K, V projections via matrix_mul_unified
+    // Input: vector<PhantomCiphertext>{X}, weights, n_cols=1, output vector
+    vector<PhantomCiphertext> Xi = {X}, Qv, Kv, Vv;
+    // Cast weights to non-const for the API (mutable reference required)
+    auto Wq_nc = Wq; auto Wk_nc = Wk; auto Wv_nc = Wv;
+    mme.matrix_mul_unified(Xi, Wq_nc, 1, Qv);
+    mme.matrix_mul_unified(Xi, Wk_nc, 1, Kv);
+    mme.matrix_mul_unified(Xi, Wv_nc, 1, Vv);
+    PhantomCiphertext Q = Qv[0], K = Kv[0], V = Vv[0];
     cudaDeviceSynchronize();
     times.qkv_ms = t.elapsed_ms();
 
     // QK^T
     t.start();
     PhantomCiphertext QK = Q;
+    eval.evaluator.mod_switch_to_inplace(K, QK.chain_index());
+    K.set_scale(QK.scale());
     eval.evaluator.multiply_inplace(QK, K);
     eval.evaluator.relinearize_inplace(QK, *eval.relin_keys);
     eval.evaluator.rescale_to_next_inplace(QK);
@@ -214,17 +222,16 @@ static LayerTimes run_bert_layer_dks(
 
     // Softmax
     t.start();
-    PhantomCiphertext attn = QK;
-    {
-        SoftmaxEvaluator se(eval);
-        se.softmax(attn, SEQ_LEN);
-    }
+    PhantomCiphertext attn;
+    se.softmax(QK, attn, SEQ_LEN);
     cudaDeviceSynchronize();
     times.softmax_ms = t.elapsed_ms();
 
     // Attention × V
     t.start();
     PhantomCiphertext AV = attn;
+    eval.evaluator.mod_switch_to_inplace(V, AV.chain_index());
+    V.set_scale(AV.scale());
     eval.evaluator.multiply_inplace(AV, V);
     eval.evaluator.relinearize_inplace(AV, *eval.relin_keys);
     eval.evaluator.rescale_to_next_inplace(AV);
@@ -233,72 +240,67 @@ static LayerTimes run_bert_layer_dks(
 
     // Output projection
     t.start();
-    PhantomCiphertext proj;
-    {
-        MMEvaluator mme(eval);
-        mme.matrix_mul(Wo, vector<vector<double>>(), proj, AV, INNER);
-    }
+    vector<PhantomCiphertext> AVv = {AV}, projv;
+    auto Wo_nc = Wo;
+    mme.matrix_mul_unified(AVv, Wo_nc, 1, projv);
+    PhantomCiphertext proj = projv[0];
     cudaDeviceSynchronize();
     times.out_ms = t.elapsed_ms();
 
     // ─── Bootstrap #1 ───
+    while (proj.coeff_modulus_size() > 1) eval.evaluator.mod_switch_to_next_inplace(proj);
     dks_bootstrap(proj, "BS1", times.bs1_ms);
 
     // ─── LayerNorm #1 ───
     t.start();
-    {
-        LayerNormEvaluator lne(eval);
-        lne.layer_norm(proj, proj, HIDDEN);
-    }
+    PhantomCiphertext ln1_out;
+    lne.layer_norm(proj, ln1_out, HIDDEN);
     cudaDeviceSynchronize();
     times.ln1_ms = t.elapsed_ms();
 
     // ─── Bootstrap #2 ───
-    dks_bootstrap(proj, "BS2", times.bs2_ms);
+    while (ln1_out.coeff_modulus_size() > 1) eval.evaluator.mod_switch_to_next_inplace(ln1_out);
+    dks_bootstrap(ln1_out, "BS2", times.bs2_ms);
 
     // ─── FFN Block ───
     t.start();
-    PhantomCiphertext ffn;
-    {
-        MMEvaluator mme(eval);
-        mme.matrix_mul(Wf1, vector<vector<double>>(), ffn, proj, INNER);
-    }
+    vector<PhantomCiphertext> ln1v = {ln1_out}, ffnv;
+    auto Wf1_nc = Wf1;
+    mme.matrix_mul_unified(ln1v, Wf1_nc, 1, ffnv);
+    PhantomCiphertext ffn = ffnv[0];
     cudaDeviceSynchronize();
     times.ffn1_ms = t.elapsed_ms();
 
     t.start();
-    {
-        GELUEvaluator ge(eval);
-        ge.gelu(ffn, ffn);
-    }
+    PhantomCiphertext gelu_out;
+    ge.gelu(ffn, gelu_out);
     cudaDeviceSynchronize();
     times.gelu_ms = t.elapsed_ms();
 
     t.start();
-    PhantomCiphertext ffn_out;
-    {
-        MMEvaluator mme(eval);
-        mme.matrix_mul(Wf2, vector<vector<double>>(), ffn_out, ffn, INNER);
-    }
+    vector<PhantomCiphertext> geluv = {gelu_out}, ffn2v;
+    auto Wf2_nc = Wf2;
+    mme.matrix_mul_unified(geluv, Wf2_nc, 1, ffn2v);
+    PhantomCiphertext ffn_out = ffn2v[0];
     cudaDeviceSynchronize();
     times.ffn2_ms = t.elapsed_ms();
 
     // ─── Bootstrap #3 ───
+    while (ffn_out.coeff_modulus_size() > 1) eval.evaluator.mod_switch_to_next_inplace(ffn_out);
     dks_bootstrap(ffn_out, "BS3", times.bs3_ms);
 
     // ─── LayerNorm #2 ───
     t.start();
-    {
-        LayerNormEvaluator lne(eval);
-        lne.layer_norm(ffn_out, ffn_out, HIDDEN);
-    }
+    PhantomCiphertext ln2_out;
+    lne.layer_norm(ffn_out, ln2_out, HIDDEN);
     cudaDeviceSynchronize();
     times.ln2_ms = t.elapsed_ms();
 
     // ─── Bootstrap #4 ───
-    dks_bootstrap(ffn_out, "BS4", times.bs4_ms);
+    while (ln2_out.coeff_modulus_size() > 1) eval.evaluator.mod_switch_to_next_inplace(ln2_out);
+    dks_bootstrap(ln2_out, "BS4", times.bs4_ms);
 
-    X = ffn_out;
+    X = ln2_out;
 
     times.total_ms =
         times.qkv_ms + times.qk_ms + times.softmax_ms + times.av_ms + times.out_ms +
@@ -318,7 +320,7 @@ int main(int argc, char **argv) {
 
     int device_count = 0;
     cudaGetDeviceCount(&device_count);
-    n_gpus = min(n_gpus, device_count);
+    n_gpus = std::min(n_gpus, device_count);
 
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║   multiNEXUS BERT DKS — N=65536, %d Heads, %d GPUs        ║\n",
@@ -328,9 +330,16 @@ int main(int argc, char **argv) {
     auto parms = build_parms();
     double SCALE = pow(2.0, LOGP);
 
-    // ── Setup on GPU 0 ──
+    // ── Create DistributedContext FIRST ──
+    // IMPORTANT: DistributedContext::create() constructs PhantomContext objects
+    // on each GPU, which reinitializes Phantom's global default stream.
+    // All crypto objects (enc, sk, pk, rk, eval) must be created AFTER this call
+    // so they use the correct post-initialization global stream.
     cudaSetDevice(0);
-    PhantomContext ctx0(parms);
+    DistributedContext dctx = DistributedContext::create(parms, n_gpus);
+
+    // ── Crypto objects from dctx.context(0) ──
+    PhantomContext   &ctx0 = dctx.context(0);   // reference, not a new allocation
     PhantomCKKSEncoder enc0(ctx0);
     PhantomSecretKey sk0(ctx0);
     PhantomPublicKey pk0  = sk0.gen_publickey(ctx0);
@@ -353,9 +362,9 @@ int main(int argc, char **argv) {
     steps.push_back(-HIDDEN);
     bs.addLeftRotKeys_Linear_to_vector_3(steps);
 
-    // Deduplicate: galois tool and key stores work on unique elements only
+    // Deduplicate
     {
-        set<int> step_set(steps.begin(), steps.end());
+        std::set<int> step_set(steps.begin(), steps.end());
         steps.assign(step_set.begin(), step_set.end());
     }
     long N_val = 1L << LOG_N;
@@ -367,9 +376,7 @@ int main(int argc, char **argv) {
 
     size_t num_keys = all_elts.size();
 
-    // Build step → key_idx map (galois_elt index, not raw step index)
-    // The galois tool stores galois elements; generate_single_galois_key uses elt_idx.
-    // We map: rotation step → galois element → index in galois_elts array.
+    // Build step → key_idx map
     auto &gelts = ctx0.key_galois_tool()->galois_elts();
     map<int, size_t> step_to_idx;
     for (size_t i = 0; i < steps.size(); i++) {
@@ -379,10 +386,18 @@ int main(int argc, char **argv) {
             step_to_idx[steps[i]] = static_cast<size_t>(std::distance(gelts.begin(), it2));
     }
 
-    // ── Create DistributedContext ──
-    DistributedContext dctx = DistributedContext::create(parms, n_gpus);
+    // ── Build sharded key store ──
+    // NOTE: 1-GPU DKS = no sharding benefit (all digits on one GPU).
+    // At N=65536, 64 keys × ~500 MB/key = ~32 GB which may OOM a 64 GB H100.
+    // Skip 1-GPU DKS; reference timing is from bert_encoder_n65536 (CPU streaming).
+    if (n_gpus == 1) {
+        printf("[Setup] n_gpus=1: DKS has no sharding benefit at this scale.\n");
+        printf("        Reference 1-GPU timing from bert_encoder_n65536 (CPU streaming).\n");
+        printf("        Skipping DKS key generation to avoid OOM (64 keys × ~500 MB).\n\n");
+        dctx.destroy();
+        return 0;
+    }
 
-    // ── Build sharded key store (galois tool must already be set up) ──
     printf("[Setup] Building DistGaloisKeyStore (%zu keys × %d GPUs)...\n",
            num_keys, n_gpus);
     DistGaloisKeyStore dks;
@@ -394,7 +409,7 @@ int main(int argc, char **argv) {
     eval0.evaluator.enable_key_streaming(&ks_cpu, &gk0);
 
     // Register DKS
-    dist_set_galois_key_store(&dks, [&](int step) -> size_t {
+    nexus_multi_gpu::dist_set_galois_key_store(&dks, [&](int step) -> size_t {
         auto it = step_to_idx.find(step);
         if (it == step_to_idx.end())
             throw std::runtime_error("Unknown step in DKS map");
@@ -419,7 +434,7 @@ int main(int argc, char **argv) {
     auto make_w = [&]() {
         vector<vector<double>> w(INNER, vector<double>(slots, 0.0));
         for (auto &r : w)
-            for (size_t s = 0; s < (size_t)min((long)HIDDEN, (long)slots); s++)
+            for (size_t s = 0; s < (size_t)std::min((long)HIDDEN, (long)slots); s++)
                 r[s] = wdist(rng);
         return w;
     };
@@ -429,7 +444,7 @@ int main(int argc, char **argv) {
 
     // ── Encrypt input ──
     vector<double> d(slots, 0.0);
-    for (size_t s = 0; s < (size_t)min((long)HIDDEN, (long)slots); s++) d[s] = idist(rng);
+    for (size_t s = 0; s < (size_t)std::min((long)HIDDEN, (long)slots); s++) d[s] = idist(rng);
     PhantomPlaintext pt_in;
     enc0.encode(ctx0, d, SCALE, pt_in);
     PhantomCiphertext X;
@@ -484,7 +499,7 @@ int main(int argc, char **argv) {
            249600.0 / proj_full);
 
     // ── Cleanup ──
-    dist_set_galois_key_store(nullptr, {});
+    nexus_multi_gpu::dist_set_galois_key_store(nullptr, {});
     dks.destroy();
     dctx.destroy();
 

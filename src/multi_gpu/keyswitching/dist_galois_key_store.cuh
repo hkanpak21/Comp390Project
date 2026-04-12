@@ -168,6 +168,102 @@ public:
         fflush(stdout);
     }
 
+    /**
+     * generate_multinode()
+     *
+     * Multi-node variant of generate(). Digit d belongs to global GPU (d % total_gpus).
+     * This node manages global GPUs [rank_offset .. rank_offset + gpus_per_node).
+     * Only those GPUs' digit shards are allocated; all others are null in the evks array.
+     *
+     * The shards_ array is sized [num_keys][gpus_per_node], indexed by LOCAL gpu id.
+     * Callers must use local GPU index (0..gpus_per_node-1) for get_evks().
+     *
+     * Note: global digit owner for digit d = d % total_gpus.
+     *       Local GPU for global rank r = r - rank_offset (if owned by this node).
+     */
+    void generate_multinode(PhantomContext        &ctx,
+                            const PhantomSecretKey &sk,
+                            int                    total_gpus,
+                            int                    rank_offset,
+                            int                    gpus_per_node,
+                            size_t                 num_keys)
+    {
+        n_gpus_   = gpus_per_node;
+        num_keys_ = num_keys;
+
+        shards_.resize(num_keys_, std::vector<GpuShard>(gpus_per_node));
+        for (size_t ki = 0; ki < num_keys_; ki++)
+            for (int g = 0; g < gpus_per_node; g++)
+                shards_[ki][g].device_id = g;
+
+        const auto &stream0 = phantom::util::global_variables::default_stream->get_stream();
+
+        printf("[DistGaloisKeyStore] generate_multinode: %zu keys, %d total GPUs, "
+               "node owns global ranks [%d..%d]\n",
+               num_keys_, total_gpus, rank_offset, rank_offset + gpus_per_node - 1);
+        fflush(stdout);
+
+        for (size_t ki = 0; ki < num_keys_; ki++) {
+            // Step 1: generate full key on GPU 0 (local)
+            DKS_CUDA_CHECK(cudaSetDevice(0));
+            PhantomRelinKey rk = sk.generate_single_galois_key(ctx, ki);
+            DKS_CUDA_CHECK(cudaStreamSynchronize(stream0));
+
+            // Step 2: copy all digit components to host
+            std::vector<std::vector<uint64_t>> comps;
+            rk.copy_to_host(comps);
+            size_t beta = comps.size();
+
+            // Step 3: for each LOCAL gpu g (global rank = rank_offset + g):
+            //   allocate only digits d where d % total_gpus == (rank_offset + g)
+            for (int g = 0; g < gpus_per_node; g++) {
+                int global_rank = rank_offset + g;
+                DKS_CUDA_CHECK(cudaSetDevice(g));
+                cudaStream_t sg = (g == 0) ? stream0 : cudaStreamPerThread;
+
+                auto &shard = shards_[ki][g];
+                shard.beta  = beta;
+
+                std::vector<uint64_t*> host_ptrs(beta, nullptr);
+
+                for (size_t d = static_cast<size_t>(global_rank);
+                     d < beta; d += static_cast<size_t>(total_gpus)) {
+                    size_t n_elem = comps[d].size();
+                    uint64_t *dptr = nullptr;
+                    DKS_CUDA_CHECK(cudaMalloc(&dptr, n_elem * sizeof(uint64_t)));
+                    DKS_CUDA_CHECK(cudaMemcpyAsync(dptr, comps[d].data(),
+                                                   n_elem * sizeof(uint64_t),
+                                                   cudaMemcpyHostToDevice, sg));
+                    host_ptrs[d] = dptr;
+                    shard.owned_bufs.push_back(dptr);
+                }
+                DKS_CUDA_CHECK(cudaStreamSynchronize(sg));
+
+                DKS_CUDA_CHECK(cudaMalloc(&shard.evks_device, beta * sizeof(uint64_t*)));
+                DKS_CUDA_CHECK(cudaMemcpy(shard.evks_device, host_ptrs.data(),
+                                          beta * sizeof(uint64_t*),
+                                          cudaMemcpyHostToDevice));
+            }
+
+            if ((ki + 1) % 10 == 0 || ki == num_keys_ - 1) {
+                size_t free_mem, total_mem;
+                cudaSetDevice(0);
+                cudaMemGetInfo(&free_mem, &total_mem);
+                printf("[DistGaloisKeyStore] multinode %zu/%zu keys sharded "
+                       "(GPU 0 free: %.2f GB)\n",
+                       ki + 1, num_keys_,
+                       free_mem / (1024.0 * 1024.0 * 1024.0));
+                fflush(stdout);
+            }
+        }
+
+        DKS_CUDA_CHECK(cudaSetDevice(0));
+        built_ = true;
+        printf("[DistGaloisKeyStore] Multinode shards loaded. "
+               "Est. mem/GPU: ~%.2f GB\n", estimated_gpu_memory_gb());
+        fflush(stdout);
+    }
+
     // Returns the device evks pointer array for key `key_idx` on GPU `gpu_id`.
     // The array has beta entries: valid device pointers for owned digits, null elsewhere.
     uint64_t** get_evks(int gpu_id, size_t key_idx) const {

@@ -24,6 +24,9 @@
 #include <vector>
 #include <memory>
 #include <stdexcept>
+#ifdef USE_MPI
+#include <mpi.h>
+#endif
 
 #include "context.cuh"
 #include "secretkey.h"
@@ -58,13 +61,32 @@ struct GpuKeySet {
 
 class DistributedContext {
 public:
-    // Create distributed context across n_gpus GPUs.
+    // Create distributed context across n_gpus GPUs (single node).
     // Initializes NCCL, creates per-GPU PhantomContexts, distributes keys.
     static DistributedContext create(
         const phantom::EncryptionParameters &parms,
         int n_gpus,
         const std::vector<int> &device_ids = {}  // default: 0..n_gpus-1
     );
+
+#ifdef USE_MPI
+    // Create multi-node context. Each MPI rank manages gpus_per_node local GPUs.
+    // NCCL communicators span ALL nodes (total = mpi_size * gpus_per_node).
+    // After creation:
+    //   n_gpus()           == gpus_per_node  (local GPUs only)
+    //   total_gpus()       == mpi_size * gpus_per_node
+    //   global_rank(g)     == mpi_rank * gpus_per_node + g
+    static DistributedContext create_multinode(
+        const phantom::EncryptionParameters &parms,
+        int gpus_per_node,
+        MPI_Comm mpi_comm = MPI_COMM_WORLD
+    );
+#endif
+
+    // Multi-node accessors (safe to call on single-node; returns n_gpus / 0 / 0)
+    int total_gpus()              const { return total_gpus_ > 0 ? total_gpus_ : n_gpus_; }
+    int global_rank(int local_gpu)const { return global_rank_offset_ + local_gpu; }
+    int global_rank_offset()      const { return global_rank_offset_; }
 
     // Distribute keys from GPU 0 to all GPUs (shallow copy)
     void distribute_relin_keys(const PhantomRelinKey &relin_keys);
@@ -102,6 +124,9 @@ private:
     std::vector<GpuKeySet> key_sets_;
     phantom::EncryptionParameters parms_;
     bool destroyed_ = false;
+    // Multi-node fields (0 if single-node)
+    int total_gpus_          = 0;
+    int global_rank_offset_  = 0;
 };
 
 // ---------------------------------------------------------------------------

@@ -244,13 +244,32 @@ void DistributedContext::destroy() {
     if (destroyed_) return;
     destroyed_ = true;
 
+    // Sync all devices before tearing down streams/comms
     for (int g = 0; g < n_gpus_; g++) {
         cudaSetDevice(device_ids_[g]);
-        if (streams_[g]) cudaStreamDestroy(streams_[g]);
-        if (comms_[g]) ncclCommDestroy(comms_[g]);
-        // Free key data
-        if (key_sets_[g].relin_key_data) cudaFree(key_sets_[g].relin_key_data);
-        if (key_sets_[g].relin_key_ptrs) cudaFree(key_sets_[g].relin_key_ptrs);
+        cudaDeviceSynchronize();
+    }
+
+    for (int g = 0; g < n_gpus_; g++) {
+        cudaSetDevice(device_ids_[g]);
+        if (streams_[g]) { cudaStreamDestroy(streams_[g]); streams_[g] = nullptr; }
+        if (comms_[g])   { ncclCommDestroy(comms_[g]);     comms_[g] = nullptr; }
+        if (key_sets_[g].relin_key_data) { cudaFree(key_sets_[g].relin_key_data); key_sets_[g].relin_key_data = nullptr; }
+        if (key_sets_[g].relin_key_ptrs) { cudaFree(key_sets_[g].relin_key_ptrs); key_sets_[g].relin_key_ptrs = nullptr; }
+    }
+
+    // PhantomContext objects for GPU g > 0 hold CudaAutoPtr members that captured
+    // a stream handle which was destroyed when GPU 0's context was created last
+    // (see create() comment: reversed loop so default_stream ends on GPU 0).
+    // Calling ~PhantomContext() on those would invoke cudaFreeAsync with a stale
+    // (invalid) stream handle → "invalid device context" crash.
+    //
+    // Fix: release() GPU 1..n-1 context unique_ptrs to skip their ~PhantomContext()
+    // destructors (intentional GPU memory leak — reclaimed at process exit).
+    // GPU 0's context can be destroyed normally: its CudaAutoPtr captured the
+    // still-valid default_stream (thread-local, not destroyed until thread exits).
+    for (int g = 1; g < n_gpus_; g++) {
+        contexts_[g].release();   // skip stale-stream destructor
     }
     contexts_.clear();
 }
