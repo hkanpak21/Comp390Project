@@ -113,10 +113,17 @@ if(NCCL_FOUND)
     file(GLOB_RECURSE MULTI_GPU_SRCS
         src/multi_gpu/*.cu
     )
+    # Include keyswitching subdir sources (galois_oa.cu, output_aggregation.cu, etc.)
+    file(GLOB_RECURSE KEYSWITCHING_SRCS src/multi_gpu/keyswitching/*.cu)
+    list(APPEND MULTI_GPU_SRCS ${KEYSWITCHING_SRCS})
 
     add_library(nexus_multi_gpu STATIC ${MULTI_GPU_SRCS})
     target_include_directories(nexus_multi_gpu PUBLIC
         src/multi_gpu
+        src/multi_gpu/keyswitching
+        src/multi_gpu/comm
+        src/multi_gpu/partition
+        src/nexus_eval
         ${NCCL_INCLUDE_DIR}
         ${NEXUS_SEAL_INCLUDE}
         ${CUDAToolkit_INCLUDE_DIRS}
@@ -141,7 +148,7 @@ endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(NCCL_FOUND)
-    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bootstrap_test_n65536 bootstrap_distkey_test bootstrap_n65536_streaming rotate_stream_test bert_encoder_n65536 bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode)
+    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bootstrap_test_n65536 bootstrap_distkey_test bootstrap_n65536_streaming rotate_stream_test bert_encoder_n65536 bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 llama_layer_multigpu_n65536 llama_layer_multinode_n65536 bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode dist_bootstrap_bench bert_dks_multigpu)
         if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/${bench}.cu)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)

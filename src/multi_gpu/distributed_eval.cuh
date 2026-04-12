@@ -35,6 +35,7 @@
  */
 
 #include "distributed_context.cuh"
+#include "keyswitching/dist_galois_key_store.cuh"
 #include "evaluate.cuh"
 #include "ckks.h"
 
@@ -166,6 +167,15 @@ void dist_add_const_inplace(
     DistributedContext &ctx,
     DistributedCiphertext &dct,
     double constant);
+
+// ---------------------------------------------------------------------------
+// DKS (Distributed Key-Switching) setup
+// ---------------------------------------------------------------------------
+// Call before inference to enable Phase 2 (DKS) rotations.
+// store:       Pre-built DistGaloisKeyStore with shards on each GPU.
+// key_idx_fn:  Maps a rotation step to the key_idx in the store.
+void dist_set_galois_key_store(const DistGaloisKeyStore *store,
+                               std::function<size_t(int)> key_idx_fn);
 
 // ---------------------------------------------------------------------------
 // GPU utilization validation

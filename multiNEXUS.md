@@ -240,75 +240,78 @@ ncclAllReduce(d_partial_ct, d_full_ct,
 
 ---
 
-## 6. Code Changes Required
+## 6. Code Changes — Implementation Status
 
-### 6.1 Phantom modifications (key generation side)
+### 6.1 Phantom: `key_galois_tool()` getter
 
-**File**: `vendor/phantom/include/util/encryptionparams.h` and `vendor/phantom/src/secretkey.cu`
-
-| Change | Description | Status |
-|---|---|---|
-| `gen_galois_key_shard(key, gpu_id, num_gpus)` | Generate only limbs `[gpu_id * L/P .. (gpu_id+1) * L/P - 1]` of a Galois key | `[ ]` |
-| `set_key_shard_config(gpu_id, num_gpus)` | Tell the context which limb range this GPU owns | `[ ]` |
-| Shard-aware key storage | `PhantomGaloisKey` stores only its shard in GPU memory | `[ ]` |
-
-**Approach**: In Phantom's key generation, the Galois key rows are already indexed by limb `j`.
-We generate only the subset `j ∈ [start, end)` and store those. The shard is complete and
-self-contained — no modification to how keys are stored on disk.
-
-### 6.2 Phantom modifications (key-switching operation)
-
-**File**: `vendor/phantom/src/evaluator.cu` — `keyswitch_inplace()` or equivalent
+**File**: `vendor/phantom/include/context.cuh`
 
 | Change | Description | Status |
 |---|---|---|
-| Partial key-switch kernel | Compute `sum_{j=start}^{end} c1_j ⊗ ksk[j]` for local limbs only | `[ ]` |
-| Output: partial ciphertext | Result is a partial sum (not valid ciphertext yet) | `[ ]` |
-| AllReduce hook | After partial compute, call NCCL AllReduce to sum across GPUs | `[ ]` |
-| Full ciphertext output | After AllReduce, each GPU has the valid rotated ciphertext | `[ ]` |
+| `key_galois_tool()` public getter | Exposes Galois permutation tool to distributed rotation code | `[x]` |
 
-The kernel modification is localized: existing key-switch code loops `j = 0..L-1`.
-We simply change the loop bounds to `j = start..end` and add an AllReduce after the loop.
+### 6.2 Output aggregation: `custom_evks` parameter
 
-### 6.3 GaloisKeyStore — distributed variant
-
-**File**: `src/nexus_eval/galois_key_store.cuh` (new variant: `dist_galois_key_store.cuh`)
+**Files**: `src/multi_gpu/keyswitching/output_aggregation.cuh/.cu`
 
 | Change | Description | Status |
 |---|---|---|
-| `DistGaloisKeyStore` class | Stores only local limb shard in GPU memory | `[ ]` |
-| `generate_shard(rot_idx)` | Generates key shard for rotation `rot_idx`, stores in GPU | `[ ]` |
-| Remove CPU streaming path | With shards fitting in GPU, no PCIe streaming needed | `[ ]` |
-| Pre-generate all shards | Bootstrap's ~50 keys pre-loaded at startup | `[ ]` |
+| `custom_evks` param on existing function | Allows passing shard evks array, bypasses `relin_keys` | `[x]` |
+| `keyswitching_output_aggregation_dks()` overload | Cleaner DKS-only entry point (no dummy `PhantomRelinKey`) | `[x]` |
+| `partial_key_switch_inner_prod` kernel | Already existed; strided loop over owned digits | `[x]` |
+| `allreduce_keyswitching_result` | Already existed (NCCL AllReduce on partial cx) | `[x]` |
+| `mod_reduce_after_allreduce` kernel | Already existed (Barrett mod after uint64 sum) | `[x]` |
 
-### 6.4 CKKS Evaluator hook
+### 6.3 `DistGaloisKeyStore`
 
-**File**: `src/nexus_eval/ckks_evaluator.cuh`
+**File**: `src/multi_gpu/keyswitching/dist_galois_key_store.cuh`
 
 | Change | Description | Status |
 |---|---|---|
-| Replace `ensure_key_loaded()` | Remove CPU→GPU streaming; key shard already in GPU | `[ ]` |
-| `distributed_rotate()` | Calls partial key-switch + NCCL AllReduce | `[ ]` |
-| `distributed_bootstrap()` | Bootstrap using `distributed_rotate()` for all 75 rotations | `[ ]` |
+| `generate(ctx, sk, n_gpus, num_keys)` | Generates all keys on GPU 0, copies owned digit shards to each GPU | `[x]` |
+| `get_evks(gpu_id, key_idx)` | Returns device evks array (valid for owned digits, null elsewhere) | `[x]` |
+| Memory per GPU | N=65536, 50 keys, P=4: ~6.8 GB (fits H100) | `[x]` |
 
-### 6.5 New benchmark: `dist_bootstrap_bench.cu`
+### 6.4 Distributed rotation: `galois_oa.cuh/.cu`
+
+**Files**: `src/multi_gpu/keyswitching/galois_oa.cuh`, `src/multi_gpu/keyswitching/galois_oa.cu`
+
+| Change | Description | Status |
+|---|---|---|
+| Phase 1: Galois permutation on GPU 0 | `apply_galois_ntt(c0)` → c0_gal; `apply_galois_ntt(c1)` → c2_gal | `[x]` |
+| Phase 2: Broadcast c0_gal + c2_gal to all GPUs | cudaMemcpyPeer (~17 MB each) | `[x]` |
+| Phase 3: Partial KS + NCCL AllReduce | `keyswitching_output_aggregation_dks` in parallel threads | `[x]` |
+| Phase 4: Scatter result back to DistributedCiphertext | from_single_gpu after AllReduce | `[x]` |
+
+### 6.5 `distributed_eval.cu` hook
+
+**File**: `src/multi_gpu/distributed_eval.cu`
+
+| Change | Description | Status |
+|---|---|---|
+| `dist_set_galois_key_store()` | Registers DKS store + step→key_idx mapping | `[x]` |
+| `dist_rotate_vector_inplace` dispatch | If DKS store set: use `dist_rotate_output_aggregation`; else: gather-op-scatter | `[x]` |
+
+### 6.6 New benchmark: `dist_bootstrap_bench.cu`
 
 **File**: `src/benchmarks/dist_bootstrap_bench.cu`
 
 | Test | Description | Status |
 |---|---|---|
-| Single rotation DKS | One rotation across P GPUs, verify correctness + time | `[ ]` |
-| Full bootstrap DKS | 50-rotation bootstrap across P GPUs | `[ ]` |
-| Scaling sweep | 1/2/4/8 GPUs, report bootstrap time | `[ ]` |
-| MAE check | Ensure bootstrap accuracy unchanged vs single-GPU | `[ ]` |
+| Single-GPU baseline | CPU-streaming bootstrap timing | `[x]` |
+| DKS rotation correctness | MAE vs single-GPU per step, P=1/2/4 | `[x]` |
+| DKS scaling sweep | Avg rotation time + projected bootstrap for 1/2/4 GPUs | `[x]` |
 
-### 6.6 BERT layer with DKS
+### 6.7 BERT layer with DKS: `bert_dks_multigpu.cu`
 
 **File**: `src/benchmarks/bert_dks_multigpu.cu`
 
-- Replace per-head GPU assignment with per-bootstrap DKS assignment
-- Option: hybrid — DKS for bootstrap, head-parallel for MatMul/GELU
-- Target: use all 4 GPUs for each bootstrap (not 3 heads per GPU)
+| Feature | Description | Status |
+|---|---|---|
+| Full 14-op BERT layer | QKV, QK^T, Softmax, AV, OutProj, BS1, LN1, BS2, FFN, GELU, FFN, BS3, LN2, BS4 | `[x]` |
+| DKS bootstrap | All 4 bootstraps route through DKS via `dist_set_galois_key_store` hook | `[x]` |
+| Per-op timing | Detailed breakdown with DKS bootstrap labeled | `[x]` |
+| Comparison output | Projected 12-head time vs CPU-streaming baseline | `[x]` |
 
 ---
 
@@ -318,18 +321,18 @@ Fill the "Outcome" column as each step is executed.
 
 | # | Step | Prerequisite | Outcome | Notes |
 |---|---|---|---|---|
-| 1 | Understand Phantom `keyswitch_inplace()` — find the limb loop | — | — | Read `vendor/phantom/src/evaluator.cu` |
-| 2 | Implement single-GPU partial key-switch (local limb range) | Step 1 | — | No AllReduce yet; verify partial output |
-| 3 | Implement NCCL AllReduce for ciphertext-size buffer | — | — | Test standalone: random uint64 buffer allreduce |
-| 4 | Wire partial key-switch + AllReduce into one `distributed_rotate()` | Steps 2+3 | — | Test: rotate by 1, verify decrypted result |
-| 5 | Build `DistGaloisKeyStore` — shard generation, GPU storage | Step 4 | — | Confirm memory usage = total/P per GPU |
-| 6 | Replace `ensure_key_loaded` hook with distributed path | Step 5 | — | Run existing bootstrap test, check MAE |
-| 7 | `dist_bootstrap_bench.cu` — single bootstrap, 2 GPUs | Step 6 | — | Target: <5.4s on 2×H100 |
-| 8 | Scaling sweep: 1/2/4/8 GPUs, log bootstrap time | Step 7 | — | Fill Table 4.1 above |
-| 9 | BERT layer with DKS — correctness first | Step 8 | — | Run single inference, check output MAE |
-| 10 | BERT DKS performance — sweep configs, fill Table 4.2 | Step 9 | — | Target: beat NEXUS 34.9s at N=65536 |
-| 11 | Multi-node extension: NCCL cross-node AllReduce | Step 10 | — | MN5, 2-4 nodes, 16-32 GPUs |
-| 12 | LLaMA layer with DKS | Step 11 | — | Structural extension of BERT DKS |
+| 1 | Understand Phantom `keyswitch_inplace()` — find the limb loop | — | `[x]` | `eval_key_switch.cu`: inner prod over `beta` digits |
+| 2 | `partial_key_switch_inner_prod` kernel (strided digit selection) | Step 1 | `[x]` | In `output_aggregation.cu` — was already there |
+| 3 | `allreduce_keyswitching_result` (NCCL AllReduce on partial cx) | — | `[x]` | In `output_aggregation.cu` — was already there |
+| 4 | `keyswitching_output_aggregation_dks()` — clean DKS entry point | Steps 2+3 | `[x]` | New overload in `output_aggregation.cu` |
+| 5 | `DistGaloisKeyStore` — shard generation, GPU storage | Step 4 | `[x]` | `dist_galois_key_store.cuh` — 50 keys/P per GPU |
+| 6 | `galois_oa.cu` — distributed rotation (perm + DKS + scatter) | Step 5 | `[x]` | `galois_oa.cu/cuh` — 4-phase pipeline |
+| 7 | `dist_set_galois_key_store` hook in `distributed_eval.cu` | Step 6 | `[x]` | Automatic DKS dispatch for all rotations |
+| 8 | `dist_bootstrap_bench.cu` — rotation correctness + timing sweep | Step 7 | `[ ]` | Run on MN5: target avg_rot < 60 ms on 4×H100 |
+| 9 | `bert_dks_multigpu.cu` — full BERT layer with DKS bootstrap | Step 8 | `[ ]` | Run on MN5: target layer < 85s on 4×H100 |
+| 10 | Fill Table 4.1 and 4.2 with measured numbers | Step 9 | `[ ]` | Update this file with actual results |
+| 11 | Multi-node extension: NCCL cross-node AllReduce | Step 10 | `[ ]` | MN5, 2-4 nodes, 16-32 GPUs |
+| 12 | LLaMA layer with DKS | Step 11 | `[ ]` | Structural extension of BERT DKS |
 
 ---
 

@@ -73,6 +73,28 @@ void keyswitching_output_aggregation(
     PhantomCiphertext     &encrypted,
     uint64_t              *c2,
     const PhantomRelinKey &relin_keys,
+    int                    n_gpus,
+    uint64_t             **custom_evks = nullptr   // if non-null, use instead of relin_keys.public_keys_ptr()
+);
+
+/**
+ * keyswitching_output_aggregation_dks
+ *
+ * DKS variant: takes a pre-sharded evks device pointer array directly.
+ * No PhantomRelinKey object needed — used by galois_oa.cu when each GPU
+ * only has its owned digit shards in GPU memory.
+ *
+ * @param custom_evks  Device array of beta uint64_t* pointers.
+ *                     Owned digit slots are valid; unowned slots are null.
+ *                     The partial kernel only accesses owned slots (strided loop).
+ */
+void keyswitching_output_aggregation_dks(
+    MultiGpuContext       &ctx,
+    const PhantomContext  &phantom_ctx,
+    int                    gpu_id,
+    PhantomCiphertext     &encrypted,
+    uint64_t              *c2,
+    uint64_t             **custom_evks,
     int                    n_gpus
 );
 

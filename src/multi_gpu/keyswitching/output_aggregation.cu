@@ -201,7 +201,8 @@ void keyswitching_output_aggregation(
     PhantomCiphertext     &encrypted,
     uint64_t              *c2,
     const PhantomRelinKey &relin_keys,
-    int                    n_gpus)
+    int                    n_gpus,
+    uint64_t             **custom_evks)
 {
     CUDA_CHECK(cudaSetDevice(gpu_id));
     const cudaStream_t &s = ctx.streams[gpu_id];
@@ -256,9 +257,14 @@ void keyswitching_output_aggregation(
     auto reduction_threshold =
         (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
 
+    // Use custom evks shard if provided (DKS), otherwise use relin_keys
+    const uint64_t *const *evks_ptr = custom_evks
+        ? const_cast<const uint64_t *const *>(custom_evks)
+        : relin_keys.public_keys_ptr();
+
     // Single kernel call processes all digits for this GPU (strided)
     partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
-        cx.get(), t_mod_up.get(), relin_keys.public_keys_ptr(),
+        cx.get(), t_mod_up.get(), evks_ptr,
         modulus_QP, n, size_QP, size_QP * n,
         size_QlP, size_QlP_n, size_Q, size_Ql,
         static_cast<size_t>(gpu_id), static_cast<size_t>(n_gpus), beta,
@@ -283,6 +289,93 @@ void keyswitching_output_aggregation(
 
     // ---- Step 5: Add correction to ciphertext ----
     // ct_i += cx_i (mod q_j) for each limb j in [0, size_Ql)
+    for (size_t i = 0; i < 2; i++) {
+        auto cx_i = cx.get() + i * size_QlP_n;
+        auto ct_i = encrypted.data() + i * size_Ql_n;
+        oa_add_to_ct<<<size_Ql_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+            ct_i, cx_i, modulus_QP, n, size_Ql);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(s));
+}
+
+// ---------------------------------------------------------------------------
+// keyswitching_output_aggregation_dks — DKS variant (no PhantomRelinKey needed)
+// ---------------------------------------------------------------------------
+// Identical to keyswitching_output_aggregation but takes custom_evks directly.
+// Used by galois_oa.cu for distributed rotation where each GPU only holds
+// its shard of the Galois key digits.
+
+void keyswitching_output_aggregation_dks(
+    MultiGpuContext       &ctx,
+    const PhantomContext  &phantom_ctx,
+    int                    gpu_id,
+    PhantomCiphertext     &encrypted,
+    uint64_t              *c2,
+    uint64_t             **custom_evks,
+    int                    n_gpus)
+{
+    CUDA_CHECK(cudaSetDevice(gpu_id));
+    const cudaStream_t &s = ctx.streams[gpu_id];
+
+    // ---- Extract parameters ----
+    auto &key_context_data = phantom_ctx.get_context_data(0);
+    auto &key_parms        = key_context_data.parms();
+    auto n                 = key_parms.poly_modulus_degree();
+    auto &key_modulus      = key_parms.coeff_modulus();
+    size_t size_P          = key_parms.special_modulus_size();
+    size_t size_QP         = key_modulus.size();
+
+    uint32_t levelsDropped = encrypted.chain_index() - 1;
+    auto &rns_tool         = phantom_ctx.get_context_data(1 + levelsDropped).gpu_rns_tool();
+    auto modulus_QP        = phantom_ctx.gpu_rns_tables().modulus();
+
+    size_t size_Ql   = rns_tool.base_Ql().size();
+    size_t size_Q    = size_QP - size_P;
+    size_t size_QlP  = size_Ql + size_P;
+    auto size_Ql_n   = size_Ql * n;
+    auto size_QlP_n  = size_QlP * n;
+
+    // ---- Step 1: mod-up ----
+    size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
+    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
+    rns_tool.modup(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
+                   key_parms.scheme(), s);
+
+    // ---- Step 2: partial inner product (owned digits only, strided by gpu_id) ----
+    auto cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
+    // Zero out cx first (some digit slots may be unowned / skipped)
+    cudaMemsetAsync(cx.get(), 0, 2 * size_QlP_n * sizeof(uint64_t), s);
+
+    auto reduction_threshold =
+        (1 << (bits_per_uint64 -
+               static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
+
+    partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+        cx.get(), t_mod_up.get(),
+        const_cast<const uint64_t *const *>(custom_evks),
+        modulus_QP, n, size_QP, size_QP * n,
+        size_QlP, size_QlP_n, size_Q, size_Ql,
+        static_cast<size_t>(gpu_id), static_cast<size_t>(n_gpus), beta,
+        reduction_threshold);
+
+    // ---- Step 3: AllReduce partial inner products ----
+    allreduce_keyswitching_result(ctx, gpu_id, cx.get(), 2 * size_QlP_n);
+
+    // ---- Step 3.5: Modular reduction after AllReduce ----
+    for (size_t i = 0; i < 2; i++) {
+        mod_reduce_after_allreduce<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
+            cx.get() + i * size_QlP_n, modulus_QP, n, size_QlP, size_Q, size_Ql);
+    }
+
+    // ---- Step 4: mod-down ----
+    for (size_t i = 0; i < 2; i++) {
+        auto cx_i = cx.get() + i * size_QlP_n;
+        rns_tool.moddown_from_NTT(cx_i, cx_i, phantom_ctx.gpu_rns_tables(),
+                                  key_parms.scheme(), s);
+    }
+
+    // ---- Step 5: Add correction to ciphertext ----
     for (size_t i = 0; i < 2; i++) {
         auto cx_i = cx.get() + i * size_QlP_n;
         auto ct_i = encrypted.data() + i * size_Ql_n;

@@ -166,6 +166,9 @@ public:
     // Setup Galois permutation tables for given elements WITHOUT generating keys
     // Used for key streaming: set up the element→index mapping, then load keys on demand
     // NOTE: assumes is_bfv=false (CKKS only) — simplification to avoid forward-declaration issues
+    // Direct access to galois permutation tool (needed by distributed rotation)
+    PhantomGaloisTool* key_galois_tool() const { return key_galois_tool_.get(); }
+
     void setup_galois_tool(const std::vector<uint32_t> &elts) {
         const auto &s = phantom::util::global_variables::default_stream->get_stream();
         int log_n = phantom::arith::get_power_of_two(poly_degree_);

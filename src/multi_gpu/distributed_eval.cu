@@ -19,6 +19,8 @@
 
 #include "distributed_eval.cuh"
 #include "partition/rns_partition.cuh"
+#include "keyswitching/galois_oa.cuh"
+#include "keyswitching/dist_galois_key_store.cuh"
 
 // Phantom raw kernels (declared in polymath.cuh)
 #include "polymath.cuh"
@@ -315,15 +317,35 @@ void dist_relinearize_inplace(
     });
 }
 
+// Phase 2 DKS path: global DistGaloisKeyStore pointer (set by benchmark at startup)
+// If null, falls back to Phase 1 gather-operate-scatter.
+// Benchmarks that want DKS must call dist_set_galois_key_store() before inference.
+static const DistGaloisKeyStore *g_dks_store = nullptr;
+static std::function<size_t(int)> g_dks_key_idx_fn;  // maps rotation step → key_idx
+
+void dist_set_galois_key_store(const DistGaloisKeyStore *store,
+                               std::function<size_t(int)> key_idx_fn)
+{
+    g_dks_store      = store;
+    g_dks_key_idx_fn = key_idx_fn;
+}
+
 void dist_rotate_vector_inplace(
     DistributedContext &ctx,
     DistributedCiphertext &dct,
     int steps,
     const PhantomGaloisKey &galois_keys)
 {
-    gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
-        rotate_vector_inplace(pctx, ct, steps, galois_keys);
-    });
+    if (g_dks_store && g_dks_key_idx_fn) {
+        // Phase 2: Distributed Key-Switching via Output Aggregation
+        size_t key_idx = g_dks_key_idx_fn(steps);
+        dist_rotate_output_aggregation(ctx, dct, steps, *g_dks_store, key_idx);
+    } else {
+        // Phase 1: gather-operate-scatter fallback
+        gather_op_scatter(ctx, dct, [&](PhantomContext &pctx, PhantomCiphertext &ct) {
+            rotate_vector_inplace(pctx, ct, steps, galois_keys);
+        });
+    }
 }
 
 void dist_square_and_relin_inplace(
