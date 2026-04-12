@@ -118,16 +118,17 @@ public:
         return public_keys_[i].get_n();
     }
 
-    // Copy all GPU key data to CPU pinned memory
+    // Copy all GPU key data to CPU pinned memory (uses Phantom's default stream)
     void copy_to_host(std::vector<std::vector<uint64_t>> &host_data) const {
+        const auto &stream = phantom::util::global_variables::default_stream->get_stream();
         host_data.resize(public_keys_.size());
         for (size_t i = 0; i < public_keys_.size(); i++) {
             size_t n = public_keys_[i].get_n();
             host_data[i].resize(n);
-            cudaMemcpy(host_data[i].data(), public_keys_[i].get(),
-                       n * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+            cudaMemcpyAsync(host_data[i].data(), public_keys_[i].get(),
+                            n * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
         }
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(stream);
     }
 
     // Load key data from CPU pinned memory back to GPU
@@ -161,19 +162,19 @@ public:
 
     // Point at externally-owned GPU buffers (does NOT take ownership)
     // Used for key streaming with pre-allocated reusable buffers
-    void set_external_buffers(const std::vector<void *> &buffers, uint64_t **ptr_array) {
+    void set_external_buffers(const std::vector<void *> &buffers,
+                              const std::vector<size_t> &buffer_elem_counts,
+                              uint64_t **ptr_array) {
         // Release any owned buffers first
         public_keys_.clear();
         public_keys_ptr_.reset();
 
-        // Create non-owning wrappers via a custom deleter (no-op)
+        // Create non-owning wrappers
         public_keys_.resize(buffers.size());
         for (size_t i = 0; i < buffers.size(); i++) {
-            // cuda_auto_ptr constructor with nullptr stream means it won't free
             public_keys_[i] = phantom::util::cuda_auto_ptr<uint64_t>(
-                (uint64_t *)buffers[i], 0, (cudaStream_t)0, /*owns=*/false);
+                (uint64_t *)buffers[i], buffer_elem_counts[i], (cudaStream_t)0, /*owns=*/false);
         }
-        // public_keys_ptr_ wraps the externally-owned ptr array
         public_keys_ptr_ = phantom::util::cuda_auto_ptr<uint64_t *>(
             ptr_array, buffers.size(), (cudaStream_t)0, /*owns=*/false);
         gen_flag_ = true;

@@ -19,7 +19,8 @@ using namespace nexus;
 // Implement key streaming intercept — finds Galois element index and loads key on demand
 void nexus::Evaluator::ensure_key_loaded(int steps, PhantomGaloisKey &galois_keys) {
     GaloisKeyStore *store = static_cast<GaloisKeyStore *>(key_store_);
-    uint32_t target_elt = step_to_elt(steps, m_val);
+    // Use context's own galois tool to compute target element — guaranteed consistent
+    uint32_t target_elt = context->key_galois_tool_->get_elt_from_step(steps);
 
     // Find the element's index in the context's galois tool
     auto &elts = context->key_galois_tool_->galois_elts();

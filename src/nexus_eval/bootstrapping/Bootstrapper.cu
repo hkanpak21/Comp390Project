@@ -1839,17 +1839,28 @@ void Bootstrapper::subsum(double scale, PhantomCiphertext &cipher) {
   int repeatcount = (1 << (logNh - logn));
   PhantomCiphertext tmp;
   int step;
+  fprintf(stderr, "[BOOT] subsum start, repeatcount=%d, iters=%ld\n", repeatcount, (long)(logNh - logn));
   for (int i = 0; i < logNh - logn; i++) {
     step = (1 << (logn + i));
+    fprintf(stderr, "[BOOT] subsum iter %d, rotate step=%d\n", i, step); fflush(stderr);
     ckks->evaluator.rotate_vector(cipher, step, *(ckks->galois_keys), tmp);
+    cudaDeviceSynchronize();
+    cudaError_t e1 = cudaGetLastError();
+    if (e1 != cudaSuccess) fprintf(stderr, "[BOOT] after rotate: %s\n", cudaGetErrorString(e1));
     ckks->evaluator.add_inplace_reduced_error(cipher, tmp);
+    cudaDeviceSynchronize();
+    cudaError_t e2 = cudaGetLastError();
+    if (e2 != cudaSuccess) fprintf(stderr, "[BOOT] after add: %s\n", cudaGetErrorString(e2));
   }
+  fprintf(stderr, "[BOOT] subsum rotations done, about to encode\n"); fflush(stderr);
 
   PhantomPlaintext tmpplain;
   ckks->encoder.encode(1.0 / repeatcount, scale, tmpplain);
+  fprintf(stderr, "[BOOT] subsum encode done\n"); fflush(stderr);
   ckks->evaluator.mod_switch_to_inplace(tmpplain, cipher.params_id());
   ckks->evaluator.multiply_plain_inplace(cipher, tmpplain);
   ckks->evaluator.rescale_to_next_inplace(cipher);
+  fprintf(stderr, "[BOOT] subsum complete\n"); fflush(stderr);
 }
 
 void Bootstrapper::bsgs_linear_transform(
@@ -2985,18 +2996,27 @@ void Bootstrapper::bootstrap_full(PhantomCiphertext &rtncipher, PhantomCiphertex
 }
 
 void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher) {
-  // ModRaise — no timing overhead
+  fprintf(stderr, "[BOOT] bootstrap_sparse_3 START\n"); fflush(stderr);
+  // ModRaise
   modraise_inplace(cipher);
+  cudaDeviceSynchronize();
+  fprintf(stderr, "[BOOT] modraise done, cipher levels=%zu\n", cipher.coeff_modulus_size()); fflush(stderr);
 
   const auto modulus = ckks->context->first_context_data().parms().coeff_modulus();
   cipher.scale() = ((double)modulus[0].value());
 
-  // Subsum
+  // Subsum (inline, not the subsum() function)
   PhantomCiphertext rot;
   for (auto i = logn; i < logNh; i++) {
+    fprintf(stderr, "[BOOT] inline subsum iter i=%ld, step=%d\n", (long)i, (1<<i)); fflush(stderr);
     ckks->evaluator.rotate_vector(cipher, (1 << i), *(ckks->galois_keys), rot);
+    cudaDeviceSynchronize();
+    fprintf(stderr, "[BOOT] rotate done\n"); fflush(stderr);
     ckks->evaluator.add_inplace(cipher, rot);
+    cudaDeviceSynchronize();
+    fprintf(stderr, "[BOOT] add done\n"); fflush(stderr);
   }
+  fprintf(stderr, "[BOOT] subsum loop done, before coefftoslot_3\n"); fflush(stderr);
 
   PhantomCiphertext rtn;
   if (logn == 0) {
@@ -3015,12 +3035,18 @@ void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphe
     ckks->evaluator.add_inplace_reduced_error(rtn, conjrtn);
   } else {
     // Coefficient to Slots
+    fprintf(stderr, "[BOOT] calling coefftoslot_3\n"); fflush(stderr);
     coefftoslot_3(rtn, cipher);
+    cudaDeviceSynchronize();
+    fprintf(stderr, "[BOOT] coefftoslot_3 done\n"); fflush(stderr);
   }
 
   // Modular Reduction
+  fprintf(stderr, "[BOOT] calling mod_reducer->modular_reduction\n"); fflush(stderr);
   PhantomCiphertext modrtn;
   mod_reducer->modular_reduction(modrtn, rtn);
+  cudaDeviceSynchronize();
+  fprintf(stderr, "[BOOT] modular_reduction done\n"); fflush(stderr);
 
   if (logn == 0) {
     const auto modulus = ckks->context->first_context_data().parms().coeff_modulus();

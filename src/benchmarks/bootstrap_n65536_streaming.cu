@@ -24,6 +24,7 @@
 #include "ckks.h"
 #include "ciphertext.h"
 
+#include "galois.cuh"
 #include "ckks_evaluator.cuh"
 #include "galois_key_store.cuh"
 #include "bootstrapping/Bootstrapper.cuh"
@@ -44,16 +45,7 @@ static void print_mem(const char *label) {
     fflush(stdout);
 }
 
-// Convert rotation step to Galois element (same as in Phantom)
-static uint32_t step_to_galois_elt(int step, uint32_t m) {
-    if (step == 0) return m - 1;
-    uint32_t gen = 5;
-    int abs_step = step < 0 ? -step : step;
-    uint32_t elt = 1;
-    for (int i = 0; i < abs_step; i++) elt = (uint64_t(elt) * gen) % m;
-    if (step < 0) elt = (m + 1 - elt) % m;
-    return elt;
-}
+// Use Phantom's own get_elts_from_steps for correctness
 
 int main() {
     printf("================================================================\n");
@@ -145,10 +137,9 @@ int main() {
     all_steps.assign(step_set.begin(), step_set.end());
     printf("[Setup] Total unique rotation steps: %zu\n", all_steps.size());
 
-    // Convert steps to Galois elements
-    uint32_t m = (uint32_t)(2 * N);
-    vector<uint32_t> all_elts;
-    for (int step : all_steps) all_elts.push_back(step_to_galois_elt(step, m));
+    // Convert steps to Galois elements using Phantom's own function
+    // (ensures consistency with what the rotation kernel expects)
+    auto all_elts = ::get_elts_from_steps(all_steps, N);
 
     // Set up the Galois tool with all elements (no keys yet)
     context.setup_galois_tool(all_elts);

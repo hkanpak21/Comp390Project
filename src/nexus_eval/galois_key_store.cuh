@@ -17,6 +17,7 @@
 
 #include "context.cuh"
 #include "secretkey.h"
+#include "util/globals.h"
 
 class GaloisKeyStore {
 public:
@@ -40,8 +41,10 @@ public:
     GaloisKeyStore() = default;
 
     ~GaloisKeyStore() {
-        for (auto p : gpu_buffers_) if (p) cudaFree(p);
-        if (gpu_ptr_array_) cudaFree(gpu_ptr_array_);
+        // Use same stream-ordered pool as Phantom
+        const auto &stream = phantom::util::global_variables::default_stream->get_stream();
+        for (auto p : gpu_buffers_) if (p) cudaFreeAsync(p, stream);
+        if (gpu_ptr_array_) cudaFreeAsync(gpu_ptr_array_, stream);
     }
 
     // Generate all keys one at a time, saving each to CPU and freeing GPU
@@ -52,9 +55,10 @@ public:
         printf("[KeyStore] Generating %zu keys one at a time (CPU streaming)...\n", num_keys);
         fflush(stdout);
 
+        const auto &stream = phantom::util::global_variables::default_stream->get_stream();
         for (size_t i = 0; i < num_keys; i++) {
             PhantomRelinKey rk = sk.generate_single_galois_key(ctx, i);
-            cudaDeviceSynchronize();
+            cudaStreamSynchronize(stream);
             rk.copy_to_host(keys_[i].components);
             keys_[i].valid = true;
             // rk destructor frees GPU memory
@@ -68,53 +72,50 @@ public:
             }
         }
 
-        // Pre-allocate GPU buffers (reused for all keys)
+        // Pre-allocate GPU buffers using SAME stream-ordered pool as Phantom
+        // (reuse 'stream' from above in generate_all_keys)
         dnum_ = keys_[0].components.size();
         gpu_buffers_.resize(dnum_);
         buffer_sizes_.resize(dnum_);
         std::vector<uint64_t *> ptrs(dnum_);
         for (size_t c = 0; c < dnum_; c++) {
             buffer_sizes_[c] = keys_[0].components[c].size() * sizeof(uint64_t);
-            cudaMalloc(&gpu_buffers_[c], buffer_sizes_[c]);
+            cudaMallocAsync(&gpu_buffers_[c], buffer_sizes_[c], stream);
             ptrs[c] = (uint64_t *)gpu_buffers_[c];
         }
-        cudaMalloc(&gpu_ptr_array_, dnum_ * sizeof(uint64_t *));
-        cudaMemcpy(gpu_ptr_array_, ptrs.data(), dnum_ * sizeof(uint64_t *),
-                   cudaMemcpyHostToDevice);
-        cudaDeviceSynchronize();
+        cudaMallocAsync(&gpu_ptr_array_, dnum_ * sizeof(uint64_t *), stream);
+        cudaMemcpyAsync(gpu_ptr_array_, ptrs.data(), dnum_ * sizeof(uint64_t *),
+                        cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream);
 
-        printf("[KeyStore] Pre-allocated %zu GPU key buffers (%.2f GB reusable)\n",
+        printf("[KeyStore] Pre-allocated %zu GPU key buffers (%.2f GB reusable, stream-ordered pool)\n",
                dnum_, dnum_ * buffer_sizes_[0] / (1024.0*1024.0*1024.0));
     }
 
-    // Load key at index `idx` — copy CPU data to the pre-allocated GPU buffers,
-    // and rebuild the slot's cuda_auto_ptr wrappers to point at them (non-owning)
     void load_key_to_gpu(size_t idx, PhantomGaloisKey &galois_keys) {
-        static int call_count = 0;
-        call_count++;
-        if (call_count <= 3 || call_count % 20 == 0) {
-            printf("[KeyStore] load_key_to_gpu call #%d, idx=%zu\n", call_count, idx);
-            fflush(stdout);
-        }
+        static int loads = 0; loads++;
+        fprintf(stderr, "[KS] load #%d idx=%zu prev=%d dnum=%zu bufsz=%zu\n",
+                loads, idx, last_loaded_idx_, dnum_, buffer_sizes_.empty()?0:buffer_sizes_[0]);
+        fflush(stderr);
 
-        if ((int)idx == last_loaded_idx_) return;
+        if ((int)idx == last_loaded_idx_) { fprintf(stderr, "[KS] already loaded\n"); return; }
 
-        cudaDeviceSynchronize(); // wait for any in-flight kernels reading old key
+        const auto &stream = phantom::util::global_variables::default_stream->get_stream();
+        cudaStreamSynchronize(stream);
 
-        // Copy key data from CPU to pre-allocated GPU buffers (synchronous)
         for (size_t c = 0; c < dnum_; c++) {
-            cudaError_t err = cudaMemcpy(gpu_buffers_[c], keys_[idx].components[c].data(),
-                                          buffer_sizes_[c], cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "[KeyStore] cudaMemcpy failed idx=%zu c=%zu: %s\n",
-                        idx, c, cudaGetErrorString(err));
-                return;
-            }
+            cudaError_t e = cudaMemcpyAsync(gpu_buffers_[c], keys_[idx].components[c].data(),
+                            buffer_sizes_[c], cudaMemcpyHostToDevice, stream);
+            if (e != cudaSuccess) fprintf(stderr, "[KS] memcpy c=%zu fail: %s\n", c, cudaGetErrorString(e));
         }
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(stream);
+
+        std::vector<size_t> elem_counts(dnum_);
+        for (size_t c = 0; c < dnum_; c++) elem_counts[c] = buffer_sizes_[c] / sizeof(uint64_t);
 
         PhantomRelinKey &slot = galois_keys.get_mutable_relin_key(idx);
-        slot.set_external_buffers(gpu_buffers_, (uint64_t **)gpu_ptr_array_);
+        slot.set_external_buffers(gpu_buffers_, elem_counts, (uint64_t **)gpu_ptr_array_);
+        fprintf(stderr, "[KS] load done\n"); fflush(stderr);
 
         last_loaded_idx_ = (int)idx;
     }
