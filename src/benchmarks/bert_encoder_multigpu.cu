@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
 
     printf("════════════════════════════════════════════════════════════\n");
     printf("  BERT Encoder Layer — Multi-GPU Real Bootstrap (%d GPUs)\n", n_gpus);
-    printf("  N=%zu, heads=%d, hidden=%d, inner=%d, seq=%d\n", N, n_heads, hidden, inner, seq_len);
+    printf("  N=32768, heads=%d, hidden=%d, inner=%d, seq=%d\n", n_heads, hidden, inner, seq_len);
     printf("════════════════════════════════════════════════════════════\n\n");
 
     // Memory monitoring helper
