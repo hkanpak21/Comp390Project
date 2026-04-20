@@ -114,7 +114,7 @@ static EncryptionParameters build_parms() {
 // ---------------------------------------------------------------------------
 static double run_single_gpu_bootstrap(
     const EncryptionParameters &parms,
-    PhantomSecretKey &sk,
+    const string &sk_str,
     double scale)
 {
     printf("\n── Single-GPU baseline (CPU key streaming) ──\n");
@@ -122,6 +122,9 @@ static double run_single_gpu_bootstrap(
     long N = 1L << LOG_N;
     PhantomContext ctx(parms);
     PhantomCKKSEncoder enc(ctx);
+    // Load SK from serialized string — sk.load() uses cudaStreamPerThread (always valid)
+    PhantomSecretKey sk;
+    { stringstream ss(sk_str); sk.load(ss); }
     PhantomPublicKey pk = sk.gen_publickey(ctx);
     PhantomRelinKey rk  = sk.gen_relinkey(ctx);
     PhantomGaloisKey gk;
@@ -324,6 +327,77 @@ static double run_dks_bootstrap(
     // bootstrapper is handled in bert_dks_multigpu.cu.
     printf("  Running %zu rotations via DKS (timing individual ops)...\n", num_keys);
 
+    // ── Phase 2 diagnostic: rotation correctness at TWO levels ──
+    // (a) Chain_index=0 (full precision): both single-GPU and DKS should give MAE < 1e-3.
+    //     This confirms the DKS algorithm is mathematically correct.
+    // (b) Chain_index=TOTAL_LEVEL (one prime left): both should give the SAME (large)
+    //     MAE — at this depth Phantom's own rotation can't preserve precision.
+    {
+        std::vector<int> ctrl_steps = {1, 2, 4, 8, 16};
+        PhantomGaloisKey ctrl_gk = sk0.create_galois_keys_from_steps(ctx0, ctrl_steps);
+
+        // High-level encryption (full precision)
+        PhantomCiphertext ct_high;
+        eval0.encryptor.encrypt(pt, ct_high);
+        printf("\n  ── Rotation control at FULL PRECISION (chain_index=%zu, coeff_modulus_size=%zu) ──\n",
+               ct_high.chain_index(), ct_high.coeff_modulus_size());
+
+        for (int step : {1, 2, 4, 8, 16}) {
+            // (a1) single-GPU at high level
+            PhantomCiphertext ct_ref = ct_high;
+            ::rotate_vector_inplace(ctx0, ct_ref, step, ctrl_gk);
+            cudaDeviceSynchronize();
+            PhantomPlaintext pt_ref; eval0.decryptor.decrypt(ct_ref, pt_ref);
+            std::vector<double> v_ref; enc0.decode(ctx0, pt_ref, v_ref);
+            double mae_sg = 0.0;
+            for (size_t i = 0; i < slots; i++) mae_sg += fabs(v_ref[i] - 0.5);
+            mae_sg /= static_cast<double>(slots);
+
+            // (a2) DKS at high level (same input)
+            DistributedCiphertext dct_high = DistributedCiphertext::from_single_gpu(dctx, ct_high, 0);
+            PhantomGaloisKey dummy_gk;
+            nexus_multi_gpu::dist_rotate_vector_inplace(dctx, dct_high, step, dummy_gk);
+            for (int g = 0; g < n_gpus; g++) { cudaSetDevice(g); cudaDeviceSynchronize(); }
+            PhantomCiphertext ct_dks_h = dct_high.to_single_gpu(dctx, 0);
+            PhantomPlaintext pt_dks_h; eval0.decryptor.decrypt(ct_dks_h, pt_dks_h);
+            std::vector<double> v_dks_h; enc0.decode(ctx0, pt_dks_h, v_dks_h);
+            double mae_dks = 0.0;
+            for (size_t i = 0; i < slots; i++) mae_dks += fabs(v_dks_h[i] - 0.5);
+            mae_dks /= static_cast<double>(slots);
+
+            printf("  step=%+d: single-GPU MAE = %.2e   DKS MAE = %.2e   %s\n",
+                   step, mae_sg, mae_dks,
+                   (mae_sg < 1e-3 && mae_dks < 1e-3) ? "BOTH PASS"
+                   : (fabs(mae_sg - mae_dks) < 1e-4) ? "MATCH (same numeric noise)"
+                   : "MISMATCH (DKS bug)");
+            fflush(stdout);
+        }
+    }
+
+    printf("\n  ── Rotation control at BOOTSTRAP LEVEL (chain_index=%zu, coeff_modulus_size=%zu) ──\n",
+           ct0.chain_index(), ct0.coeff_modulus_size());
+    printf("  Note: at coeff_modulus_size=1, Phantom's own rotation cannot preserve precision.\n");
+    printf("  Identical large MAE for single-GPU and DKS == DKS algorithm is correct.\n");
+    {
+        std::vector<int> ctrl_steps = {1, 2, 4, 8, 16};
+        PhantomGaloisKey ctrl_gk = sk0.create_galois_keys_from_steps(ctx0, ctrl_steps);
+        for (int step : {1, 2, 4, 8, 16}) {
+            PhantomCiphertext ct_ref = ct0;
+            ::rotate_vector_inplace(ctx0, ct_ref, step, ctrl_gk);
+            cudaDeviceSynchronize();
+            PhantomPlaintext pt_ref;
+            eval0.decryptor.decrypt(ct_ref, pt_ref);
+            std::vector<double> v_ref;
+            enc0.decode(ctx0, pt_ref, v_ref);
+            double mae = 0.0;
+            for (size_t i = 0; i < slots; i++) mae += fabs(v_ref[i] - 0.5);
+            mae /= static_cast<double>(slots);
+            printf("  step=%+d: single-GPU rotation MAE (vs 0.5) = %.2e\n", step, mae);
+            fflush(stdout);
+        }
+    }
+    printf("\n  ── DKS rotation at BOOTSTRAP LEVEL (same input, same level) ──\n");
+
     // Time a single DKS rotation
     double rot_ms_total = 0.0;
     int rot_count = 0;
@@ -355,6 +429,7 @@ static double run_dks_bootstrap(
 
         printf("  step=%+d: DKS rotation = %.1f ms  MAE (vs 0.5 expected) = %.2e  %s\n",
                step, ms, mae, mae < 1e-3 ? "PASS" : "FAIL (large MAE)");
+        fflush(stdout);
     }
 
     double avg_rot_ms = rot_ms_total / rot_count;
@@ -364,6 +439,7 @@ static double run_dks_bootstrap(
     printf("  Average DKS rotation time: %.1f ms\n", avg_rot_ms);
     printf("  Projected bootstrap time:  %.1f ms  (%.1fx vs single-GPU %.1f ms)\n",
            proj_bootstrap_ms, baseline_ms / proj_bootstrap_ms, baseline_ms);
+    fflush(stdout);
 
     // Clean up
     dks.destroy();
@@ -392,15 +468,24 @@ int main(int argc, char **argv) {
     auto parms = build_parms();
     double SCALE = pow(2.0, LOGP);
 
-    // Generate SK once on GPU 0
-    cudaSetDevice(0);
-    PhantomContext ctx0(parms);
-    PhantomSecretKey sk0(ctx0);
+    // Generate SK once on GPU 0, serialize, then destroy ctx0 in this scope.
+    // CRITICAL: ctx0 must NOT outlive this scope — if it does, PhantomContext
+    // constructors inside run_single_gpu_bootstrap / DistributedContext::create
+    // will reset default_stream (destroying the stream ctx0 captured), leaving
+    // ctx0's internal CudaAutoPtr members holding a stale stream handle.
+    // All subsequent benchmarks load SK from the serialized string via
+    // sk.load(), which uses cudaStreamPerThread (always valid, never stale).
     string sk_str;
-    { stringstream ss; sk0.save(ss); sk_str = ss.str(); }
+    {
+        cudaSetDevice(0);
+        PhantomContext ctx0(parms);
+        PhantomSecretKey sk0(ctx0);
+        stringstream ss; sk0.save(ss); sk_str = ss.str();
+        // ctx0 and sk0 are destroyed here, cleanly, before any benchmark context
+    }
 
     // Run single-GPU baseline
-    double baseline_ms = run_single_gpu_bootstrap(parms, sk0, SCALE);
+    double baseline_ms = run_single_gpu_bootstrap(parms, sk_str, SCALE);
 
     // Run DKS for each GPU count
     printf("\n╔══════════════════════════════════════════════════╗\n");

@@ -40,6 +40,7 @@
 #include "ciphertext.h"
 #include "galois.cuh"
 #include "util/globals.h"
+#include "nvtx_tracer.cuh"
 
 #include <thread>
 #include <vector>
@@ -242,6 +243,141 @@ void dist_rotate_output_aggregation(
     GAL_CUDA_CHECK(cudaSetDevice(0));
     GAL_CUDA_CHECK(cudaFree(c0_gal_dev));
     GAL_CUDA_CHECK(cudaFree(c2_gal_dev));
+}
+
+// ---------------------------------------------------------------------------
+// dist_rotate_phantom_inplace
+// ---------------------------------------------------------------------------
+// Same OA algorithm as dist_rotate_output_aggregation but skips the DCT
+// scatter/gather on input/output. Used by the Bootstrapper (which holds a
+// PhantomCiphertext on GPU 0). Saves ~10–30 ms per rotation versus wrapping
+// in a temporary DistributedCiphertext.
+
+void dist_rotate_phantom_inplace(
+    DistributedContext       &ctx,
+    PhantomCiphertext        &ct,
+    int                       steps,
+    const DistGaloisKeyStore &key_store,
+    size_t                    key_idx)
+{
+    NVTX_SCOPE_FMT("dist_rotate_phantom step=%d", steps);
+    const int n_gpus = ctx.n_gpus();
+
+    GAL_CUDA_CHECK(cudaSetDevice(0));
+    const auto &stream0 = phantom::util::global_variables::default_stream->get_stream();
+
+    auto &pctx0 = ctx.context(0);
+    auto *gtool = pctx0.key_galois_tool();
+    if (!gtool)
+        throw std::runtime_error("[dist_rotate_phantom] Galois tool not initialized on GPU 0");
+
+    uint32_t galois_elt = gtool->get_elt_from_step(steps);
+    const auto &gelts = gtool->galois_elts();
+    auto it = std::find(gelts.begin(), gelts.end(), galois_elt);
+    if (it == gelts.end())
+        throw std::runtime_error("[dist_rotate_phantom] Galois element not found");
+    size_t gelt_idx = static_cast<size_t>(std::distance(gelts.begin(), it));
+
+    size_t coeff_mod_size = ct.coeff_modulus_size();
+    size_t N              = ct.poly_modulus_degree();
+    size_t poly_bytes     = coeff_mod_size * N * sizeof(uint64_t);
+
+    // Phase 3 fast path: persistent per-GPU c0_gal/c2_gal buffers, no per-call cudaMalloc.
+    ctx.ensure_rotation_workspace(poly_bytes);
+    auto &ws = ctx.rotation_workspace();
+
+    // Apply Galois permutation directly into GPU 0's persistent slot.
+    {
+        NVTX_SCOPE("P1_galois_ntt");
+        uint64_t *c0_gal_dev = ws.c0_gal[0];
+        uint64_t *c2_gal_dev = ws.c2_gal[0];
+        gtool->apply_galois_ntt(ct.data(), coeff_mod_size, gelt_idx, c0_gal_dev, stream0);
+        gtool->apply_galois_ntt(ct.data() + coeff_mod_size * N, coeff_mod_size,
+                                 gelt_idx, c2_gal_dev, stream0);
+        GAL_CUDA_CHECK(cudaStreamSynchronize(stream0));
+    }
+
+    // Peer-broadcast into the persistent workspace on each remote GPU
+    {
+        NVTX_SCOPE("P2_peer_broadcast");
+        uint64_t *c0_gal_dev = ws.c0_gal[0];
+        uint64_t *c2_gal_dev = ws.c2_gal[0];
+        for (int g = 1; g < n_gpus; g++) {
+            GAL_CUDA_CHECK(cudaSetDevice(g));
+            GAL_CUDA_CHECK(cudaMemcpyPeerAsync(ws.c0_gal[g], g, c0_gal_dev, 0, poly_bytes, ctx.stream(g)));
+            GAL_CUDA_CHECK(cudaMemcpyPeerAsync(ws.c2_gal[g], g, c2_gal_dev, 0, poly_bytes, ctx.stream(g)));
+        }
+        for (int g = 1; g < n_gpus; g++) {
+            GAL_CUDA_CHECK(cudaSetDevice(g));
+            GAL_CUDA_CHECK(cudaStreamSynchronize(ctx.stream(g)));
+        }
+    }
+
+    // Phase 4a: persistent per-GPU local_cts. Reuse across rotations; resize
+    // only when chain_index changes (rare during a single bootstrap).
+    if ((int)ws.local_cts.size() < n_gpus) {
+        ws.local_cts.resize(n_gpus);
+        ws.local_chain_index.resize(n_gpus, 0);
+    }
+    auto &local_cts = ws.local_cts;  // reference into the workspace
+    const size_t target_chain = ct.chain_index();
+    for (int g = 0; g < n_gpus; g++) {
+        GAL_CUDA_CHECK(cudaSetDevice(g));
+        if (ws.local_chain_index[g] != target_chain || local_cts[g].coeff_modulus_size() == 0) {
+            local_cts[g].resize(ctx.context(g), target_chain, 2,
+                                g == 0 ? stream0 : cudaStreamPerThread);
+            ws.local_chain_index[g] = target_chain;
+        }
+        local_cts[g].set_scale(ct.scale());
+        local_cts[g].set_ntt_form(true);
+
+        size_t lbytes = 2 * poly_bytes;
+        GAL_CUDA_CHECK(cudaMemset(local_cts[g].data(), 0, lbytes));
+        GAL_CUDA_CHECK(cudaMemcpy(local_cts[g].data(), ws.c0_gal[g],
+                                  poly_bytes, cudaMemcpyDeviceToDevice));
+    }
+    for (int g = 0; g < n_gpus; g++) {
+        GAL_CUDA_CHECK(cudaSetDevice(g));
+        GAL_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    MultiGpuContext mgctx;
+    mgctx.n_gpus = n_gpus;
+    mgctx.device_ids.resize(n_gpus);
+    mgctx.comms.resize(n_gpus);
+    mgctx.streams.resize(n_gpus);
+    for (int g = 0; g < n_gpus; g++) {
+        mgctx.device_ids[g] = g;
+        mgctx.comms[g]      = ctx.comm(g);
+        mgctx.streams[g]    = ctx.stream(g);
+    }
+
+    // Phase 4b: dispatch to persistent worker threads in DistributedContext —
+    // no per-rotation std::thread spawn/join.
+    {
+        NVTX_SCOPE("P3_dispatch_partialKS");
+        std::vector<std::function<void()>> work(n_gpus);
+        for (int g = 0; g < n_gpus; g++) {
+            work[g] = [&, g]() {
+                NVTX_SCOPE_FMT("partialKS gpu=%d", g);
+                keyswitching_output_aggregation_dks(
+                    mgctx, ctx.context(g), g,
+                    local_cts[g], ws.c2_gal[g],
+                    key_store.get_evks(g, key_idx),
+                    n_gpus);
+            };
+        }
+        ctx.dispatch_to_all_gpus(work);
+    }
+
+    // Phase 4 — write the result back into ct (GPU 0 D2D, no DCT scatter)
+    {
+        NVTX_SCOPE("P4_writeback");
+        GAL_CUDA_CHECK(cudaSetDevice(0));
+        GAL_CUDA_CHECK(cudaMemcpyAsync(ct.data(), local_cts[0].data(),
+                                       2 * poly_bytes, cudaMemcpyDeviceToDevice, stream0));
+        GAL_CUDA_CHECK(cudaStreamSynchronize(stream0));
+    }
 }
 
 // ---------------------------------------------------------------------------

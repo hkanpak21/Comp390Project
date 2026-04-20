@@ -408,13 +408,32 @@ int main(int argc, char **argv) {
     ks_cpu.generate_all_keys(ctx0, sk0, num_keys);
     eval0.evaluator.enable_key_streaming(&ks_cpu, &gk0);
 
-    // Register DKS
+    // Register DKS (global pointer used by dist_rotate_vector_inplace)
     nexus_multi_gpu::dist_set_galois_key_store(&dks, [&](int step) -> size_t {
         auto it = step_to_idx.find(step);
         if (it == step_to_idx.end())
             throw std::runtime_error("Unknown step in DKS map");
         return it->second;
     });
+
+    // Enable DKS rotation in the Evaluator so Bootstrapper's rotate_vector_inplace
+    // dispatches to dist_rotate_phantom_inplace (parallel partial KS across GPUs).
+    // The function pointer must outlive the bench, so allocate on heap and leak.
+    static auto *step_to_idx_fn = new std::function<size_t(int)>(
+        [&](int step) -> size_t {
+            auto it = step_to_idx.find(step);
+            if (it == step_to_idx.end())
+                throw std::runtime_error("Unknown step in Evaluator DKS map");
+            return it->second;
+        });
+    if (std::getenv("DKS_ROTATE")) {
+        eval0.evaluator.enable_dks_rotation(&dctx, &dks, step_to_idx_fn);
+        printf("[Setup] DKS rotation ENABLED — Bootstrapper rotates via dist_rotate_phantom_inplace\n");
+    } else {
+        printf("[Setup] DKS rotation DISABLED — Bootstrapper uses CPU-streaming + async prefetch\n");
+        printf("        (set DKS_ROTATE=1 to enable distributed rotation)\n");
+    }
+    fflush(stdout);
 
     printf("[Setup] DKS ready. GPU memory summary:\n");
     for (int g = 0; g < n_gpus; g++) {
@@ -425,6 +444,7 @@ int main(int argc, char **argv) {
                g, fr / 1e9, tot / 1e9);
     }
     cudaSetDevice(0);
+    fflush(stdout);
 
     // ── Generate weight matrices ──
     mt19937 rng(42);
@@ -453,6 +473,7 @@ int main(int argc, char **argv) {
 
     printf("\n[BERT Layer] Running 1 head via DKS on %d GPU%s...\n",
            n_gpus, n_gpus > 1 ? "s" : "");
+    fflush(stdout);
 
     // ── Run one layer (1 head, DKS bootstrap) ──
     LayerTimes times = run_bert_layer_dks(
@@ -497,6 +518,7 @@ int main(int argc, char **argv) {
     printf("  Reference (CPU streaming, 4-GPU head parallel): ~249,600 ms\n");
     printf("  DKS speedup vs CPU streaming: %.2fx\n",
            249600.0 / proj_full);
+    fflush(stdout);
 
     // ── Cleanup ──
     nexus_multi_gpu::dist_set_galois_key_store(nullptr, {});

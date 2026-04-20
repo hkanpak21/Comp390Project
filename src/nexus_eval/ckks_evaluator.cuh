@@ -157,6 +157,13 @@ class Evaluator {
   void *key_store_ = nullptr;
   PhantomGaloisKey *streaming_galois_keys_ = nullptr;  // galois_keys we populate on demand
 
+  // ── DKS rotation hook (Phase 3): when set, rotate_vector_inplace dispatches
+  //    to nexus_multi_gpu::dist_rotate_phantom_inplace instead of Phantom's
+  //    single-GPU rotate. Type-erased to avoid pulling multi_gpu headers here. ──
+  void   *dks_dctx_      = nullptr;       // DistributedContext*
+  void   *dks_key_store_ = nullptr;       // DistGaloisKeyStore*
+  void   *dks_step_to_idx_fn_ = nullptr;  // std::function<size_t(int)>* (heap-owned)
+
   uint32_t m_val = 0;  // 2*N, set from encoder slot_count
 
   // Convert rotation step to Galois element
@@ -386,6 +393,18 @@ class Evaluator {
 
   bool has_key_streaming() const { return key_store_ != nullptr; }
 
+  // Enable DKS rotation: rotate_vector_inplace will use distributed key-switching
+  // across all GPUs in dctx, with per-GPU sharded keys from dks_store. The
+  // step_to_idx function maps a rotation step → key index in the shard array.
+  // When DKS rotation is enabled, the CPU-streaming key path is bypassed.
+  void enable_dks_rotation(void *dctx, void *dks_store, std::function<size_t(int)> *step_to_idx_fn) {
+    dks_dctx_ = dctx;
+    dks_key_store_ = dks_store;
+    dks_step_to_idx_fn_ = step_to_idx_fn;
+  }
+
+  bool has_dks_rotation() const { return dks_dctx_ != nullptr; }
+
   // Mod switch
   inline void mod_switch_to_next_inplace(PhantomCiphertext &ct) {
     ::mod_switch_to_next_inplace(*context, ct);
@@ -512,39 +531,18 @@ class Evaluator {
     ::sub_inplace(*context, ct1, ct2);
   }
 
-  // Rotation — with key streaming and multi-GPU support
-  inline void rotate_vector(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys, PhantomCiphertext &dest) {
-    if (key_store_) {
-      ensure_key_loaded(steps, galois_keys);
-    }
-    if (remote && remote->device_id >= 0) {
-      uint32_t elt = step_to_elt(steps, m_val);
-      if (remote->galois_elts.count(elt)) {
-        remote_rotate(ct, steps, false, dest);
-        return;
-      }
-    }
-    dest = ::rotate_vector(*context, ct, steps, galois_keys);
-  }
-
-  inline void rotate_vector_inplace(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys) {
-    if (key_store_) {
-      ensure_key_loaded(steps, galois_keys);
-    }
-    if (remote && remote->device_id >= 0) {
-      uint32_t elt = step_to_elt(steps, m_val);
-      if (remote->galois_elts.count(elt)) {
-        PhantomCiphertext dest;
-        remote_rotate(ct, steps, false, dest);
-        ct = std::move(dest);
-        return;
-      }
-    }
-    ::rotate_vector_inplace(*context, ct, steps, galois_keys);
-  }
+  // Rotation — with key streaming, multi-GPU, and DKS support
+  void rotate_vector(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys, PhantomCiphertext &dest);
+  void rotate_vector_inplace(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys);
 
   // Load the Galois key for a given rotation step from CPU to GPU
   void ensure_key_loaded(int steps, PhantomGaloisKey &galois_keys);
+
+  // Kick async H→D for the key needed by a future rotation. Caller should
+  // invoke this before/after the current rotate so the next key streams in
+  // concurrently with the current rotation's compute kernels.
+  // Safe no-op if key streaming is not enabled.
+  void prefetch_rotation_step(int steps, PhantomGaloisKey &galois_keys);
 
   // Negation
   inline void negate(PhantomCiphertext &ct, PhantomCiphertext &dest) {

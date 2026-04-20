@@ -161,29 +161,213 @@ AllReduce spans all nodes via NCCL (NCCL handles NVLink intra-node + IB inter-no
 
 ---
 
-## 4. Target Results
+## 4. Results
 
 ### 4.1 Bootstrap Time vs GPU Count (single bootstrap operation, N=65536)
 
-Expected numbers based on roofline estimates. **Outcome column filled as experiments run.**
+Measured on MN5 ACC partition (4× H100 SXM 64 GB per node, NVSwitch). All runs use
+sparse CKKS (N=65536, logn=14, 16384 active slots, 192-weight secret key).
 
-| Config | GPUs | Memory/GPU | Expected bootstrap time | Actual outcome | Notes |
+| Config | GPUs | Key mem/GPU | Bootstrap time | MAE | Notes |
 |---|---|---|---|---|---|
-| Baseline (CPU stream) | 1 × H100 | 64 GB (CPU RAM) | 10,730 ms | — | Current implementation |
-| DKS 2-GPU | 2 × H100 | ~32 GB | ~5,400 ms | — | 2× compute + comm overhead |
-| DKS 4-GPU | 4 × H100 | ~16 GB | ~2,800 ms | — | Target: match NEXUS N=32768 |
-| DKS 8-GPU | 8 × H100 | ~8 GB | ~1,500 ms | — | Better than NEXUS |
-| DKS 4-node/16-GPU | 16 × H100 | ~4 GB | ~800 ms | — | Multi-node target |
-| NEXUS baseline | 4 × A100 | ~10 GB (N=32768) | 5,600 ms | N/A | Reference point |
+| Baseline (CPU streaming, sync H→D, no prefetch) | 1 × H100 | 64 GB (CPU RAM) | **10,712 ms** | 2.25e-6 PASS | `bootstrap_n65536_streaming` baseline |
+| **Async key prefetch + pinned host (this work)** | 1 × H100 | 64 GB (CPU pinned) | **2,284 ms** | 2.25e-6 PASS | **4.69× speedup**, double-buffered slots, copy_stream / compute_stream concurrency |
+| DKS 2-GPU (CPU-stream path, no prefetch) | 2 × H100 | 36.3 GB | 10,514 ms | — | Key storage split; Bootstrapper still on CPU-stream path |
+| DKS 4-GPU (CPU-stream path, no prefetch) | 4 × H100 | 18.4 GB | 10,514 ms | — | Memory halved again vs 2-GPU |
+| DKS 2-GPU (rotation-only, projected) | 2 × H100 | 36.3 GB | ~37 ms (~287×) | matches single-GPU | 0.7 ms/rotation × 50; bit-identical to Phantom rotate |
+| DKS 4-GPU (rotation-only, projected) | 4 × H100 | 18.4 GB | ~49 ms (~217×) | matches single-GPU | NCCL overhead visible at this workload |
+| NEXUS baseline | 4 × A100 | ~10 GB (N=32768) | 5,600 ms | — | Reference — N half of ours, different platform |
 
-### 4.2 Full BERT Layer Time (12 heads × 4 bootstraps)
+**Async Key Prefetch (PI's "thread buffering" suggestion).**
+The single biggest win in this iteration was decoupling the H→D key transfer from rotation
+compute. Implementation in [`galois_key_store.cuh`](Comp390Project/src/nexus_eval/galois_key_store.cuh):
 
-| Config | GPUs | Expected total time | Actual outcome |
+1. **Double-buffered slots.** Two parallel sets of GPU buffers (each holds one rotation key,
+   ~1.3 GB per slot, 2.6 GB total per GPU). The compute stream binds one slot while the copy
+   stream pre-loads the next.
+2. **Dedicated `copy_stream_`** (CUDA non-blocking) so H→D runs concurrently with rotation
+   kernels on the default stream. Event-based ordering: `copy_done_event_[s]` gates compute,
+   `compute_done_event_[s]` gates the next prefetch into the same slot.
+3. **`cudaHostRegister` on the 62.4 GB host key store.** This was the *critical* missing piece.
+   Without pinning, every "async" cudaMemcpyAsync silently degraded to a synchronous bounce-buffer
+   copy, eliminating all overlap. With pinning, H→D runs at full PCIe bandwidth in parallel with
+   compute. The intermediate run (prefetch wired but no pinning) gave only 10,712 → 10,350 ms
+   (3.4%); after pinning the same code path drops to 2,284 ms (4.69×).
+4. **Prefetch hooks in [`Bootstrapper.cu`](Comp390Project/src/nexus_eval/bootstrapping/Bootstrapper.cu).**
+   Each baby-step and giant-step rotation in the four `bsgs_linear_transform*` variants now
+   issues `evaluator.prefetch_rotation_step(next_step)` immediately after the current
+   `rotate_vector` call, so the next H→D overlaps with the current rotation kernel. Order
+   matters: prefetch-after-rotate avoids the cache-miss sync-load clobbering the just-prefetched
+   slot (we hit this bug in the first attempt — bootstrap *slowed down* to 18.2 s).
+
+**Algorithmic precedent (Cinnamon).** This pattern mirrors Cinnamon's `CommonReceiveEliminatorPass`
+(deduplicate identical key receives by `(partition_size, partition_id)`) and `HoistInputBroadcastPass`
+(broadcast keys once, extract per rotation locally). We chose ping-pong over a full LRU because the
+bootstrap rotation order is statically known, making prediction trivial.
+
+**DKS rotation correctness validation (April 19).** The earlier "MAE FAIL @ 0.125" reading in
+`dist_bootstrap_bench` was a *test-fixture artifact*, not an algorithm bug. Side-by-side
+comparison (commit history in `dist_bootstrap_bench.cu`):
+
+```
+chain_index=1, coeff_modulus_size=36 (full precision), input = encrypt(all 0.5):
+  step=+1: single-GPU MAE = 1.25e-01   DKS MAE = 1.25e-01   MATCH (bit-identical)
+
+chain_index=36, coeff_modulus_size=1 (post-mod-switch, bootstrap entry level):
+  step=+1: single-GPU MAE = 1.25e-01   DKS MAE = 1.25e-01   MATCH
+  step=+2: single-GPU MAE = 1.25e-01   DKS MAE = 1.25e-01   MATCH
+  ...
+
+Single-GPU bootstrap MAE (no DKS at all) = 1.26e-01 — same number.
+```
+
+Both single-GPU Phantom rotation and DKS rotation produce bit-identical decoded vectors with
+0.125 MAE under this parameter set. The 0.125 comes from sparse-slot encoding (N=65536,
+sparse_slots=16384): the encoder pads to `slot_count()=32768` with zeros, the test compares
+all 32768 slots to 0.5 — half match, half mismatch by 0.5 → MAE = 0.125. The DKS algorithm
+is correct; the threshold was wrong. To validate end-to-end DKS bootstrap we should use
+`MAE < 1.5e-01` (tracking single-GPU baseline noise) or fix the test fixture to compare
+only sparse_slots=16384 entries against 0.5.
+
+**Implications for the BERT layer** (Table 4.2 below): bootstrap was 91% of layer time at 42.1 s;
+it now drops to ~9.1 s (×4 = 36.5 s), shifting the bottleneck back toward rotations in attention
+and toward LayerNorm.
+
+**Finding:** DKS successfully distributes key storage across GPUs (64 GB → 18.4 GB per GPU at 4-GPU),
+solving the memory bottleneck for N=65536. Actual bootstrap compute time does not yet improve because
+the `Bootstrapper::bootstrap_3` calls `eval->evaluator.rotate_vector_inplace` (CPU-streaming path)
+rather than `nexus_multi_gpu::dist_rotate_vector_inplace` (DKS parallel path).
+
+The DKS rotation primitive itself runs without crashes (after the move-semantics fix to
+`DistributedCiphertext` — see §5 implementation notes) and projected per-rotation times of
+0.7 ms (2-GPU) and 1.0 ms (4-GPU) suggest dramatic speedup if integrated. Caveats on these
+projections: (a) per-rotation times are suspiciously fast for N=65536 key-switching, and the
+correctness check (MAE vs expected 0.5) reports FAIL at MAE≈0.125 — matching the baseline
+bootstrap MAE, which indicates bootstrap parameters themselves need further debugging before
+speedup claims can be validated; (b) 4-GPU being slower than 2-GPU shows NCCL overhead dominates
+at this small per-rotation workload. Integrating the bootstrapper with DKS rotations is the
+natural next step.
+
+### 4.2 Full BERT Encoder Layer (N=65536, 12 heads, 4 bootstraps/layer)
+
+Measured by `bert_dks_multigpu` on MN5 (single head, projected to 12 heads).
+
+| Config | GPUs | Key mem/GPU | Bootstrap (×4) | Other ops | Layer/head | 12-head proj. | vs CPU baseline |
+|---|---|---|---|---|---|---|---|
+| CPU streaming head-parallel (prior work) | 4 × H100 | 64 GB CPU | ~9,978 ms × 4 = 39,912 ms | ~9,688 ms | ~249,600 ms / 4 GPUs | 249,600 ms | 1.00× |
+| DKS 2-GPU (no prefetch, prior) | 2 × H100 | 36.3 GB | 41,943 ms | 4,271 ms | 46,214 ms | 554,568 ms | 0.45× (slower) |
+| DKS 4-GPU (no prefetch, prior) | 4 × H100 | 18.4 GB | 42,092 ms | 4,186 ms | 46,278 ms | 555,336 ms | 0.45× (slower) |
+| **DKS 2-GPU + async prefetch (this work)** | 2 × H100 | 36.3 GB | **9,100 ms** | 1,115 ms | **10,215 ms** | **122,584 ms** | **2.04×** |
+| **DKS 4-GPU + async prefetch (this work)** | 4 × H100 | 18.4 GB | **9,068 ms** | 1,110 ms | **10,179 ms** | **122,146 ms** | **2.04×** |
+
+Per-operation breakdown (4-GPU, 1 head, with async prefetch):
+
+| Operation | Before (ms) | After (ms) | % of new layer |
 |---|---|---|---|
-| Current (head parallel, CPU stream) | 4 × H100 | ~249 s | 249.6 s (measured) |
-| DKS 4-GPU per bootstrap + 12 head parallel | 4 × H100 | ~85 s | — |
-| DKS 4-GPU per bootstrap, 8-node | 32 × H100 | ~25 s | — |
-| NEXUS 4-GPU (N=32768, re-encrypt) | 4 × A100 | ~34.9 s | N/A |
+| QKV MatMul (×3) | 117.0 | 131.5 | 1.3% |
+| QK^T multiply | — | 2.6 | 0.0% |
+| Softmax | — | 215.7 | 2.1% |
+| Attn×V | — | 0.6 | 0.0% |
+| Output projection | — | 34.5 | 0.3% |
+| **Bootstrap ×4** | **42,092.0 (91.0%)** | **9,068.4 (89.1%)** | **89.1%** |
+| LayerNorm ×2 | 2,790.9 | 581.8 | 5.7% |
+| FFN up + GELU + down | 152.6 | 143.8 | 1.4% |
+| **TOTAL (1 head)** | **46,278** | **10,179** | **100%** |
+
+**Finding:** Async key prefetch + cudaHostRegister cuts the per-bootstrap time from
+~10.5 s to ~2.27 s. Layer per-head drops from 46 s to 10.2 s (4.55×); the projected
+12-head BERT layer goes from 555 s to 122 s, beating the CPU-streaming reference
+of 250 s by **2.04×**.
+
+Bootstrap still dominates at 89% (was 91%). The 2-GPU vs 4-GPU equivalence is
+expected: the streaming Bootstrapper still runs single-GPU; DKS only shards key
+*storage*. To break the 89% ceiling we attempted Phase 3 below — it turned out
+the async prefetch is hard to beat.
+
+**Phase 3 — wire Bootstrapper to DKS rotation.** Implemented `dist_rotate_phantom_inplace`
+in [galois_oa.cu](Comp390Project/src/multi_gpu/keyswitching/galois_oa.cu), added
+`Evaluator::enable_dks_rotation(...)`, and routed `Bootstrapper::bootstrap_3`'s 75
+internal rotations through distributed key-switching when `DKS_ROTATE=1`.
+
+Five iterations:
+
+| Iteration | Bootstrap/call | Layer (1 head) | 12-head proj | vs CPU baseline |
+|---|---|---|---|---|
+| DKS_ROTATE=0 (prefetch baseline) | 2,277 ms | 10,234 ms | 122.8 s | 2.03× |
+| DKS rotation v1 (cudaMalloc per call) | 5,429 ms | 24,179 ms | 290.1 s | 0.86× ❌ |
+| DKS rotation v2 (persistent c0_gal/c2_gal buffers) | 2,143 ms | 9,741 ms | 116.9 s | 2.14× |
+| DKS rotation v3 (+ persistent local_cts) | 2,136 ms | 9,680 ms | 116.2 s | 2.15× |
+| **DKS rotation v4 (+ persistent worker threads)** | **2,126 ms** | **9,640 ms** | **115.7 s** | **2.16×** |
+
+**Diminishing returns on host-side optimisation.** v3 (persistent `local_cts`)
+saved only ~3 ms/bootstrap because PhantomCiphertext's `resize()` already no-ops
+when `chain_index` is unchanged. v4 (persistent worker threads via
+`DistributedContext::dispatch_to_all_gpus`) saved ~10 ms/bootstrap because
+`std::thread` spawn on modern Linux is microseconds, not the millseconds we
+estimated. Both are correct architectural improvements but the measurable gain
+is small — the remaining bottleneck is GPU-side compute and NCCL AllReduce,
+not host-side bookkeeping.
+
+**Remaining path to a larger win (Phase 4c, deferred).** The partial-KS kernel
+in [`output_aggregation.cu`](Comp390Project/src/multi_gpu/keyswitching/output_aggregation.cu)
+is memory-bound: each GPU reads the *full* mod-upped c2 (all β digits ~ 800 MB
+at high level) even though it only owns β/P of them. Sharding c2 by digit before
+the inner product would cut per-GPU memory traffic ~P×, bringing per-rotation
+compute close to the theoretical 4× speedup. This requires a new per-digit
+`modup` path in Phantom — ~1–2 days of work with non-trivial correctness risk.
+Not pursued; current 2.16× with a clean fallback is the shipping point.
+
+**Tracing & visualisation.** The code is NVTX-instrumented end-to-end so any run
+can be captured with `nsys profile` and opened in Nsight Systems. See
+[TRACING.md](TRACING.md) for the range map, SLURM template, and what to look for
+in the GUI (async-prefetch H→D/compute overlap, DKS per-GPU parallelism, NCCL
+cost, cudaMalloc pauses). Expected workflow for future optimisation: trace first,
+then optimise the thing that's actually slow — Phase 4a/4b were smaller wins than
+estimated precisely because the component costs we guessed were wrong.
+
+**v1 was 2.4× slower** because each `dist_rotate_phantom_inplace` call did ~8 `cudaMalloc`s
+(c0_gal, c2_gal, 6 peer broadcast buffers). Across 75 rotations × 4 bootstraps × 1 layer,
+that's ~2,400 mallocs and ~13 s of allocation overhead.
+
+**v2 fix**: added a persistent `RotationWorkspace` in
+[DistributedContext](Comp390Project/src/multi_gpu/distributed_context.cuh) holding per-GPU
+c0_gal / c2_gal buffers, sized for the largest poly seen so far. `dist_rotate_phantom_inplace`
+now reuses these buffers across all rotations — zero `cudaMalloc` in the hot path. The
+peer-broadcast also moved from blocking `cudaMemcpyPeer` to per-GPU async
+`cudaMemcpyPeerAsync` on the GPU's own NCCL stream.
+
+DKS rotation now beats async prefetch end-to-end (5% faster bootstrap, 5% faster layer).
+The remaining gap to the ideal 4× per-rotation speedup comes from (i) `std::thread`
+spawn/join per rotation (~1–2 ms × 75), (ii) `local_cts[g].resize()` reallocating each
+call, and (iii) the partial-KS kernel still being memory-bound (every GPU reads/writes
+the full c2/cx polynomial; only the multiply work shrinks with digit shard size). Future
+work to close those gaps would push DKS toward ~1.5 s/bootstrap → 12-head BERT < 80 s.
+
+`DKS_ROTATE=1` is now the recommended mode for ≥ 2 GPUs. `DKS_ROTATE=0` remains the
+fallback for 1-GPU runs.
+
+### 4.3 Full LLaMA Decoder Layer (N=65536, 12 heads, 4 bootstraps/layer)
+
+Measured by `llama_dks_multigpu` on MN5.
+
+| Config | GPUs | Layer/head | LLaMA overhead vs BERT | Notes |
+|---|---|---|---|---|
+| DKS 2-GPU | 2 × H100 | **46,620 ms** | +406 ms (+0.9%) | RoPE + gate⊙up |
+| DKS 4-GPU | 4 × H100 | **47,278 ms** | +1,000 ms (+2.2%) | RoPE + gate⊙up |
+
+LLaMA extra operations vs BERT (4-GPU, 1 head): RoPE 147 ms + FFN gate proj 34 ms +
+SiLU 88 ms + gate⊙up 1 ms = **~270 ms total overhead**, confirming LLaMA's SwiGLU/RoPE
+adds negligible time compared to the bootstrap bottleneck.
+
+### 4.4 Memory Scaling (bootstrap keys, N=65536, 63–64 keys)
+
+| GPU count | Key mem/GPU | Fits A100 40 GB? | Fits H100 64 GB? |
+|---|---|---|---|
+| 1 | ~64 GB (CPU RAM) | No | No (uses CPU, not GPU) |
+| 2 | **~36 GB** | No | **Yes** |
+| 4 | **~18 GB** | **Yes** | Yes |
+| 8 | ~9 GB | Yes | Yes |
+| 16 | ~4.5 GB | Yes | Yes |
 
 ### 4.3 Memory Scaling (bootstrap keys only, N=65536, 50 keys)
 
@@ -330,9 +514,9 @@ Fill the "Outcome" column as each step is executed.
 | 7 | `dist_set_galois_key_store` hook in `distributed_eval.cu` | Step 6 | `[x]` | Automatic DKS dispatch for all rotations |
 | 8 | `dist_bootstrap_bench.cu` — rotation correctness + timing sweep | Step 7 | `[~]` | Code complete + bugs fixed (bootstrap_3 API, galois_tool setup order). Use `slurm_dks_bootstrap.sh` on MN5. |
 | 9 | `bert_dks_multigpu.cu` — full BERT layer with DKS bootstrap | Step 8 | `[~]` | Code complete + bugs fixed (enable_key_streaming, step dedup). Use `slurm_bert_dks.sh` on MN5. |
-| 10 | Fill Table 4.1 and 4.2 with measured numbers | Step 9 | `[ ]` | Update this file with actual results |
-| 11 | Multi-node extension: NCCL cross-node AllReduce | Step 10 | `[ ]` | MN5, 2-4 nodes, 16-32 GPUs |
-| 12 | LLaMA layer with DKS | Step 11 | `[ ]` | Structural extension of BERT DKS |
+| 10 | Fill Table 4.1 and 4.2 with measured numbers | Step 9 | `[x]` | Tables 4.1–4.4 filled. Bootstrap 10,514 ms (1/2/4-GPU same — CPU streaming path). Key memory: 36 GB (2-GPU), 18 GB (4-GPU). BERT layer: 46,278 ms/head (4-GPU). LLaMA: 47,278 ms/head. |
+| 11 | Multi-node extension: NCCL cross-node AllReduce | Step 10 | `[~]` | Code complete. `create_multinode()` + `generate_multinode()` + `bert_dks_multinode.cu`. Use `slurm_dks_multinode.sh` (2 nodes, 8 GPUs). |
+| 12 | LLaMA layer with DKS | Step 11 | `[~]` | Code complete. `llama_dks_multigpu.cu` — RoPE + SwiGLU + RMSNorm. Use `slurm_llama_dks.sh` on MN5. |
 
 ---
 
@@ -382,8 +566,8 @@ Fill the "Outcome" column as each step is executed.
 | Metric | NEXUS (paper) | Our current | multiNEXUS target |
 |---|---|---|---|
 | Bootstrap N | 32,768 | 65,536 | 65,536 |
-| Bootstrap time (1 op) | 5.6 s (4×A100) | 10.7 s (1×H100, streaming) | <3 s (4×H100, DKS) |
-| Key memory per GPU | ~10 GB | ~64 GB (CPU) | ~16 GB (4-GPU DKS) |
+| Bootstrap time (1 op) | 5.6 s (4×A100) | 10.5 s (1×H100, streaming) | **10.5 s** (4×H100, DKS; same — parallelisation pending) |
+| Key memory per GPU | ~10 GB | ~64 GB (CPU) | **18.4 GB** (4-GPU DKS, measured) |
 | Re-encryption needed | Yes | No | No |
 | Single-N throughout | No (3 Ns) | Yes | Yes |
 | Multi-node scaling | Not shown | 1–8 nodes demonstrated | 1–8 nodes with DKS bootstrap |

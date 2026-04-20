@@ -300,3 +300,154 @@ The field has reached an inflection point where GPU-accelerated FHE transforms e
 The key technical insight from this survey is that **naive multi-GPU distribution of FHE operations makes performance worse, not better**—Cerium's results show a 1.2× slowdown without compiler-driven optimization. The critical path runs through key-switching, which accounts for 70–80% of execution time and has cross-limb dependencies that create communication bottlenecks. Success requires implementing the input broadcast and output aggregation algorithms, building sophisticated compute-communication overlapping via CUDA streams, and carefully profiling to ensure that communication never sits on the critical path.
 
 The combination of NEXUS's publicly available codebase (with Phantom GPU acceleration), NCCL's mature multi-GPU communication primitives, and access to AWS p5 instances and MareNostrum 5 makes this project technically executable within 12 weeks. The resulting system would be the first multi-node non-interactive secure transformer inference implementation—a genuine and publishable contribution to a rapidly growing field.
+
+---
+
+## 8. Code walkthrough: what we actually built (presentation prep)
+
+This section walks through the implementation we can demo and defend during the presentation. It explains *why* each piece exists, *what problem it solves*, and *what to say* if the committee drills into it.
+
+### 8.1 Repository layout at a glance
+
+```
+Comp390Project/
+├── vendor/phantom/              ← Phantom FHE library (submodule), retrofit for streaming
+│   ├── include/secretkey.h          ← added copy_to_host / load_from_host / set_external_buffers
+│   ├── include/context.cuh          ← added setup_galois_tool (late Galois init)
+│   ├── include/cuda_wrapper.cuh     ← added owns_ flag for non-owning cuda_auto_ptr
+│   ├── include/ciphertext.h         ← added parms_id_ to (de)serialization
+│   └── src/secretkey.cu             ← added generate_single_galois_key
+├── src/
+│   ├── nexus_eval/
+│   │   ├── galois_key_store.cuh      ← NEW: CPU-side Galois key storage, on-demand streaming
+│   │   ├── ckks_evaluator.cuh        ← added enable_key_streaming + ensure_key_loaded hook
+│   │   ├── ckks_evaluator.cu         ← rotate_vector / complex_conjugate route through hook
+│   │   ├── gelu.cuh / softmax.cuh / layer_norm.cuh / matrix_mul.cuh   ← NEXUS ops, untouched
+│   │   └── bootstrapping/Bootstrapper.cuh                             ← NEXUS bootstrap, untouched
+│   └── benchmarks/
+│       ├── bootstrap_n65536_streaming.cu     ← standalone N=65536 bootstrap proof-of-concept
+│       ├── bert_encoder_n65536.cu            ← single-GPU BERT-layer at N=65536
+│       ├── bert_encoder_multigpu_n65536.cu   ← multi-GPU, per-GPU key store, round-robin heads
+│       ├── bert_encoder_multinode_n65536.cu  ← multi-node via MPI scatter/gather
+│       └── llama_layer_multigpu_n65536.cu    ← LLaMA-style comparison (SwiGLU + RoPE + RMSNorm-proxy)
+├── scripts/mn5/                  ← SLURM submission scripts for MareNostrum 5
+├── paper/progress_report.md      ← full written report with all results
+└── CMakeLists.txt                ← adds every benchmark as a CUDA executable
+```
+
+### 8.2 The core problem, in one paragraph
+
+At N=65536 (the polynomial degree NEXUS uses for non-bootstrap operations), one full set of Galois rotation keys is **62.4 GB** — it almost fills a 64 GB H100 before any ciphertext arrives. NEXUS sidestepped this by running bootstrap at N=32768 and using a two-server parameter-switching protocol, which requires interactive re-encryption between servers. Cerium sidestepped it by writing a custom multi-GPU FHE library (FIDESlib, ~50 k lines). We sidestep it with **CPU-side Galois key streaming**: keep all keys in CPU pinned memory (abundant — 512+ GB per node), stream one key at a time to a reusable GPU buffer right before each rotation. The GPU ends up holding ~5 GB instead of ~63 GB, and one full BERT encoder layer at N=65536 runs end-to-end on a single H100 in ~91 s (10.7 s per bootstrap).
+
+### 8.3 The Phantom retrofit (minimal changes, ~150 lines)
+
+Phantom was not designed for memory-constrained scenarios; its `PhantomGaloisKey` owns its GPU allocations and has no way to replace them in-place. Changes we made:
+
+- **`PhantomRelinKey::copy_to_host` / `load_from_host`** — serialize a single key's RNS limbs into host vectors and back. Needed so we can generate a key, ship it to CPU, free its GPU buffers, and later reconstitute it into a pre-allocated GPU buffer.
+- **`PhantomRelinKey::set_external_buffers(ptrs, n, elem_counts)`** — put the key into *non-owning mode*: it points at buffers we manage, and will not free them in its destructor. This is the critical mechanism that lets one 1.3 GB GPU buffer be reused across all 63 keys.
+- **`PhantomGaloisKey::resize_slots / get_mutable_relin_key`** — expose per-step slots so we can populate one at a time.
+- **`PhantomSecretKey::generate_single_galois_key(ctx, idx)`** — generate exactly one Galois key on demand instead of all 48–63 at once (otherwise the GPU OOMs during setup).
+- **`PhantomContext::setup_galois_tool(elts)`** — initialize the permutation tables for a set of Galois elements *without* actually generating keys for them. This decouples "the context knows how to rotate by step k" from "the key for step k is resident on GPU".
+- **`cuda_auto_ptr::owns_` flag** — Phantom's RAII pointer defaulted to owning; adding a non-owning mode avoids double-free when we wrap external buffers.
+- **`PhantomCiphertext::parms_id_` in save/load** — needed for cross-context ciphertext transfer (used in our earlier multi-GPU key-distribution attempt; kept because it's harmless and documents the failure mode).
+
+**Talking point:** "Why retrofit instead of fork?" Because the retrofit is ~150 lines in five headers and one .cu file, and the changes are orthogonal to Phantom's hot-loop kernels — we inherit all of Phantom's NTT optimizations for free. A fork would have diverged immediately.
+
+### 8.4 GaloisKeyStore — where the streaming actually happens
+
+[`src/nexus_eval/galois_key_store.cuh`](src/nexus_eval/galois_key_store.cuh) is the new class that makes this work.
+
+- **`generate_all_keys(ctx, sk, n_keys)`** loops over every Galois element, calls `sk.generate_single_galois_key(ctx, i)`, copies the key's RNS limbs to CPU pinned memory via `cudaMemcpyAsync`, frees its GPU data, and moves on to the next. At no point are more than one or two keys resident on GPU.
+- **`HostKey`** is a vector of vectors of `uint64_t` — one vector per RNS limb, sized by `dnum × component_size`.
+- **Pre-allocated reusable GPU buffers** — during setup we `cudaMallocAsync` exactly one RelinKey-sized GPU region per "slot" (we pre-allocate 36 to allow small amounts of overlap between successive rotations). All of this happens on Phantom's `default_stream` so the allocations come from its stream-ordered pool — mixing pools was the first bug we hit.
+- **`load_key_to_gpu(idx, gk)`** — `cudaStreamSynchronize` on the default stream to make sure the previous rotation has consumed the current buffer, then `cudaMemcpyAsync` host→device and point `gk`'s non-owning slot at the buffer.
+
+**Talking point:** "What's the cost of streaming?" About 40 ms per key load over PCIe Gen5 (1.3 GB at ~32 GB/s). Bootstrap does ~75 rotations and reuses keys in a predictable pattern, so we amortize to ~3 s per bootstrap of transfer overhead — and that overlaps with compute on the same stream. This is the 40× bootstrap slowdown we report: most of it is larger-N kernels, not the streaming itself.
+
+### 8.5 The Evaluator hook — how rotations get intercepted transparently
+
+[`src/nexus_eval/ckks_evaluator.cuh`](src/nexus_eval/ckks_evaluator.cuh) is the NEXUS wrapper around Phantom's evaluator. We added:
+
+```cpp
+void enable_key_streaming(void *store, PhantomGaloisKey *gk);  // registers the store
+void ensure_key_loaded(int step, PhantomGaloisKey &gk);        // called before every rotation
+```
+
+`rotate_vector`, `rotate_vector_inplace`, and `complex_conjugate` all call `ensure_key_loaded(step, gk)` first. That function maps the step to a Galois element via Phantom's own `context->key_galois_tool_->get_elt_from_step(step)` (using Phantom's own conversion was another bug we fixed — our custom step→elt mapping was wrong for negative steps), looks up the key index, and calls `GaloisKeyStore::load_key_to_gpu` if the right key isn't already resident.
+
+**This is the key architectural decision.** Every NEXUS operator — softmax, layer-norm, GELU, bootstrap — calls `evaluator.rotate_vector(...)`. By intercepting at that level we inherited the entire NEXUS operator library without touching any of it. Zero changes to `softmax.cuh`, `layer_norm.cuh`, `gelu.cuh`, or `Bootstrapper.cuh`.
+
+**Talking point:** "How do you know the keys are correct?" The standalone bootstrap test at N=65536 produces MAE = 2.248×10⁻⁶ (PASS) against the plaintext reference — that's within CKKS's expected ~32-bit precision, and it's identical to what Phantom produces when all keys are resident. If any key were wrong, the polynomial evaluation in mod-reduction would explode exponentially.
+
+### 8.6 Multi-GPU pattern — per-thread Phantom context
+
+Phantom is **context-bound**: each `PhantomContext` creates GPU-specific NTT tables, and a ciphertext created under context A cannot be correctly rotated under context B because the NTT roots are different GPU allocations. Our earlier experiment in multi-GPU *key distribution* (split 48 keys across 2 GPUs) produced MAE = 10²³⁸ — documented in §7.5 of the progress report — precisely because of this cross-context failure.
+
+Our solution in [`bert_encoder_multigpu_n65536.cu`](src/benchmarks/bert_encoder_multigpu_n65536.cu) is **head-level parallelism**: spawn one `std::thread` per GPU, each thread creates its own `PhantomContext`, its own `PhantomSecretKey` (loaded from a common serialized blob), its own `GaloisKeyStore`, and its own pre-allocated buffers. Phantom's `default_stream` is `thread_local`, so each thread's CUDA operations route to the correct GPU automatically. Heads are distributed round-robin: GPU 0 handles heads {0, 4, 8}, GPU 1 handles {1, 5, 9}, etc.
+
+**Talking point:** "Why not distribute keys across GPUs to save memory?" We tried — it failed with MAE = 10²³⁸ because Phantom contexts own their NTT tables. Cerium solves this with UVM + a custom FHE library. Our approach (head-level parallelism with independent contexts) is the natural fit for Phantom and matches how BERT's attention heads are already independent.
+
+### 8.7 Multi-node pattern — MPI for scatter/gather
+
+[`bert_encoder_multinode_n65536.cu`](src/benchmarks/bert_encoder_multinode_n65536.cu) layers an MPI outer loop on top of the per-node multi-GPU pattern:
+
+- **Rank 0** encrypts inputs for all 12 heads, serializes them to byte buffers, and uses `MPI_Scatterv` to distribute heads across ranks (one rank per node).
+- **Each rank** runs the multi-GPU benchmark on its assigned subset of heads, writing results into output buffers.
+- **`MPI_Gatherv`** collects all head outputs back to rank 0.
+
+The `heads_per_rank[]` vector handles the case where 12 doesn't divide evenly by the node count (e.g., 12 / 8 → some ranks get 2 heads, others 1). Measured scatter/gather time is **0.5–0.6 s across all node counts** — <0.6% of total runtime — which justifies the MPI choice: communication is once-per-layer, not inside a hot loop.
+
+**Talking point:** "Why MPI and not NCCL for inter-node?" NCCL is designed for fixed-size collectives inside tight loops (e.g., all-reduce after every gradient step in training). Our workload is a once-per-layer scatter/gather with *uneven* chunk sizes, where MPI_Scatterv/Gatherv are the natural fit. At 0.5% of runtime there's essentially no headroom for a lower-level transport to improve things. We *do* use NCCL for intra-node collectives in the key-switching micro-benchmark, where bandwidth actually matters.
+
+### 8.8 The benchmark programs and what each one proves
+
+| Program | What it proves |
+|---|---|
+| [`bootstrap_n65536_streaming.cu`](src/benchmarks/bootstrap_n65536_streaming.cu) | CPU-side key streaming is correct: standalone bootstrap at N=65536 runs in 10.7 s with MAE = 2.248×10⁻⁶. First time this has been shown on a single H100. |
+| [`bert_encoder_n65536.cu`](src/benchmarks/bert_encoder_n65536.cu) | End-to-end single-layer BERT at N=65536 on one GPU: 91 s for 2 heads, 4 bootstraps per head, no parameter switching. |
+| [`bert_encoder_multigpu_n65536.cu`](src/benchmarks/bert_encoder_multigpu_n65536.cu) | Multi-GPU scaling within one node (4×H100 on MN5): 238.7 s for 12 heads at N=65536, Nsight-profiled, 93.4% bootstrap. |
+| [`bert_encoder_multinode_n65536.cu`](src/benchmarks/bert_encoder_multinode_n65536.cu) | Multi-node scaling (2/4/8 nodes on MN5): 183 s → 146 s → 103 s. Scatter stays at ~0.5 s regardless of node count. |
+| [`llama_layer_multigpu_n65536.cu`](src/benchmarks/llama_layer_multigpu_n65536.cu) | Framework is architecture-agnostic: same infrastructure runs a LLaMA-style decoder (SwiGLU, RoPE, RMSNorm-proxy) at 257 s — +22.6% over BERT, driven entirely by an extra bootstrap level in the SwiGLU path. |
+
+### 8.9 Granular profile — where time actually goes (slide-worthy numbers)
+
+1-node / 4-GPU / N=65536 / 12 heads, summed across all heads:
+
+| Category | BERT | LLaMA |
+|---|---:|---:|
+| Bootstraps (4×) | **559.0 s (93.4%)** | **631.9 s (93.2%)** |
+| Non-linear (Softmax + 2× Norm + Activation) | 36.9 s (6.2%) | 40.6 s (6.0%) |
+| MatMuls (6× BERT / 7× LLaMA) | 2.6 s (0.4%) | 3.5 s (0.5%) |
+| LLaMA extras (RoPE + gate⊙up) | — | 2.2 s (0.3%) |
+
+**Three takeaways for the presentation:**
+
+1. **Bootstrap is 93% of the layer.** Every other optimization is second-order. This is why NEXUS, Cerium, and us all spend so many words on bootstrap.
+2. **Matmuls are 0.4%.** At seq_len=16 and hidden=64 with N=65536, a matmul is a handful of ct×pt multiplies plus a small rotation tree. The 40 MB of CPU→GPU key traffic per matmul is invisible because it overlaps with the next bootstrap's rotations.
+3. **The architecture gap (BERT→LLaMA) is +22% end-to-end, not +2×.** Most of LLaMA's extra cost is one additional multiplicative level in the SwiGLU path, which slightly increases each bootstrap's mod-switch chain. RoPE itself is 0.3%. This is useful context if the committee asks "what about Llama3-8B?" — the answer is that the per-layer structure scales predictably and the bottleneck is the same bootstrap.
+
+### 8.10 Likely presentation questions (with short answers)
+
+**Q. Why is your bootstrap 40× slower than NEXUS's?** NEXUS runs bootstrap at N=32768; we run it at N=65536. The NTT is 2× larger, there are more RNS limbs (37 vs 31), and the streaming layer adds ~3 s of overhead. NEXUS explicitly downgraded to N=32768 with the comment "adjusted to satisfy the memory constraints of an A100 GPU" — we can now do what they couldn't.
+
+**Q. Is this secure?** Yes — we never drop below 128-bit security. N=65536 and the Hamming-weight-192 sparse secret are exactly the parameters NEXUS uses for non-bootstrap operations. CPU-side key storage does not weaken security: the client never sees server-side keys, and the server is assumed honest-but-curious in both NEXUS's and our threat model.
+
+**Q. Why doesn't multi-GPU speedup linearly?** Two reasons: (a) 12 heads don't divide evenly by 8/16/32 GPUs, so some GPUs run longer than others — the wall-clock is set by the most-loaded one. (b) Setup (key generation + streaming buffer allocation, ~47 s/node) runs once per node and doesn't parallelize across GPUs within a node.
+
+**Q. Why MPI for inter-node if NCCL is faster?** Our inter-node communication is 0.5% of runtime. Even a 10× faster transport would save 0.05% wall-clock. The simpler, more flexible API is the right engineering choice when performance isn't the binding constraint.
+
+**Q. Does this work for LLaMA-7B?** Our LLaMA-layer benchmark is one decoder block with 12 heads. A full LLaMA-7B has 32 layers × 32 heads. Per-layer cost at our hidden size is ~56 s on 4 GPUs; at LLaMA's actual hidden size (4096) the matmul cost would grow but bootstrap (93% of time) is independent of hidden size — so extrapolation suggests O(32 × 56 s) ≈ 30 min per token on 4×H100, vs Cerium's 134 s on their 8-GPU/custom-library setup.
+
+**Q. What would you do next with more time?** (i) LRU cache of the K most-recently-used keys on GPU — reduces streaming cost by 10–20× because bootstrap reuses keys predictably; (ii) fused-CoeffToSlot bootstrap kernel (currently top Nsight hotspot at 2.3%); (iii) port the hook to Cerium's FIDESlib when it becomes open-source, which would let us combine CPU streaming with their multi-GPU key distribution.
+
+### 8.11 Live-demo checklist
+
+If the committee asks for a demo:
+
+1. `ssh mn5-gpu` → `squeue -u $USER` (show MN5 access).
+2. `cat /gpfs/projects/etur02/hkanpak/logs/n65k_granular_38905181.out` — the granular BERT profile.
+3. `cat /gpfs/projects/etur02/hkanpak/logs/llama_granular_38905301.out` — the granular LLaMA profile.
+4. Optionally resubmit a 4-GPU job (~4 min wall): `sbatch /tmp/prof_n65k_granular.sh`.
+5. Open [`src/nexus_eval/galois_key_store.cuh`](src/nexus_eval/galois_key_store.cuh) and [`src/nexus_eval/ckks_evaluator.cuh`](src/nexus_eval/ckks_evaluator.cuh) — point at `ensure_key_loaded` to show the hook is three lines.
+
+The Nsight report (`nsight_n65k_4gpu.nsys-rep`) can be opened in Nsight Systems locally if the projection supports GUI.

@@ -24,6 +24,10 @@
 #include <vector>
 #include <memory>
 #include <stdexcept>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 #ifdef USE_MPI
 #include <mpi.h>
 #endif
@@ -115,6 +119,51 @@ public:
     void destroy();
     ~DistributedContext();
 
+    // ── Persistent rotation workspace (Phase 3 optimisation) ──
+    // Per-GPU device buffers reused across DKS rotations to avoid per-call
+    // cudaMalloc. Sized for the largest poly_bytes seen so far; grows on
+    // demand. Each GPU holds its own c0_gal and c2_gal slot — for the
+    // source GPU these point into the input poly directly (no copy needed
+    // when broadcast is the same buffer); for peer GPUs they hold the
+    // received broadcast.
+    struct RotationWorkspace {
+        std::vector<uint64_t*> c0_gal;       // [n_gpus] device buffers (or null on src)
+        std::vector<uint64_t*> c2_gal;       // [n_gpus] device buffers (or null on src)
+        size_t                 capacity = 0; // bytes per buffer
+        // Phase 4a: persistent per-GPU local PhantomCiphertext, sized for the
+        // last-seen chain_index. Reused across rotations; only reallocated
+        // when chain_index changes (which is rare during a single bootstrap).
+        std::vector<PhantomCiphertext> local_cts;
+        std::vector<size_t>            local_chain_index;  // tracks current size, ~0 = unallocated
+    };
+    RotationWorkspace &rotation_workspace() { return rot_ws_; }
+
+    // Ensure each GPU's c0_gal/c2_gal buffers are at least n_bytes.
+    // Idempotent and reentrant-safe (single-threaded use during rotation).
+    void ensure_rotation_workspace(size_t n_bytes);
+
+    // ── Phase 4b: persistent worker threads for DKS rotation ──
+    // One worker thread per GPU is spawned at DistributedContext::create() time
+    // and remains alive until destroy(). Each worker is pinned to its device
+    // (cudaSetDevice on thread startup) and loops waiting for work.
+    // dispatch_to_all_gpus submits one lambda per GPU and blocks until all
+    // workers report done. Eliminates std::thread spawn/join per rotation.
+    struct Worker {
+        std::thread             thread;
+        std::mutex              mtx;
+        std::condition_variable cv;
+        std::function<void()>   work;
+        std::exception_ptr      err;
+        bool                    has_work = false;
+        bool                    done     = false;
+        bool                    shutdown = false;
+        int                     device_id = -1;
+    };
+    // dispatch work[g] to worker[g] on GPU g, wait for all to finish.
+    // Re-throws first worker exception on the caller's thread.
+    void dispatch_to_all_gpus(std::vector<std::function<void()>> &work);
+    bool has_workers() const { return !workers_.empty(); }
+
 private:
     int n_gpus_ = 0;
     std::vector<int> device_ids_;
@@ -127,6 +176,10 @@ private:
     // Multi-node fields (0 if single-node)
     int total_gpus_          = 0;
     int global_rank_offset_  = 0;
+    // Phase 3: persistent rotation workspace
+    RotationWorkspace rot_ws_;
+    // Phase 4b: persistent worker threads (one per GPU)
+    std::vector<std::unique_ptr<Worker>> workers_;
 };
 
 // ---------------------------------------------------------------------------
@@ -173,6 +226,15 @@ public:
     // Free GPU memory
     void free_all();
     ~DistributedCiphertext();
+
+    // Move-only: raw GPU pointers cannot be safely shallow-copied.
+    // The user-declared destructor suppresses implicit move generation (C++ Rule of Five),
+    // so we must define them explicitly. Copy is deleted to prevent accidental double-free.
+    DistributedCiphertext() = default;
+    DistributedCiphertext(const DistributedCiphertext&) = delete;
+    DistributedCiphertext& operator=(const DistributedCiphertext&) = delete;
+    DistributedCiphertext(DistributedCiphertext&& other) noexcept;
+    DistributedCiphertext& operator=(DistributedCiphertext&& other) noexcept;
 
 private:
     std::vector<uint64_t*> local_data_;  // one buffer per GPU

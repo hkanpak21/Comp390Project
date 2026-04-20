@@ -148,6 +148,7 @@ target_include_directories(nexus_evaluators PUBLIC
     src/nexus_eval
     src/nexus_eval/bootstrapping
     src/nexus_eval/bootstrapping/common
+    src/util
     ${PHANTOM_ROOT}/include
     /gpfs/projects/etur02/hkanpak/local/include
     /usr/local/include
@@ -190,6 +191,7 @@ if(NCCL_FOUND)
         src/multi_gpu/comm
         src/multi_gpu/partition
         src/nexus_eval
+        src/util
         ${NCCL_INCLUDE_DIR}
         ${NEXUS_SEAL_INCLUDE}
         ${CUDAToolkit_INCLUDE_DIRS}

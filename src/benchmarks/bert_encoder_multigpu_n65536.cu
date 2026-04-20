@@ -18,6 +18,7 @@
 #include <thread>
 #include <sstream>
 #include <atomic>
+#include <mutex>
 #include <set>
 
 #include "context.cuh"
@@ -48,6 +49,32 @@ struct PerfTimer {
             chrono::high_resolution_clock::now() - t0).count();
     }
 };
+
+struct OpTimes {
+    double qkv_matmul = 0, qk_matmul = 0, softmax = 0, av_matmul = 0,
+           out_matmul = 0, bs1 = 0, ln1 = 0, bs2 = 0,
+           ffn1 = 0, gelu = 0, ffn2 = 0, bs3 = 0, ln2 = 0, bs4 = 0;
+    int heads = 0;
+    void add(const OpTimes &o) {
+        qkv_matmul += o.qkv_matmul; qk_matmul += o.qk_matmul; softmax += o.softmax;
+        av_matmul += o.av_matmul; out_matmul += o.out_matmul;
+        bs1 += o.bs1; ln1 += o.ln1; bs2 += o.bs2;
+        ffn1 += o.ffn1; gelu += o.gelu; ffn2 += o.ffn2; bs3 += o.bs3;
+        ln2 += o.ln2; bs4 += o.bs4; heads += o.heads;
+    }
+    double total() const {
+        return qkv_matmul + qk_matmul + softmax + av_matmul + out_matmul +
+               bs1 + ln1 + bs2 + ffn1 + gelu + ffn2 + bs3 + ln2 + bs4;
+    }
+};
+
+#define TIME_OP(field, code) do { \
+    cudaDeviceSynchronize(); \
+    PerfTimer _pt; _pt.start(); \
+    code; \
+    cudaDeviceSynchronize(); \
+    times.field += _pt.elapsed_ms(); \
+} while(0)
 
 int main(int argc, char **argv) {
     int n_gpus = 4, n_heads = 12, inner = 64, seq_len = 16;
@@ -150,6 +177,9 @@ int main(int argc, char **argv) {
     PerfTimer compute_timer, total_timer;
     total_timer.start();
 
+    OpTimes global_times;
+    mutex times_mtx;
+
     for (int g = 0; g < n_gpus; g++) {
         threads.emplace_back([&, g]() {
             cudaSetDevice(g);
@@ -207,61 +237,90 @@ int main(int argc, char **argv) {
             LNEvaluator ll(le);
             MMEvaluator lm(le);
 
+            OpTimes times;
+
             // Process assigned heads
             for (int h_idx : gpu_heads[g]) {
                 PhantomCiphertext ct;
                 { stringstream ss(ct_data[h_idx]); ct.load(ss); }
 
                 vector<PhantomCiphertext> xi = {ct}, q, k, v;
-                lm.matrix_mul_unified(xi, W_q, 1, q);
-                lm.matrix_mul_unified(xi, W_k, 1, k);
-                lm.matrix_mul_unified(xi, W_v, 1, v);
+                TIME_OP(qkv_matmul, {
+                    lm.matrix_mul_unified(xi, W_q, 1, q);
+                    lm.matrix_mul_unified(xi, W_k, 1, k);
+                    lm.matrix_mul_unified(xi, W_v, 1, v);
+                });
 
-                le.evaluator.mod_switch_to_inplace(k[0], q[0].chain_index());
-                k[0].set_scale(q[0].scale());
                 PhantomCiphertext as;
-                le.evaluator.multiply(q[0], k[0], as);
-                le.evaluator.relinearize_inplace(as, *le.relin_keys);
-                le.evaluator.rescale_to_next_inplace(as);
+                TIME_OP(qk_matmul, {
+                    le.evaluator.mod_switch_to_inplace(k[0], q[0].chain_index());
+                    k[0].set_scale(q[0].scale());
+                    le.evaluator.multiply(q[0], k[0], as);
+                    le.evaluator.relinearize_inplace(as, *le.relin_keys);
+                    le.evaluator.rescale_to_next_inplace(as);
+                });
 
                 PhantomCiphertext aw;
-                ls.softmax(as, aw, seq_len);
+                TIME_OP(softmax, { ls.softmax(as, aw, seq_len); });
 
-                le.evaluator.mod_switch_to_inplace(v[0], aw.chain_index());
-                v[0].set_scale(aw.scale());
                 PhantomCiphertext ao;
-                le.evaluator.multiply(aw, v[0], ao);
-                le.evaluator.relinearize_inplace(ao, *le.relin_keys);
-                le.evaluator.rescale_to_next_inplace(ao);
+                TIME_OP(av_matmul, {
+                    le.evaluator.mod_switch_to_inplace(v[0], aw.chain_index());
+                    v[0].set_scale(aw.scale());
+                    le.evaluator.multiply(aw, v[0], ao);
+                    le.evaluator.relinearize_inplace(ao, *le.relin_keys);
+                    le.evaluator.rescale_to_next_inplace(ao);
+                });
 
                 vector<PhantomCiphertext> pi = {ao}, po;
-                lm.matrix_mul_unified(pi, W_o, 1, po);
+                TIME_OP(out_matmul, { lm.matrix_mul_unified(pi, W_o, 1, po); });
 
-                while (po[0].coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(po[0]);
-                PhantomCiphertext b1; lb.bootstrap_3(b1, po[0]);
+                PhantomCiphertext b1;
+                TIME_OP(bs1, {
+                    while (po[0].coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(po[0]);
+                    lb.bootstrap_3(b1, po[0]);
+                });
 
-                PhantomCiphertext ln1o; ll.layer_norm(b1, ln1o, hidden);
-                while (ln1o.coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(ln1o);
-                PhantomCiphertext b2; lb.bootstrap_3(b2, ln1o);
+                PhantomCiphertext ln1o;
+                TIME_OP(ln1, { ll.layer_norm(b1, ln1o, hidden); });
+
+                PhantomCiphertext b2;
+                TIME_OP(bs2, {
+                    while (ln1o.coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(ln1o);
+                    lb.bootstrap_3(b2, ln1o);
+                });
 
                 vector<PhantomCiphertext> fi = {b2}, fo;
-                lm.matrix_mul_unified(fi, W_f1, 1, fo);
-                PhantomCiphertext go; lg.gelu(fo[0], go);
+                TIME_OP(ffn1, { lm.matrix_mul_unified(fi, W_f1, 1, fo); });
+
+                PhantomCiphertext go;
+                TIME_OP(gelu, { lg.gelu(fo[0], go); });
 
                 vector<PhantomCiphertext> f2i = {go}, f2o;
-                lm.matrix_mul_unified(f2i, W_f2, 1, f2o);
-                while (f2o[0].coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(f2o[0]);
-                PhantomCiphertext b3; lb.bootstrap_3(b3, f2o[0]);
+                TIME_OP(ffn2, { lm.matrix_mul_unified(f2i, W_f2, 1, f2o); });
 
-                PhantomCiphertext ln2o; ll.layer_norm(b3, ln2o, hidden);
-                while (ln2o.coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(ln2o);
-                PhantomCiphertext b4; lb.bootstrap_3(b4, ln2o);
+                PhantomCiphertext b3;
+                TIME_OP(bs3, {
+                    while (f2o[0].coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(f2o[0]);
+                    lb.bootstrap_3(b3, f2o[0]);
+                });
+
+                PhantomCiphertext ln2o;
+                TIME_OP(ln2, { ll.layer_norm(b3, ln2o, hidden); });
+
+                PhantomCiphertext b4;
+                TIME_OP(bs4, {
+                    while (ln2o.coeff_modulus_size() > 1) le.evaluator.mod_switch_to_next_inplace(ln2o);
+                    lb.bootstrap_3(b4, ln2o);
+                });
+                times.heads++;
                 printf("[GPU %d] head %d COMPLETE (out level=%zu)\n",
                        g, h_idx, b4.coeff_modulus_size());
                 fflush(stdout);
             }
 
             cudaDeviceSynchronize();
+            { lock_guard<mutex> lk(times_mtx); global_times.add(times); }
         });
     }
 
@@ -276,6 +335,40 @@ int main(int argc, char **argv) {
     printf("  Setup:   %8.1f ms\n", total_ms - compute_ms);
     printf("  Compute: %8.1f ms (pipeline parallelism)\n", compute_ms);
     printf("  Total:   %8.1f ms\n", total_ms);
+    printf("════════════════════════════════════════════════\n");
+
+    // ═══ Granular sub-op breakdown (summed across heads; divide by heads for per-head avg) ═══
+    int H = global_times.heads > 0 ? global_times.heads : 1;
+    double sum = global_times.total();
+    auto row = [&](const char *name, double v) {
+        printf("  %-18s %9.1f ms   %7.1f ms/head   %5.1f%%\n",
+               name, v, v / H, 100.0 * v / sum);
+    };
+    printf("\n─── Per-operation timing (summed across %d heads) ───\n", H);
+    row("QKV MatMul",    global_times.qkv_matmul);
+    row("Q*K^T MatMul",  global_times.qk_matmul);
+    row("Softmax",       global_times.softmax);
+    row("Attn*V MatMul", global_times.av_matmul);
+    row("Out MatMul",    global_times.out_matmul);
+    row("Bootstrap #1",  global_times.bs1);
+    row("LayerNorm #1",  global_times.ln1);
+    row("Bootstrap #2",  global_times.bs2);
+    row("FFN1 MatMul",   global_times.ffn1);
+    row("GELU",          global_times.gelu);
+    row("FFN2 MatMul",   global_times.ffn2);
+    row("Bootstrap #3",  global_times.bs3);
+    row("LayerNorm #2",  global_times.ln2);
+    row("Bootstrap #4",  global_times.bs4);
+    printf("  %-18s %9.1f ms   %7.1f ms/head   100.0%%\n",
+           "TOTAL (work)", sum, sum / H);
+    double bs_total = global_times.bs1 + global_times.bs2 + global_times.bs3 + global_times.bs4;
+    double mm_total = global_times.qkv_matmul + global_times.qk_matmul + global_times.av_matmul +
+                      global_times.out_matmul + global_times.ffn1 + global_times.ffn2;
+    double nl_total = global_times.softmax + global_times.gelu + global_times.ln1 + global_times.ln2;
+    printf("\n─── Category rollup ───\n");
+    printf("  Bootstraps (4×):  %8.1f ms   (%.1f%%)\n", bs_total, 100.0*bs_total/sum);
+    printf("  MatMuls (6×):     %8.1f ms   (%.1f%%)\n", mm_total, 100.0*mm_total/sum);
+    printf("  Non-linear (4×):  %8.1f ms   (%.1f%%)\n", nl_total, 100.0*nl_total/sum);
     printf("════════════════════════════════════════════════\n");
     return 0;
 }

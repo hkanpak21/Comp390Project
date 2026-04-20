@@ -7,10 +7,25 @@
 
 #include <algorithm>
 #include <iostream>
+#include <functional>
 
 #include "ckks_evaluator.cuh"
 #include "galois_key_store.cuh"
 #include "utils.cuh"
+#include "nvtx_tracer.cuh"
+
+// Forward declarations for the multi-GPU DKS path. We avoid #including the
+// multi_gpu headers here so nexus_evaluators stays decoupled from NCCL.
+class DistGaloisKeyStore;
+namespace nexus_multi_gpu {
+    class DistributedContext;
+    void dist_rotate_phantom_inplace(
+        DistributedContext       &ctx,
+        PhantomCiphertext        &ct,
+        int                       steps,
+        const ::DistGaloisKeyStore &key_store,
+        size_t                    key_idx);
+}
 
 using namespace phantom::arith;
 using namespace phantom::util;
@@ -32,6 +47,67 @@ void nexus::Evaluator::ensure_key_loaded(int steps, PhantomGaloisKey &galois_key
     }
     size_t idx = std::distance(elts.begin(), it);
     store->load_key_to_gpu(idx, galois_keys);
+}
+
+// Async prefetch sibling: kicks H→D for the next rotation's key without blocking.
+void nexus::Evaluator::prefetch_rotation_step(int steps, PhantomGaloisKey & /*galois_keys*/) {
+    NVTX_SCOPE_FMT("prefetch step=%d", steps);
+    if (!key_store_) return;
+    GaloisKeyStore *store = static_cast<GaloisKeyStore *>(key_store_);
+    uint32_t target_elt = context->key_galois_tool_->get_elt_from_step(steps);
+    auto &elts = context->key_galois_tool_->galois_elts();
+    auto it = std::find(elts.begin(), elts.end(), target_elt);
+    if (it == elts.end()) return;
+    store->prefetch(std::distance(elts.begin(), it));
+}
+
+// Helper: dispatch rotation through DKS path if enabled
+static bool try_dks_rotate_inplace(
+    void *dks_dctx, void *dks_key_store, void *dks_step_to_idx_fn,
+    PhantomCiphertext &ct, int steps)
+{
+    if (!dks_dctx || !dks_key_store || !dks_step_to_idx_fn) return false;
+    auto *dctx       = static_cast<nexus_multi_gpu::DistributedContext*>(dks_dctx);
+    auto *key_store  = static_cast<DistGaloisKeyStore*>(dks_key_store);
+    auto *fn         = static_cast<std::function<size_t(int)>*>(dks_step_to_idx_fn);
+    size_t key_idx   = (*fn)(steps);
+    nexus_multi_gpu::dist_rotate_phantom_inplace(*dctx, ct, steps, *key_store, key_idx);
+    return true;
+}
+
+void nexus::Evaluator::rotate_vector(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys, PhantomCiphertext &dest) {
+    NVTX_SCOPE_FMT("rotate_vector step=%d", steps);
+    if (dks_dctx_) {
+        dest = ct;
+        if (try_dks_rotate_inplace(dks_dctx_, dks_key_store_, dks_step_to_idx_fn_, dest, steps)) return;
+    }
+    if (key_store_) ensure_key_loaded(steps, galois_keys);
+    if (remote && remote->device_id >= 0) {
+        uint32_t elt = step_to_elt(steps, m_val);
+        if (remote->galois_elts.count(elt)) {
+            remote_rotate(ct, steps, false, dest);
+            return;
+        }
+    }
+    dest = ::rotate_vector(*context, ct, steps, galois_keys);
+}
+
+void nexus::Evaluator::rotate_vector_inplace(PhantomCiphertext &ct, int steps, PhantomGaloisKey &galois_keys) {
+    NVTX_SCOPE_FMT("rotate_inplace step=%d", steps);
+    if (dks_dctx_) {
+        if (try_dks_rotate_inplace(dks_dctx_, dks_key_store_, dks_step_to_idx_fn_, ct, steps)) return;
+    }
+    if (key_store_) ensure_key_loaded(steps, galois_keys);
+    if (remote && remote->device_id >= 0) {
+        uint32_t elt = step_to_elt(steps, m_val);
+        if (remote->galois_elts.count(elt)) {
+            PhantomCiphertext dest;
+            remote_rotate(ct, steps, false, dest);
+            ct = std::move(dest);
+            return;
+        }
+    }
+    ::rotate_vector_inplace(*context, ct, steps, galois_keys);
 }
 
 void CKKSEvaluator::print_decoded_pt(PhantomPlaintext &pt, int num) {

@@ -1,4 +1,5 @@
 #include "Bootstrapper.cuh"
+#include "nvtx_tracer.cuh"
 
 Bootstrapper::Bootstrapper(
     long _loge,
@@ -1885,6 +1886,11 @@ void Bootstrapper::bsgs_linear_transform(
       babyct[i - basicstart1] = cipher;
     else
       ckks->evaluator.rotate_vector(cipher, (Nh + i * basicstep) % Nh, *(ckks->galois_keys), babyct[i - basicstart1]);
+    // Prefetch next iteration's key on the copy stream — overlaps the rotate kernel above.
+    int next_i = i + 1;
+    if (next_i < basicstart1 + gs1 && next_i != 0) {
+      ckks->evaluator.prefetch_rotation_step((Nh + next_i * basicstep) % Nh, *(ckks->galois_keys));
+    }
   }
 
   for (int i = giantfirst1; i <= giantlast1; i++) {
@@ -1913,6 +1919,10 @@ void Bootstrapper::bsgs_linear_transform(
 
     if (i != 0) {
       ckks->evaluator.rotate_vector(giantct, (Nh + i * gs1 * basicstep) % Nh, *(ckks->galois_keys), tmptmpct);
+      // Prefetch the next giant rotation's key on the copy stream
+      if (i + 1 <= giantlast1 && i + 1 != 0) {
+        ckks->evaluator.prefetch_rotation_step((Nh + (i + 1) * gs1 * basicstep) % Nh, *(ckks->galois_keys));
+      }
       if (!tmpctbool) {
         tmpct = tmptmpct;
         tmpctbool = true;
@@ -1951,6 +1961,10 @@ void Bootstrapper::rotated_bsgs_linear_transform(
     } else {
       ckks->evaluator.rotate_vector(cipher, (Nh + i * basicstep) % Nh, *(ckks->galois_keys), babyct[i]);
     }
+    int next_i = i + 1;
+    if (next_i < gs2 && next_i != 0) {
+      ckks->evaluator.prefetch_rotation_step((Nh + next_i * basicstep) % Nh, *(ckks->galois_keys));
+    }
   }
 
   for (int i = 0; i <= giantlast2; i++) {
@@ -1979,6 +1993,9 @@ void Bootstrapper::rotated_bsgs_linear_transform(
 
     if (i != 0) {
       ckks->evaluator.rotate_vector(giantct, (Nh + i * gs2 * basicstep) % Nh, *(ckks->galois_keys), tmptmpct);
+      if (i + 1 <= giantlast2 && i + 1 != 0) {
+        ckks->evaluator.prefetch_rotation_step((Nh + (i + 1) * gs2 * basicstep) % Nh, *(ckks->galois_keys));
+      }
       if (!tmpctbool) {
         tmpct = tmptmpct;
         tmpctbool = true;
@@ -2016,6 +2033,10 @@ void Bootstrapper::bsgs_linear_transform_hoisting(
       babyct[i - basicstart1] = cipher;
     else
       ckks->evaluator.rotate_vector(cipher, (Nh + i * basicstep) % Nh, *(ckks->galois_keys), babyct[i - basicstart1]);
+    int next_i = i + 1;
+    if (next_i < basicstart1 + gs1 && next_i != 0) {
+      ckks->evaluator.prefetch_rotation_step((Nh + next_i * basicstep) % Nh, *(ckks->galois_keys));
+    }
   }
 
   for (int i = giantfirst1; i <= giantlast1; i++) {
@@ -2046,6 +2067,9 @@ void Bootstrapper::bsgs_linear_transform_hoisting(
 
     if (i != 0) {
       ckks->evaluator.rotate_vector(*giantct, (Nh + i * gs1 * basicstep) % Nh, *(ckks->galois_keys), tmptmpct);
+      if (i + 1 <= giantlast1 && i + 1 != 0) {
+        ckks->evaluator.prefetch_rotation_step((Nh + (i + 1) * gs1 * basicstep) % Nh, *(ckks->galois_keys));
+      }
       if (tmpct == 0) {
         tmpct = new PhantomCiphertext();
         *tmpct = tmptmpct;
@@ -2089,6 +2113,10 @@ void Bootstrapper::rotated_bsgs_linear_transform_hoisting(
     } else {
       ckks->evaluator.rotate_vector(cipher, (Nh + i * basicstep) % Nh, *(ckks->galois_keys), babyct[i]);
     }
+    int next_i = i + 1;
+    if (next_i < gs2 && next_i != 0) {
+      ckks->evaluator.prefetch_rotation_step((Nh + next_i * basicstep) % Nh, *(ckks->galois_keys));
+    }
   }
 
   for (int i = 0; i <= giantlast2; i++) {
@@ -2119,6 +2147,9 @@ void Bootstrapper::rotated_bsgs_linear_transform_hoisting(
 
     if (i != 0) {
       ckks->evaluator.rotate_vector(*giantct, (Nh + i * gs2 * basicstep) % Nh, *(ckks->galois_keys), tmptmpct);
+      if (i + 1 <= giantlast2 && i + 1 != 0) {
+        ckks->evaluator.prefetch_rotation_step((Nh + (i + 1) * gs2 * basicstep) % Nh, *(ckks->galois_keys));
+      }
       if (tmpct == 0) {
         tmpct = new PhantomCiphertext;
         *tmpct = tmptmpct;
@@ -2325,6 +2356,7 @@ void Bootstrapper::sfl_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher
 }
 
 void Bootstrapper::sfl_full_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher) {
+  NVTX_SCOPE("sfl_full_3");
   int div_part3 = floor(logn / 3.0);
   int div_part2 = floor((logn - div_part3) / 2.0);
   int div_part1 = logn - div_part3 - div_part2;
@@ -2469,6 +2501,7 @@ void Bootstrapper::sflinv_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cip
 }
 
 void Bootstrapper::sflinv_full_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher) {
+  NVTX_SCOPE("sflinv_full_3");
   int div_part1 = floor(logn / 3.0);
   int div_part2 = floor((logn - div_part1) / 2.0);
   int div_part3 = logn - div_part1 - div_part2;
@@ -2590,6 +2623,7 @@ void Bootstrapper::slottocoeff_full(PhantomCiphertext &rtncipher, PhantomCiphert
 
 // NOTE:
 void Bootstrapper::coefftoslot_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher) {
+  NVTX_SCOPE("coefftoslot_3");
   PhantomCiphertext tmpct1, tmpct2, tmpct3;
   sflinv_3(tmpct1, cipher);
   ckks->evaluator.complex_conjugate(tmpct1, *(ckks->galois_keys), tmpct2);
@@ -2631,6 +2665,7 @@ void Bootstrapper::coefftoslot_full_3(PhantomCiphertext &rtncipher1, PhantomCiph
   ckks->evaluator.add_reduced_error(tmpct2, tmpct3, rtncipher2);
 }
 void Bootstrapper::slottocoeff_full_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher1, PhantomCiphertext &cipher2) {
+  NVTX_SCOPE("slottocoeff_full_3");
   PhantomCiphertext tmpct1, tmpct2, tmpct3;
   complex<double> iunit(0.0, 1.0);
 
@@ -2996,6 +3031,7 @@ void Bootstrapper::bootstrap_full(PhantomCiphertext &rtncipher, PhantomCiphertex
 }
 
 void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphertext &cipher) {
+  NVTX_SCOPE("bootstrap_sparse_3");
   fprintf(stderr, "[BOOT] bootstrap_sparse_3 START\n"); fflush(stderr);
   // ModRaise
   modraise_inplace(cipher);

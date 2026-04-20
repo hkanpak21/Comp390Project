@@ -240,6 +240,82 @@ size_t DistributedContext::local_limbs(int gpu, size_t chain_index) const {
 // Cleanup
 // ---------------------------------------------------------------------------
 
+void DistributedContext::ensure_rotation_workspace(size_t n_bytes) {
+    if (n_bytes <= rot_ws_.capacity) return;
+    // First call: size the vectors. Otherwise free old buffers before resize.
+    if (rot_ws_.c0_gal.empty()) {
+        rot_ws_.c0_gal.assign(n_gpus_, nullptr);
+        rot_ws_.c2_gal.assign(n_gpus_, nullptr);
+    }
+    for (int g = 0; g < n_gpus_; g++) {
+        cudaSetDevice(device_ids_[g]);
+        if (rot_ws_.c0_gal[g]) cudaFree(rot_ws_.c0_gal[g]);
+        if (rot_ws_.c2_gal[g]) cudaFree(rot_ws_.c2_gal[g]);
+        cudaMalloc(&rot_ws_.c0_gal[g], n_bytes);
+        cudaMalloc(&rot_ws_.c2_gal[g], n_bytes);
+    }
+    cudaSetDevice(device_ids_[0]);
+    rot_ws_.capacity = n_bytes;
+
+    // Phase 4b: lazily spawn persistent workers on first rotation call.
+    // Spawned here (rather than in create()) so the worker threads inherit
+    // the same thread-local default_stream state the context was built with.
+    if (workers_.empty()) {
+        workers_.reserve(n_gpus_);
+        for (int g = 0; g < n_gpus_; g++) {
+            auto w = std::make_unique<Worker>();
+            w->device_id = device_ids_[g];
+            Worker *raw = w.get();
+            w->thread = std::thread([raw]() {
+                cudaSetDevice(raw->device_id);
+                while (true) {
+                    std::unique_lock<std::mutex> lock(raw->mtx);
+                    raw->cv.wait(lock, [raw]{ return raw->has_work || raw->shutdown; });
+                    if (raw->shutdown) break;
+                    auto fn = std::move(raw->work);
+                    raw->has_work = false;
+                    lock.unlock();
+                    try { fn(); } catch (...) { raw->err = std::current_exception(); }
+                    lock.lock();
+                    raw->done = true;
+                    lock.unlock();
+                    raw->cv.notify_one();
+                }
+            });
+            workers_.push_back(std::move(w));
+        }
+    }
+}
+
+void DistributedContext::dispatch_to_all_gpus(std::vector<std::function<void()>> &work) {
+    if ((int)workers_.size() < n_gpus_) {
+        // Fallback: should not happen since ensure_rotation_workspace spawns workers.
+        throw std::runtime_error("[DistributedContext] workers not initialized");
+    }
+    // Submit work to all workers
+    for (int g = 0; g < n_gpus_; g++) {
+        auto &w = *workers_[g];
+        {
+            std::lock_guard<std::mutex> lock(w.mtx);
+            w.work     = std::move(work[g]);
+            w.has_work = true;
+            w.done     = false;
+            w.err      = nullptr;
+        }
+        w.cv.notify_one();
+    }
+    // Wait for all to finish
+    for (int g = 0; g < n_gpus_; g++) {
+        auto &w = *workers_[g];
+        std::unique_lock<std::mutex> lock(w.mtx);
+        w.cv.wait(lock, [&]{ return w.done; });
+    }
+    // Re-throw first exception if any
+    for (int g = 0; g < n_gpus_; g++) {
+        if (workers_[g]->err) std::rethrow_exception(workers_[g]->err);
+    }
+}
+
 void DistributedContext::destroy() {
     if (destroyed_) return;
     destroyed_ = true;
@@ -249,6 +325,38 @@ void DistributedContext::destroy() {
         cudaSetDevice(device_ids_[g]);
         cudaDeviceSynchronize();
     }
+
+    // Phase 4b: shut down persistent worker threads BEFORE freeing any GPU
+    // resources the workers might still hold references to.
+    for (auto &w : workers_) {
+        if (!w) continue;
+        {
+            std::lock_guard<std::mutex> lock(w->mtx);
+            w->shutdown = true;
+        }
+        w->cv.notify_one();
+    }
+    for (auto &w : workers_) {
+        if (w && w->thread.joinable()) w->thread.join();
+    }
+    workers_.clear();
+
+    // Free persistent rotation workspace BEFORE contexts/streams are torn down.
+    // local_cts[g]'s PhantomCiphertext destructor calls cudaFreeAsync on the
+    // captured stream — that stream must still be alive at this point.
+    for (int g = 0; g < n_gpus_ && g < (int)rot_ws_.local_cts.size(); g++) {
+        cudaSetDevice(device_ids_[g]);
+        // PhantomCiphertext destructor runs when the slot is overwritten with default
+        rot_ws_.local_cts[g] = PhantomCiphertext();
+    }
+    rot_ws_.local_cts.clear();
+    rot_ws_.local_chain_index.clear();
+    for (int g = 0; g < n_gpus_ && g < (int)rot_ws_.c0_gal.size(); g++) {
+        cudaSetDevice(device_ids_[g]);
+        if (rot_ws_.c0_gal[g]) { cudaFree(rot_ws_.c0_gal[g]); rot_ws_.c0_gal[g] = nullptr; }
+        if (rot_ws_.c2_gal[g]) { cudaFree(rot_ws_.c2_gal[g]); rot_ws_.c2_gal[g] = nullptr; }
+    }
+    rot_ws_.capacity = 0;
 
     for (int g = 0; g < n_gpus_; g++) {
         cudaSetDevice(device_ids_[g]);
@@ -408,6 +516,46 @@ void DistributedCiphertext::free_all() {
 
 DistributedCiphertext::~DistributedCiphertext() {
     free_all();
+}
+
+// ---------------------------------------------------------------------------
+// DistributedCiphertext move semantics
+// ---------------------------------------------------------------------------
+// The user-declared destructor suppresses implicit move generation (C++ Rule of Five).
+// Without explicit moves, assignments like `dct = from_single_gpu(...)` fall back to
+// copy assignment (shallow pointer copy). The temporary's destructor then frees the
+// shared GPU buffers, leaving dct with dangling local_data_ pointers.
+// Fix: implement move constructor and move assignment that transfer ownership.
+
+DistributedCiphertext::DistributedCiphertext(DistributedCiphertext&& other) noexcept
+    : local_data_(std::move(other.local_data_)),
+      local_limb_counts_(std::move(other.local_limb_counts_)),
+      n_polys_(other.n_polys_),
+      chain_index_(other.chain_index_),
+      poly_degree_(other.poly_degree_),
+      total_limbs_(other.total_limbs_),
+      scale_(other.scale_),
+      is_ntt_form_(other.is_ntt_form_),
+      n_gpus_(other.n_gpus_)
+{
+    other.n_gpus_ = 0;  // prevent other's destructor from double-freeing
+}
+
+DistributedCiphertext& DistributedCiphertext::operator=(DistributedCiphertext&& other) noexcept {
+    if (this != &other) {
+        free_all();  // release existing GPU buffers before overwriting
+        local_data_       = std::move(other.local_data_);
+        local_limb_counts_= std::move(other.local_limb_counts_);
+        n_polys_      = other.n_polys_;
+        chain_index_  = other.chain_index_;
+        poly_degree_  = other.poly_degree_;
+        total_limbs_  = other.total_limbs_;
+        scale_        = other.scale_;
+        is_ntt_form_  = other.is_ntt_form_;
+        n_gpus_       = other.n_gpus_;
+        other.n_gpus_ = 0;  // prevent other's destructor from double-freeing
+    }
+    return *this;
 }
 
 } // namespace nexus_multi_gpu

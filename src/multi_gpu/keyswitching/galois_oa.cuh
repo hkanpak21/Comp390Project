@@ -50,6 +50,24 @@ void dist_rotate_output_aggregation(
 );
 
 /**
+ * dist_rotate_phantom_inplace
+ *
+ * Same Output Aggregation algorithm as dist_rotate_output_aggregation, but
+ * operates directly on a PhantomCiphertext that already lives on GPU 0 — no
+ * DistributedCiphertext scatter/gather. Intended for the streaming Bootstrapper
+ * which manipulates PhantomCiphertexts on GPU 0.
+ *
+ * The input ct is overwritten with the rotated result.
+ */
+void dist_rotate_phantom_inplace(
+    DistributedContext       &ctx,
+    PhantomCiphertext        &ct,
+    int                       steps,
+    const DistGaloisKeyStore &key_store,
+    size_t                    key_idx
+);
+
+/**
  * dist_relinearize_output_aggregation
  *
  * Relinearize a distributed ciphertext via Output Aggregation DKS.
