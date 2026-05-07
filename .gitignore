@@ -78,3 +78,4 @@ venv/
 .aws/credentials
 .env
 *.env
+vendor/phantom_old/
