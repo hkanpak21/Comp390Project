@@ -31,11 +31,16 @@ partition (4× H100 64GB SXM per node, NVSwitch).
 
 **Local Mac** (primary working tree):
 ```
-/Users/halilibrahimkanpak/Documents/COURSES/SPRING2026/Comp390/Comp390Project/
+/Users/a90/Documents/COURSES/SPRING2026/Comp390/Comp390Project/
 ├── multiNEXUS.md              ← main writeup, all results, tables 4.1/4.2
-├── HANDOFF.md                 ← THIS FILE
 ├── TRACING.md                 ← how to use NVTX + Nsight Systems
+├── CLAUDE.md                  ← auto-loaded Claude context (session start)
 ├── CMakeLists.txt
+├── docs/                      ← session documentation
+│   ├── HANDOFF.md             ← THIS FILE
+│   ├── RESULTS_SUMMARY.md     ← all 10 measurement tables + prior-art comparison
+│   ├── PI_BRIEFING.md         ← advisor walkthrough with Mermaid diagrams
+│   └── NSIGHT_GUIDE.md        ← how to open and read Nsight traces
 ├── src/
 │   ├── nexus_eval/            ← single-GPU FHE evaluator (CKKS ops, Bootstrapper)
 │   │   ├── ckks_evaluator.{cu,cuh}      ← Evaluator class, rotate dispatch
@@ -54,16 +59,16 @@ partition (4× H100 64GB SXM per node, NVSwitch).
 │   ├── util/nvtx_tracer.cuh   ← NVTX RAII macros (NVTX_SCOPE)
 │   └── ...
 ├── scripts/mn5/               ← SLURM job templates
-│   ├── slurm_bert_dks_rot.sh  ← MAIN A/B test (DKS_ROTATE=0 vs =1)
-│   ├── slurm_trace_nsys.sh    ← captures Nsight Systems traces
-│   ├── slurm_boot_prefetch.sh ← single-GPU bootstrap timing test
+│   ├── slurm_bert_dks.sh      ← MAIN A/B test (DKS_ROTATE=0 vs =1)
+│   ├── slurm_bootstrap_n65536.sh ← single-GPU bootstrap timing test
 │   └── ...
+├── profiling/                 ← Nsight Systems / Nsight Compute run scripts
 ├── vendor/
 │   ├── phantom/               ← Phantom FHE library (modified, NOT git-cloned vanilla)
 │   └── nexus/                 ← reference NEXUS implementation
-└── ~/nexus-traces/            ← (NOT in repo) — local Nsight .nsys-rep files
-    ├── trace_dksrot.nsys-rep  ← DKS_ROTATE=1 timeline (30 MB)
-    └── trace_prefetch.nsys-rep ← DKS_ROTATE=0 timeline (25 MB)
+└── ~/nexus-traces/            ← (NOT in repo) — local Nsight .nsys-rep files (13 traces)
+    ├── trace_dksrot.nsys-rep  ← DKS_ROTATE=1 champion timeline (30 MB, Apr 19)
+    └── trace_prefetch.nsys-rep ← DKS_ROTATE=0 comparison timeline (25 MB, Apr 19)
 ```
 
 **MN5** (`ssh mn5-gpu`, user `koc971580`):
@@ -165,9 +170,9 @@ The traces showed the right next steps:
 ```bash
 ssh mn5-gpu
 cd /gpfs/projects/etur02/hkanpak/Comp390Project
-sbatch scripts/mn5/slurm_bert_dks_rot.sh   # runs both DKS_ROTATE=0 and =1
+sbatch scripts/mn5/slurm_bert_dks.sh   # runs both DKS_ROTATE=0 and =1
 # wait ~10 min, then
-cat /gpfs/projects/etur02/hkanpak/logs/bertdksrot_<JOBID>.out
+cat /gpfs/projects/etur02/hkanpak/logs/bert_dks_<JOBID>.out
 ```
 
 ### Edit code locally, push to MN5, rebuild
@@ -185,15 +190,26 @@ ssh mn5-gpu "module purge; module load cuda/12.8 cmake/3.30.5 nccl/2.24.3-1; \
 
 ### Generate a new Nsight Systems trace
 ```bash
-ssh mn5-gpu "cd /gpfs/projects/etur02/hkanpak/Comp390Project && sbatch scripts/mn5/slurm_trace_nsys.sh"
-# wait ~15 min, then on local Mac:
-rsync -avz mn5-gpu:/gpfs/projects/etur02/hkanpak/Comp390Project/traces/*.nsys-rep ~/nexus-traces/
-open -a "Nsight Systems" ~/nexus-traces/trace_dksrot.nsys-rep
+ssh mn5-gpu
+cd /gpfs/projects/etur02/hkanpak/Comp390Project
+salloc --qos=acc_debug --account=etur02 --gres=gpu:4 --time=00:30:00 bash -lc '
+  module purge && module load cuda/12.8 nccl/2.24.3-1 && mkdir -p traces
+  for MODE in 0 1; do
+    DKS_ROTATE=$MODE nsys profile \
+      --trace=cuda,nvtx,osrt,nccl \
+      --capture-range=nvtx --nvtx-capture=bootstrap_sparse_3 \
+      --output=traces/trace_$([ $MODE = 0 ] && echo prefetch || echo dksrot) \
+      --force-overwrite=true ./build/bin/bert_dks_multigpu 4
+  done
+'
+# Pull to local Mac:
+rsync -avh mn5-gpu:/gpfs/projects/etur02/hkanpak/Comp390Project/traces/*.nsys-rep ~/nexus-traces/
+open -a "NVIDIA Nsight Systems" ~/nexus-traces/trace_dksrot.nsys-rep
 ```
 
 ### Run the standalone bootstrap test (single-GPU, MAE check)
 ```bash
-sbatch /gpfs/projects/etur02/hkanpak/Comp390Project/scripts/mn5/slurm_boot_prefetch.sh
+sbatch /gpfs/projects/etur02/hkanpak/Comp390Project/scripts/mn5/slurm_bootstrap_n65536.sh
 # expected: bootstrap MAE = 2.25e-6 PASS, time ~2.3 s (with prefetch)
 ```
 
@@ -317,5 +333,5 @@ ssh mn5-gpu "ls -la /gpfs/projects/etur02/hkanpak/Comp390Project/build/bin/bert_
 ---
 
 **End of handoff.** Drop this entire file as the first message of a new Claude Code
-session in `/Users/halilibrahimkanpak/Documents/COURSES/SPRING2026/Comp390/Comp390Project/`
-and ask "what's next?". The new session will have full context.
+session in `/Users/a90/Documents/COURSES/SPRING2026/Comp390/Comp390Project/` —
+CLAUDE.md auto-loads context. Drop this file for full detail.

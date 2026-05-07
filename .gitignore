@@ -76,3 +76,5 @@ venv/
 # AWS credentials / secrets — NEVER commit these
 *.pem
 .aws/credentials
+.env
+*.env
