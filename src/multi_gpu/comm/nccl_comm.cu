@@ -44,6 +44,9 @@ MultiGpuContext MultiGpuContext::create(const std::vector<int> &dev_ids) {
     ctx.device_ids  = dev_ids;
     ctx.comms.resize(ctx.n_gpus);
     ctx.streams.resize(ctx.n_gpus);
+    ctx.ready_events.resize(ctx.n_gpus);
+    ctx.allreduce_done_events.resize(ctx.n_gpus);
+    ctx.oa_done_events.resize(ctx.n_gpus);
 
     // ncclCommInitAll initializes one communicator per device in a single call.
     NCCL_CHECK(ncclCommInitAll(ctx.comms.data(), ctx.n_gpus, dev_ids.data()));
@@ -52,6 +55,13 @@ MultiGpuContext MultiGpuContext::create(const std::vector<int> &dev_ids) {
     for (int g = 0; g < ctx.n_gpus; ++g) {
         CUDA_CHECK(cudaSetDevice(dev_ids[g]));
         CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.streams[g], cudaStreamNonBlocking));
+        // T-STRAGGLER / T-OVERLAP: per-GPU events used as GPU-side barriers around
+        // ncclAllReduce. cudaEventDisableTiming reduces overhead (we never query elapsed time).
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.ready_events[g], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.allreduce_done_events[g], cudaEventDisableTiming));
+        // T-OVERLAP: end-of-OA event used as cross-stream signal to the writeback
+        // memcpy on stream0 in galois_oa.cu (replaces trailing cudaStreamSynchronize).
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.oa_done_events[g], cudaEventDisableTiming));
     }
 
     return ctx;
@@ -60,9 +70,24 @@ MultiGpuContext MultiGpuContext::create(const std::vector<int> &dev_ids) {
 void MultiGpuContext::destroy() {
     for (int g = 0; g < n_gpus; ++g) {
         cudaSetDevice(device_ids[g]);
+        if (g < (int)ready_events.size() && ready_events[g]) {
+            cudaEventDestroy(ready_events[g]);
+            ready_events[g] = nullptr;
+        }
+        if (g < (int)allreduce_done_events.size() && allreduce_done_events[g]) {
+            cudaEventDestroy(allreduce_done_events[g]);
+            allreduce_done_events[g] = nullptr;
+        }
+        if (g < (int)oa_done_events.size() && oa_done_events[g]) {
+            cudaEventDestroy(oa_done_events[g]);
+            oa_done_events[g] = nullptr;
+        }
         cudaStreamDestroy(streams[g]);
         ncclCommDestroy(comms[g]);
     }
+    ready_events.clear();
+    allreduce_done_events.clear();
+    oa_done_events.clear();
     comms.clear();
     streams.clear();
 }

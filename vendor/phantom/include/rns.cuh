@@ -155,6 +155,20 @@ namespace phantom {
         void modup(uint64_t *dst, const uint64_t *cks, const DNTTTable &ntt_tables,
                    const scheme_type &scheme, const cudaStream_t &stream) const;
 
+        // T-MODUP (per-digit modulus raising):
+        // Like `modup`, but only computes the digit range [d_start, d_start + d_count)
+        // and writes them CONTIGUOUSLY into `dst` at slots [0, d_count).
+        //
+        // Layout: dst is sized for d_count digits (d_count * size_QlP_n uint64_t).
+        // Slot i in dst (i in [0, d_count)) holds the modup output for global digit
+        // d_start + i.
+        //
+        // Caller must ensure 0 <= d_start, d_start + d_count <= beta.
+        // d_count == 0 is a no-op.
+        void modup_partial(uint64_t *dst, const uint64_t *cks, const DNTTTable &ntt_tables,
+                           const scheme_type &scheme, size_t d_start, size_t d_count,
+                           const cudaStream_t &stream) const;
+
         void moddown(uint64_t *ct_i, uint64_t *cx_i, const DNTTTable &ntt_tables,
                      const scheme_type &scheme, const cudaStream_t &stream) const;
 

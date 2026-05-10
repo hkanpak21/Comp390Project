@@ -527,6 +527,37 @@ __global__ static void modup_copy_partQl_kernel(uint64_t *t_mod_up, const uint64
     }
 }
 
+// T-MODUP partial variant: copies the part-Ql slice for global digit indices in
+// [d_start, d_start + d_count) into a CONTIGUOUS dst layout: local slot i holds
+// the slice for global digit d_start + i. Used by modup_partial.
+//
+// Indexing:
+//   global limb of slice for global digit (d_start + local) = (d_start + local) * size_alpha_n + j
+//                                                              for j in [0, size_alpha_n)
+//   destination slot for global digit (d_start + local)     = local * size_QlP_n + (d_start + local) * size_alpha_n + j
+//   (mirroring the full-modup layout, where slot beta_idx places its part-Ql
+//    data starting at offset beta_idx * size_alpha_n within that slot's QlP rows)
+__global__ static void modup_copy_partQl_partial_kernel(uint64_t *t_mod_up, const uint64_t *cks,
+                                                        size_t size_alpha_n,
+                                                        size_t size_QlP_n,
+                                                        size_t size_Ql_n,
+                                                        size_t d_start,
+                                                        size_t d_count,
+                                                        size_t total_elems) {
+    for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x; tid < total_elems; tid += blockDim.x * gridDim.x) {
+        const size_t local_beta = tid / size_alpha_n;          // 0..d_count-1
+        const size_t inner      = tid % size_alpha_n;          // 0..size_alpha_n-1
+        const size_t global_beta = d_start + local_beta;
+        const size_t src_idx = global_beta * size_alpha_n + inner;
+        // Last-digit short-tail: when size_Ql is not a multiple of alpha, the
+        // last digit (global_beta == beta - 1) has size_PartQl < alpha valid
+        // limbs. Reads past size_Ql_n would hit unmapped memory; skip them.
+        if (src_idx >= size_Ql_n) continue;
+        const size_t dst_idx = local_beta * size_QlP_n + global_beta * size_alpha_n + inner;
+        t_mod_up[dst_idx] = cks[src_idx];
+    }
+}
+
 void DRNSTool::modup(uint64_t *dst, const uint64_t *cks, const DNTTTable &ntt_tables, const scheme_type &scheme,
                      const cudaStream_t &stream) const {
     size_t n = n_;
@@ -572,6 +603,158 @@ void DRNSTool::modup(uint64_t *dst, const uint64_t *cks, const DNTTTable &ntt_ta
         const uint64_t *cks_part_i = cks + startPartIdx * n;
         uint64_t *t_cks_part_i = t_cks.get() + startPartIdx * n;
         uint64_t *t_modup_part_i = dst + beta_idx * size_QlP_n;
+
+        if (alpha == 1) {
+            uint64_t gridDimGlb = n * size_QlP / blockDimGlb.x;
+
+            if (scheme == scheme_type::ckks || scheme == scheme_type::bgv) {
+                modup_bconv_single_p_kernel<<<gridDimGlb, blockDimGlb, 0, stream>>>(
+                        t_modup_part_i, cks_part_i, t_cks.get() + startPartIdx * n,
+                        startPartIdx, n, base_QlP_.base(), size_QlP);
+            } else if (scheme == scheme_type::bfv) {
+                modup_bconv_single_p_kernel<<<gridDimGlb, blockDimGlb, 0, stream>>>(
+                        t_modup_part_i, cks_part_i, cks_part_i,
+                        startPartIdx, n, base_QlP_.base(), size_QlP);
+            } else {
+                throw invalid_argument("unsupported scheme");
+            }
+        } else {
+            auto &base_part_Ql_to_compl_part_QlP_conv = v_base_part_Ql_to_compl_part_QlP_conv_[beta_idx];
+
+            auto &ibase = base_part_Ql_to_compl_part_QlP_conv.ibase();
+            auto &obase = base_part_Ql_to_compl_part_QlP_conv.obase();
+            const auto qiHat_mod_pj = base_part_Ql_to_compl_part_QlP_conv.QHatModp();
+            const size_t ibase_size = ibase.size();
+            const size_t obase_size = obase.size();
+            uint64_t gridDimGlb;
+
+            // bfv need to scale while ckks and bgv already scaled
+            if (scheme == scheme_type::bfv) {
+                gridDimGlb = n * ibase_size / blockDimGlb.x;
+                bconv_mult_kernel<<<gridDimGlb, blockDimGlb, 0, stream>>>(
+                        t_cks_part_i, cks_part_i, ibase.QHatInvModq(),
+                        ibase.QHatInvModq_shoup(), ibase.base(), ibase_size, n);
+            }
+
+            constexpr int unroll_factor = 2;
+            gridDimGlb = n * obase_size / blockDimGlb.x / unroll_factor;
+            bconv_matmul_padded_unroll2_kernel<<<
+            gridDimGlb, blockDimGlb, sizeof(uint64_t) * obase_size * ibase_size, stream>>>(
+                    t_modup_part_i, t_cks_part_i, qiHat_mod_pj, ibase.base(), ibase_size, obase.base(), obase_size, n,
+                    startPartIdx, size_PartQl);
+        }
+
+        if (scheme == scheme_type::ckks || scheme == scheme_type::bgv) {
+            // some part of t_mod_up_i is already in NTT domain, no need to perform NTT
+            nwt_2d_radix8_forward_inplace_include_special_mod_exclude_range(
+                    t_modup_part_i, ntt_tables, size_QlP, 0,
+                    size_QP, size_P, startPartIdx, endPartIdx, stream);
+        } else if (scheme == scheme_type::bfv) {
+            nwt_2d_radix8_forward_inplace_include_special_mod(
+                    t_modup_part_i, ntt_tables, size_QlP, 0, size_QP, size_P, stream);
+        } else {
+            throw invalid_argument("unsupported scheme");
+        }
+    }
+}
+
+// =============================================================================
+// modup_partial — T-MODUP (per-digit modulus raising)
+// =============================================================================
+// Contract:
+//   * dst    : caller-allocated, sized for d_count digits = d_count * size_QlP_n
+//              uint64_t. Layout 1 (CONTIGUOUS): local slot i in [0, d_count)
+//              holds the modup output for global digit (d_start + i).
+//   * cks    : the input polynomial in base Ql (NTT domain for CKKS/BGV). Same
+//              shape and contents as for the full `modup` — full size_Ql limbs.
+//              We read only the limbs corresponding to global digits in
+//              [d_start, d_start + d_count); the other limbs are untouched.
+//   * d_start, d_count : digit subrange (global indices). Must satisfy
+//                        d_start + d_count <= beta. d_count == 0 is a no-op.
+//
+// Implementation mirrors `modup` line-for-line, except the digit loop is
+// restricted to [d_start, d_start + d_count) and the per-digit destination
+// pointer becomes `dst + (beta_idx - d_start) * size_QlP_n`.
+//
+// The two pre-loop steps that operate over multiple digits at once (the
+// inverse-NTT into t_cks and the part-Ql copy into the dst slot lower-Ql rows)
+// are also restricted to the owned digit range.
+// =============================================================================
+void DRNSTool::modup_partial(uint64_t *dst, const uint64_t *cks, const DNTTTable &ntt_tables,
+                             const scheme_type &scheme,
+                             size_t d_start, size_t d_count,
+                             const cudaStream_t &stream) const {
+    if (d_count == 0) return;
+
+    size_t n = n_;
+    size_t size_Ql = base_Ql_.size();
+    size_t size_P = size_P_;
+    size_t size_QlP = size_Ql + size_P_;
+    size_t size_QP = size_QP_;
+
+    auto size_Ql_n = size_Ql * n;
+    auto size_QlP_n = size_QlP * n;
+
+    size_t alpha = size_P;
+    size_t beta = v_base_part_Ql_to_compl_part_QlP_conv_.size();
+
+    if (d_start >= beta || d_start + d_count > beta) {
+        throw std::invalid_argument("modup_partial: digit range out of bounds");
+    }
+
+    // Allocate t_cks at full size_Ql_n — it's only ~19 MB and lets us reuse
+    // the existing iNTT signature and partQlHatInv concat addressing without
+    // pointer-juggling. Only the slice we touch is meaningful.
+    auto t_cks = make_cuda_auto_ptr<uint64_t>(size_Ql_n, stream);
+
+    // Limb range covered by the owned digits: [d_start*alpha, (d_start+d_count)*alpha).
+    // This is (almost always) exactly d_count*alpha limbs — except the *last*
+    // global digit may be shorter than alpha. If our owned range includes that
+    // last digit, we trim coeff_limbs accordingly.
+    size_t limb_start = d_start * alpha;
+    size_t limb_end_full = (d_start + d_count) * alpha;
+    if (limb_end_full > size_Ql) limb_end_full = size_Ql; // last digit short tail
+    size_t coeff_limbs = limb_end_full - limb_start;
+
+    // cks is in NTT domain, t_cks is in normal domain
+    if (alpha == 1) {
+        // In CKKS and BGV t_target is in NTT form; switch back to normal form
+        if (scheme == scheme_type::ckks || scheme == scheme_type::bgv) {
+            // no need to multiply qiHatInv_mod_qi; restrict to owned limbs.
+            nwt_2d_radix8_backward(t_cks.get(), cks, ntt_tables, coeff_limbs, limb_start, stream);
+            // copy partQl to t_mod_up is fused with modup_bconv_single_p_kernel
+        }
+    } else {
+        // In CKKS and BGV t_target is in NTT form; switch back to normal form
+        if (scheme == scheme_type::ckks || scheme == scheme_type::bgv) {
+            // fuse with base converter kernel 1 (multiply qiHatInv_mod_qi).
+            // partQlHatInv_mod_Ql_concat_ is a flat size_Ql array indexed by
+            // limb (digit-major), so it covers limb_start..limb_end_full directly.
+            nwt_2d_radix8_backward_scale(t_cks.get(), cks, ntt_tables, coeff_limbs, limb_start,
+                                         partQlHatInv_mod_Ql_concat_.get(),
+                                         partQlHatInv_mod_Ql_concat_shoup_.get(), stream);
+        }
+
+        // copy partQl to t_mod_up — partial variant for CONTIGUOUS local layout
+        size_t alpha_n = alpha * n;
+        // Iterate over a flat range of d_count*alpha_n; the kernel internally
+        // skips indices that fall past size_Ql_n (last-digit short-tail).
+        size_t total_elems = d_count * alpha_n;
+        size_t size_Ql_n_local = size_Ql * n;
+        modup_copy_partQl_partial_kernel<<<
+            (total_elems + blockDimGlb.x - 1) / blockDimGlb.x, blockDimGlb, 0, stream>>>(
+                dst, cks, alpha_n, size_QlP_n, size_Ql_n_local, d_start, d_count, total_elems);
+    }
+
+    for (size_t beta_idx = d_start; beta_idx < d_start + d_count; beta_idx++) {
+        const size_t startPartIdx = alpha * beta_idx;
+        const size_t size_PartQl = (beta_idx == beta - 1) ? (size_Ql - alpha * (beta - 1)) : alpha;
+        const size_t endPartIdx = startPartIdx + size_PartQl;
+
+        const uint64_t *cks_part_i = cks + startPartIdx * n;
+        uint64_t *t_cks_part_i = t_cks.get() + startPartIdx * n;
+        // CONTIGUOUS local layout: write at local slot (beta_idx - d_start).
+        uint64_t *t_modup_part_i = dst + (beta_idx - d_start) * size_QlP_n;
 
         if (alpha == 1) {
             uint64_t gridDimGlb = n * size_QlP / blockDimGlb.x;

@@ -10,8 +10,10 @@
  *   result = sum_{d=0}^{beta-1} modup(c2, d) * evk[d]
  *
  * Output Aggregation distributes this across GPUs:
- *   1. Each GPU g processes digits d where d % n_gpus == g:
- *        partial_g = sum_{d: d%n==g} modup(c2_local, d) * evk[d]
+ *   1. Each GPU g processes a CONTIGUOUS range of digits [g*beta/P, (g+1)*beta/P):
+ *        partial_g = sum_{d in [d_start, d_start+d_count)} modup(c2_local, d) * evk[d]
+ *      (After T-MODUP, mod-up itself is restricted to the owned digit range —
+ *       both NTT work and t_mod_up allocation drop by 1/P.)
  *   2. ReduceScatter: partial sums across GPUs → each GPU gets its local slice.
  *      (Or AllReduce if we want every GPU to have the full result.)
  *
@@ -86,7 +88,8 @@ void keyswitching_output_aggregation(
  *
  * @param custom_evks  Device array of beta uint64_t* pointers.
  *                     Owned digit slots are valid; unowned slots are null.
- *                     The partial kernel only accesses owned slots (strided loop).
+ *                     The partial kernel only accesses the contiguous owned
+ *                     range [d_start, d_start + d_count).
  */
 void keyswitching_output_aggregation_dks(
     MultiGpuContext       &ctx,

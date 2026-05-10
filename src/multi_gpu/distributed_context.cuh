@@ -164,6 +164,17 @@ public:
     void dispatch_to_all_gpus(std::vector<std::function<void()>> &work);
     bool has_workers() const { return !workers_.empty(); }
 
+    // T-STRAGGLER / T-OVERLAP: persistent per-GPU events used as GPU-side
+    // barriers around ncclAllReduce in keyswitching_output_aggregation_dks.
+    // Created in DistributedContext::create() with cudaEventDisableTiming and
+    // shallow-copied into the per-call MultiGpuContext built by galois_oa.cu.
+    const std::vector<cudaEvent_t>& ready_events()         const { return ready_events_; }
+    const std::vector<cudaEvent_t>& allreduce_done_events() const { return allreduce_done_events_; }
+    // T-OVERLAP: end-of-OA events recorded after oa_add_to_ct in
+    // keyswitching_output_aggregation_dks. Waited on by the rotation caller's
+    // writeback memcpy (on stream0) so we can drop the trailing host sync.
+    const std::vector<cudaEvent_t>& oa_done_events()        const { return oa_done_events_; }
+
 private:
     int n_gpus_ = 0;
     std::vector<int> device_ids_;
@@ -171,6 +182,18 @@ private:
     std::vector<ncclComm_t> comms_;
     std::vector<cudaStream_t> streams_;
     std::vector<GpuKeySet> key_sets_;
+    // T-STRAGGLER / T-OVERLAP: per-GPU CUDA events (cudaEventDisableTiming).
+    // ready_events_ is recorded after partial_key_switch_inner_prod and waited
+    // on before ncclAllReduce. allreduce_done_events_ is recorded after the
+    // ncclAllReduce enqueue (replaces the cudaStreamSynchronize that previously
+    // blocked the CPU and prevented overlap with the next rotation's modup).
+    std::vector<cudaEvent_t> ready_events_;
+    std::vector<cudaEvent_t> allreduce_done_events_;
+    // T-OVERLAP: per-GPU events recorded at the END of
+    // keyswitching_output_aggregation_dks (after oa_add_to_ct), replacing the
+    // trailing cudaStreamSynchronize. Used as a cross-stream gate for the
+    // rotation caller's writeback memcpy on stream0.
+    std::vector<cudaEvent_t> oa_done_events_;
     phantom::EncryptionParameters parms_;
     bool destroyed_ = false;
     // Multi-node fields (0 if single-node)

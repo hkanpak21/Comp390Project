@@ -66,11 +66,22 @@ DistributedContext DistributedContext::create(
     ctx.comms_.resize(n_gpus);
     NCCL_CHECK(ncclCommInitAll(ctx.comms_.data(), n_gpus, ctx.device_ids_.data()));
 
-    // Create per-GPU streams
+    // Create per-GPU streams + GPU-side barrier events (T-STRAGGLER, T-OVERLAP).
+    // ready_events_: recorded after partial_key_switch_inner_prod, waited on
+    //                before ncclAllReduce so all 4 streams arrive simultaneously.
+    // allreduce_done_events_: recorded after ncclAllReduce (replaces the
+    //                blocking cudaStreamSynchronize that prevented next-rotation
+    //                modup from overlapping with this rotation's AllReduce).
     ctx.streams_.resize(n_gpus);
+    ctx.ready_events_.resize(n_gpus);
+    ctx.allreduce_done_events_.resize(n_gpus);
+    ctx.oa_done_events_.resize(n_gpus);
     for (int g = 0; g < n_gpus; g++) {
         CUDA_CHECK(cudaSetDevice(ctx.device_ids_[g]));
         CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.streams_[g], cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.ready_events_[g], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.allreduce_done_events_[g], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.oa_done_events_[g], cudaEventDisableTiming));
     }
 
     // Enable peer access between all GPU pairs
@@ -154,11 +165,17 @@ DistributedContext DistributedContext::create_multinode(
     }
     NCCL_CHECK(ncclGroupEnd());
 
-    // ── Per-GPU streams ──
+    // ── Per-GPU streams + barrier events (T-STRAGGLER, T-OVERLAP) ──
     ctx.streams_.resize(gpus_per_node);
+    ctx.ready_events_.resize(gpus_per_node);
+    ctx.allreduce_done_events_.resize(gpus_per_node);
+    ctx.oa_done_events_.resize(gpus_per_node);
     for (int g = 0; g < gpus_per_node; g++) {
         CUDA_CHECK(cudaSetDevice(g));
         CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.streams_[g], cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.ready_events_[g], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.allreduce_done_events_[g], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.oa_done_events_[g], cudaEventDisableTiming));
     }
 
     // ── Enable intra-node peer access ──
@@ -360,11 +377,24 @@ void DistributedContext::destroy() {
 
     for (int g = 0; g < n_gpus_; g++) {
         cudaSetDevice(device_ids_[g]);
+        // T-STRAGGLER / T-OVERLAP: destroy barrier events before their stream.
+        if (g < (int)ready_events_.size() && ready_events_[g]) {
+            cudaEventDestroy(ready_events_[g]); ready_events_[g] = nullptr;
+        }
+        if (g < (int)allreduce_done_events_.size() && allreduce_done_events_[g]) {
+            cudaEventDestroy(allreduce_done_events_[g]); allreduce_done_events_[g] = nullptr;
+        }
+        if (g < (int)oa_done_events_.size() && oa_done_events_[g]) {
+            cudaEventDestroy(oa_done_events_[g]); oa_done_events_[g] = nullptr;
+        }
         if (streams_[g]) { cudaStreamDestroy(streams_[g]); streams_[g] = nullptr; }
         if (comms_[g])   { ncclCommDestroy(comms_[g]);     comms_[g] = nullptr; }
         if (key_sets_[g].relin_key_data) { cudaFree(key_sets_[g].relin_key_data); key_sets_[g].relin_key_data = nullptr; }
         if (key_sets_[g].relin_key_ptrs) { cudaFree(key_sets_[g].relin_key_ptrs); key_sets_[g].relin_key_ptrs = nullptr; }
     }
+    ready_events_.clear();
+    allreduce_done_events_.clear();
+    oa_done_events_.clear();
 
     // PhantomContext objects for GPU g > 0 hold CudaAutoPtr members that captured
     // a stream handle which was destroyed when GPU 0's context was created last

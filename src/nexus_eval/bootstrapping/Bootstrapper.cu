@@ -1882,6 +1882,7 @@ void Bootstrapper::bsgs_linear_transform(
   PhantomCiphertext addtmp1, addtmp2;
 
   for (int i = basicstart1; i < basicstart1 + gs1; i++) {
+    NVTX_SCOPE_FMT("bsgs_baby_step i=%d", i);
     if (i == 0)
       babyct[i - basicstart1] = cipher;
     else
@@ -1894,6 +1895,7 @@ void Bootstrapper::bsgs_linear_transform(
   }
 
   for (int i = giantfirst1; i <= giantlast1; i++) {
+    NVTX_SCOPE_FMT("bsgs_giant_step i=%d", i);
     giantbool = false;
     if (i != giantlast1) {
       for (int j = basicstart1; j < basicstart1 + gs1; j++) {
@@ -1956,6 +1958,7 @@ void Bootstrapper::rotated_bsgs_linear_transform(
   PhantomCiphertext addtmp1, addtmp2;
 
   for (int i = 0; i < gs2; i++) {
+    NVTX_SCOPE_FMT("bsgs_baby_step i=%d", i);
     if (i == 0) {
       babyct[i] = cipher;
     } else {
@@ -1968,6 +1971,7 @@ void Bootstrapper::rotated_bsgs_linear_transform(
   }
 
   for (int i = 0; i <= giantlast2; i++) {
+    NVTX_SCOPE_FMT("bsgs_giant_step i=%d", i);
     giantbool = false;
     if (i != giantlast2) {
       for (int j = 0; j < gs2; j++) {
@@ -2029,6 +2033,7 @@ void Bootstrapper::bsgs_linear_transform_hoisting(
   PhantomCiphertext addtmp1, addtmp2;
 
   for (int i = basicstart1; i < basicstart1 + gs1; i++) {
+    NVTX_SCOPE_FMT("bsgs_baby_step i=%d", i);
     if (i == 0)
       babyct[i - basicstart1] = cipher;
     else
@@ -2040,6 +2045,7 @@ void Bootstrapper::bsgs_linear_transform_hoisting(
   }
 
   for (int i = giantfirst1; i <= giantlast1; i++) {
+    NVTX_SCOPE_FMT("bsgs_giant_step i=%d", i);
     if (!(giantct == 0))
       delete giantct;
     giantct = 0;
@@ -2108,6 +2114,7 @@ void Bootstrapper::rotated_bsgs_linear_transform_hoisting(
   tmpct = 0;
 
   for (int i = 0; i < gs2; i++) {
+    NVTX_SCOPE_FMT("bsgs_baby_step i=%d", i);
     if (i == 0) {
       babyct[i] = cipher;
     } else {
@@ -2120,6 +2127,7 @@ void Bootstrapper::rotated_bsgs_linear_transform_hoisting(
   }
 
   for (int i = 0; i <= giantlast2; i++) {
+    NVTX_SCOPE_FMT("bsgs_giant_step i=%d", i);
     if (!(giantct == 0))
       delete giantct;
     giantct = 0;

@@ -8,9 +8,9 @@
  * and contributes a partial inner product. AllReduce sums these partials.
  *
  * Pipeline per GPU:
- *   1. mod-up: decompose c2 into beta digits. Each GPU does mod-up for ALL
- *      digits (c2 is available locally after ciphertext multiplication).
- *   2. partial inner product: GPU g accumulates only digits d where d%n == g.
+ *   1. mod-up: each GPU runs modup_partial over its OWN CONTIGUOUS digit
+ *      range [d_start, d_start + d_count); no work for unowned digits.
+ *   2. partial inner product: accumulate over the same owned range only.
  *   3. AllReduce: sum partial inner products across GPUs.
  *   4. mod-down: convert from QlP basis to Ql basis (local, no communication).
  *   5. Add correction to ciphertext.
@@ -23,6 +23,7 @@
 #include "output_aggregation.cuh"
 #include "../comm/nccl_comm.cuh"
 #include "../partition/rns_partition.cuh"
+#include "nvtx_tracer.cuh"
 
 #include "evaluate.cuh"
 #include "context.cuh"
@@ -67,13 +68,16 @@ namespace nexus_multi_gpu {
 // The output is a PARTIAL sum — AllReduce across GPUs yields the full result.
 
 // Partial inner product kernel for Output Aggregation.
-// Processes digits assigned to this GPU in a STRIDED pattern:
-//   GPU g handles digits: g, g+n_gpus, g+2*n_gpus, ...
-// This avoids the overwrite bug of calling the kernel multiple times.
+//
+// T-MODUP layout: each GPU has a CONTIGUOUS chunk of digits in `c2`.
+//   c2 holds d_count digits at slots [0 .. d_count) (size d_count*size_QlP_n)
+//   evks holds beta global pointers; only [d_start .. d_start+d_count) are valid
+// The kernel walks local digit i in [0, d_count), reading c2 at local slot i and
+// evks at global slot d_start + i.
 __global__ void partial_key_switch_inner_prod(
     uint64_t       *dst,
-    const uint64_t *c2,            // mod-up'd c2 [beta * size_QlP_n]
-    const uint64_t *const *evks,   // evk pointers [beta]
+    const uint64_t *c2,            // mod-up'd c2 [d_count * size_QlP_n], CONTIGUOUS
+    const uint64_t *const *evks,   // evk pointers [beta], indexed by GLOBAL digit
     const DModulus *modulus,
     size_t          n,             // poly_modulus_degree
     size_t          size_QP,
@@ -82,9 +86,8 @@ __global__ void partial_key_switch_inner_prod(
     size_t          size_QlP_n,
     size_t          size_Q,
     size_t          size_Ql,
-    size_t          gpu_id,        // this GPU's index
-    size_t          n_gpus,        // total number of GPUs
-    size_t          beta,          // total number of digits
+    size_t          d_start,       // global index of first owned digit
+    size_t          d_count,       // number of owned digits (length of c2 in slots)
     size_t          reduction_threshold)
 {
     for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -101,9 +104,11 @@ __global__ void partial_key_switch_inner_prod(
         uint128_t acc0 = {0, 0};
         uint128_t acc1 = {0, 0};
 
-        // Accumulate digits in strided pattern: gpu_id, gpu_id+n_gpus, ...
+        // T-MODUP: walk owned digits CONTIGUOUSLY.
+        //   c2 indexed locally at slot d in [0, d_count).
+        //   evks indexed globally at d_start + d.
         bool first = true;
-        for (size_t d = gpu_id; d < beta; d += n_gpus) {
+        for (size_t d = 0; d < d_count; d++) {
             if (!first && reduction_threshold == 0) {
                 acc0.lo = barrett_reduce_uint128_uint64(acc0, mod.value(), mod.const_ratio());
                 acc0.hi = 0;
@@ -112,10 +117,13 @@ __global__ void partial_key_switch_inner_prod(
             }
             first = false;
 
-            prod0 = multiply_uint64_uint64(c2[c2_id + d * size_QlP_n], evks[d][evk_id]);
+            const size_t global_d = d_start + d;
+            const uint64_t c2_val = c2[c2_id + d * size_QlP_n];
+
+            prod0 = multiply_uint64_uint64(c2_val, evks[global_d][evk_id]);
             add_uint128_uint128(acc0, prod0, acc0);
 
-            prod1 = multiply_uint64_uint64(c2[c2_id + d * size_QlP_n], evks[d][evk_id + size_QP_n]);
+            prod1 = multiply_uint64_uint64(c2_val, evks[global_d][evk_id + size_QP_n]);
             add_uint128_uint128(acc1, prod1, acc1);
         }
 
@@ -138,7 +146,16 @@ void allreduce_keyswitching_result(
     NCCL_CHECK(ncclAllReduce(partial_cx, partial_cx,
                              count, ncclUint64, ncclSum,
                              ctx.comms[gpu_id], ctx.streams[gpu_id]));
-    CUDA_CHECK(cudaStreamSynchronize(ctx.streams[gpu_id]));
+    // T-OVERLAP: replace blocking cudaStreamSynchronize with a recorded event.
+    // Downstream mod-reduce / moddown / add-to-ct kernels run on the SAME stream
+    // and therefore correctly serialize after the AllReduce — no host-side wait
+    // needed. The CPU thread now returns immediately and can launch the next
+    // rotation's modup, overlapping it with this rotation's ~291 ms AllReduce.
+    if (gpu_id < (int)ctx.allreduce_done_events.size() &&
+        ctx.allreduce_done_events[gpu_id]) {
+        CUDA_CHECK(cudaEventRecord(ctx.allreduce_done_events[gpu_id],
+                                   ctx.streams[gpu_id]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,24 +252,45 @@ void keyswitching_output_aggregation(
         rns_tool.scaleAndRound_HPS_Q_Ql(c2, t_cks.get(), s);
     }
 
-    // ---- Step 1: mod-up (each GPU does this for ALL digits) ----
+    // ---- Step 1: T-MODUP (per-digit mod-up; each GPU computes only its owned digits) ----
+    // CONTIGUOUS ownership: GPU g owns digits [g * d_count, (g+1) * d_count).
+    // The DKS evks shard (in the DKS variant) and the relin_keys path (single-GPU
+    // baseline-style) both treat the evks pointer array as global-indexed.
+    // Uneven contiguous sharding: distribute remainder across the first GPUs so
+    // each GPU owns either floor(beta/n) or floor(beta/n)+1 contiguous digits.
+    // Some keys at smaller chain levels have beta < n_gpus (e.g., beta=3 with 4 GPUs):
+    // the trailing GPUs receive d_count=0 and become no-ops for those keys.
     size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
-    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
-    rns_tool.modup(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(), key_parms.scheme(), s);
+    const size_t d_count_min = beta / static_cast<size_t>(n_gpus);
+    const size_t remainder   = beta % static_cast<size_t>(n_gpus);
+    const size_t d_start = static_cast<size_t>(gpu_id) * d_count_min +
+                           std::min(static_cast<size_t>(gpu_id), remainder);
+    const size_t d_count = d_count_min + (static_cast<size_t>(gpu_id) < remainder ? 1 : 0);
 
-    // ---- Step 2: partial inner product (only local digits) ----
-    // Assign digits to GPUs round-robin: GPU g processes digits d where d % n_gpus == g
-    size_t d_start = static_cast<size_t>(gpu_id);
-    size_t d_count = 0;
-    for (size_t d = d_start; d < beta; d += n_gpus)
-        d_count++;
+    // Layout 1 (CONTIGUOUS): allocate only d_count digits worth of t_mod_up.
+    // At N=65536, beta=36, n_gpus=4 this is ~195 MB instead of ~780 MB per GPU.
+    // Allocate at least 1 element to avoid cudaMallocAsync(0) returning a
+    // sentinel pointer that some downstream sanity checks reject. The kernel
+    // does not read this buffer when d_count == 0, so a 1-element scratch
+    // is sufficient.
+    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(
+        std::max<size_t>(1, d_count * size_QlP_n), s);
+    {
+        NVTX_SCOPE("modup");
+        rns_tool.modup_partial(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
+                               key_parms.scheme(), d_start, d_count, s);
+    }
 
-    // However, the kernel needs contiguous digit iteration. Since digits may not
-    // be contiguous for this GPU, we need to handle the strided pattern.
-    // For simplicity with the existing kernel structure, if beta <= n_gpus,
-    // each GPU gets at most 1 digit. Otherwise we call the kernel multiple times.
-
+    // ---- Step 2: partial inner product (CONTIGUOUS owned digits) ----
     auto cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
+
+    // Defensive zero-init of cx: even though the kernel writes every output
+    // position when d_count > 0, an explicit memset guards against the
+    // d_count == 0 path (small chain levels where beta < n_gpus) where the
+    // kernel launch would still be made but contribute nothing meaningful;
+    // also makes ncclAllReduce's contract on the input buffer trivially valid.
+    CUDA_CHECK(cudaMemsetAsync(cx.get(), 0,
+                               2 * size_QlP_n * sizeof(uint64_t), s));
 
     auto reduction_threshold =
         (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
@@ -262,13 +300,26 @@ void keyswitching_output_aggregation(
         ? const_cast<const uint64_t *const *>(custom_evks)
         : relin_keys.public_keys_ptr();
 
-    // Single kernel call processes all digits for this GPU (strided)
+    // Kernel walks d in [0, d_count) over CONTIGUOUS local t_mod_up,
+    // and indexes evks at the global digit index d_start + d.
+    // Skip kernel launch entirely when d_count == 0 (this GPU contributes 0).
+    if (d_count > 0)
     partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
         cx.get(), t_mod_up.get(), evks_ptr,
         modulus_QP, n, size_QP, size_QP * n,
         size_QlP, size_QlP_n, size_Q, size_Ql,
-        static_cast<size_t>(gpu_id), static_cast<size_t>(n_gpus), beta,
+        d_start, d_count,
         reduction_threshold);
+
+    // ---- T-STRAGGLER: GPU-side barrier before AllReduce (see DKS variant) ----
+    if (gpu_id < (int)ctx.ready_events.size() && ctx.ready_events[gpu_id]) {
+        CUDA_CHECK(cudaEventRecord(ctx.ready_events[gpu_id], s));
+        for (int g = 0; g < n_gpus; ++g) {
+            if (g < (int)ctx.ready_events.size() && ctx.ready_events[g]) {
+                CUDA_CHECK(cudaStreamWaitEvent(s, ctx.ready_events[g], 0));
+            }
+        }
+    }
 
     // ---- Step 3: AllReduce partial inner products ----
     allreduce_keyswitching_result(ctx, gpu_id, cx.get(), 2 * size_QlP_n);
@@ -281,10 +332,13 @@ void keyswitching_output_aggregation(
     }
 
     // ---- Step 4: mod-down ----
-    for (size_t i = 0; i < 2; i++) {
-        auto cx_i = cx.get() + i * size_QlP_n;
-        rns_tool.moddown_from_NTT(cx_i, cx_i, phantom_ctx.gpu_rns_tables(),
-                                  key_parms.scheme(), s);
+    {
+        NVTX_SCOPE("moddown");
+        for (size_t i = 0; i < 2; i++) {
+            auto cx_i = cx.get() + i * size_QlP_n;
+            rns_tool.moddown_from_NTT(cx_i, cx_i, phantom_ctx.gpu_rns_tables(),
+                                      key_parms.scheme(), s);
+        }
     }
 
     // ---- Step 5: Add correction to ciphertext ----
@@ -296,6 +350,11 @@ void keyswitching_output_aggregation(
             ct_i, cx_i, modulus_QP, n, size_Ql);
     }
 
+    // T-OVERLAP (reverted): host sync. The cross-stream wait at writeback was
+    // buggy under some chain levels — restore the safe sync until investigated.
+    if (gpu_id < (int)ctx.oa_done_events.size() && ctx.oa_done_events[gpu_id]) {
+        CUDA_CHECK(cudaEventRecord(ctx.oa_done_events[gpu_id], s));
+    }
     CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
@@ -336,28 +395,65 @@ void keyswitching_output_aggregation_dks(
     auto size_Ql_n   = size_Ql * n;
     auto size_QlP_n  = size_QlP * n;
 
-    // ---- Step 1: mod-up ----
+    // ---- Step 1: T-MODUP — per-digit mod-up (only owned digits) ----
+    // CONTIGUOUS ownership: GPU g owns digits [g*d_count .. (g+1)*d_count).
+    // This matches the contiguous layout used by DistGaloisKeyStore so that
+    // evks[d_start + d] is always non-null for d in [0, d_count).
+    // Uneven contiguous sharding (see non-DKS variant for rationale).
     size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
-    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
-    rns_tool.modup(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
-                   key_parms.scheme(), s);
+    const size_t d_count_min = beta / static_cast<size_t>(n_gpus);
+    const size_t remainder   = beta % static_cast<size_t>(n_gpus);
+    const size_t d_start = static_cast<size_t>(gpu_id) * d_count_min +
+                           std::min(static_cast<size_t>(gpu_id), remainder);
+    const size_t d_count = d_count_min + (static_cast<size_t>(gpu_id) < remainder ? 1 : 0);
 
-    // ---- Step 2: partial inner product (owned digits only, strided by gpu_id) ----
+    // Layout 1 (CONTIGUOUS): only d_count digits' worth of t_mod_up.
+    // Allocate at least 1 element to avoid cudaMallocAsync(0) returning a
+    // sentinel pointer that some downstream sanity checks reject. The kernel
+    // does not read this buffer when d_count == 0, so a 1-element scratch
+    // is sufficient.
+    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(
+        std::max<size_t>(1, d_count * size_QlP_n), s);
+    {
+        NVTX_SCOPE("modup");
+        rns_tool.modup_partial(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
+                               key_parms.scheme(), d_start, d_count, s);
+    }
+
+    // ---- Step 2: partial inner product (CONTIGUOUS owned digits) ----
     auto cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
-    // Zero out cx first (some digit slots may be unowned / skipped)
-    cudaMemsetAsync(cx.get(), 0, 2 * size_QlP_n * sizeof(uint64_t), s);
+    // Defensive zero-init: covers the d_count == 0 case (small chain levels)
+    // and gives ncclAllReduce a trivially valid input even if the kernel
+    // is skipped on this GPU.
+    CUDA_CHECK(cudaMemsetAsync(cx.get(), 0,
+                               2 * size_QlP_n * sizeof(uint64_t), s));
 
     auto reduction_threshold =
         (1 << (bits_per_uint64 -
                static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
 
+    if (d_count > 0)
     partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
         cx.get(), t_mod_up.get(),
         const_cast<const uint64_t *const *>(custom_evks),
         modulus_QP, n, size_QP, size_QP * n,
         size_QlP, size_QlP_n, size_Q, size_Ql,
-        static_cast<size_t>(gpu_id), static_cast<size_t>(n_gpus), beta,
+        d_start, d_count,
         reduction_threshold);
+
+    // ---- T-STRAGGLER: GPU-side barrier before AllReduce ----
+    // Record this GPU's "ready for AllReduce" event, then make this stream wait
+    // on ALL GPUs' ready events. After this point every stream has reached the
+    // same logical point, so ncclAllReduce starts in lockstep across the 4 GPUs
+    // and the previous ~530 ms straggler wait is eliminated.
+    if (gpu_id < (int)ctx.ready_events.size() && ctx.ready_events[gpu_id]) {
+        CUDA_CHECK(cudaEventRecord(ctx.ready_events[gpu_id], s));
+        for (int g = 0; g < n_gpus; ++g) {
+            if (g < (int)ctx.ready_events.size() && ctx.ready_events[g]) {
+                CUDA_CHECK(cudaStreamWaitEvent(s, ctx.ready_events[g], 0));
+            }
+        }
+    }
 
     // ---- Step 3: AllReduce partial inner products ----
     allreduce_keyswitching_result(ctx, gpu_id, cx.get(), 2 * size_QlP_n);
@@ -369,10 +465,13 @@ void keyswitching_output_aggregation_dks(
     }
 
     // ---- Step 4: mod-down ----
-    for (size_t i = 0; i < 2; i++) {
-        auto cx_i = cx.get() + i * size_QlP_n;
-        rns_tool.moddown_from_NTT(cx_i, cx_i, phantom_ctx.gpu_rns_tables(),
-                                  key_parms.scheme(), s);
+    {
+        NVTX_SCOPE("moddown");
+        for (size_t i = 0; i < 2; i++) {
+            auto cx_i = cx.get() + i * size_QlP_n;
+            rns_tool.moddown_from_NTT(cx_i, cx_i, phantom_ctx.gpu_rns_tables(),
+                                      key_parms.scheme(), s);
+        }
     }
 
     // ---- Step 5: Add correction to ciphertext ----
@@ -383,7 +482,15 @@ void keyswitching_output_aggregation_dks(
             ct_i, cx_i, modulus_QP, n, size_Ql);
     }
 
-    CUDA_CHECK(cudaStreamSynchronize(s));
+    // T-OVERLAP: replace the trailing host sync with a recorded event. The
+    // rotation caller's writeback memcpy (on stream0) will cudaStreamWaitEvent
+    // on this event before issuing its memcpy, preserving GPU-side ordering
+    // without blocking the worker CPU thread.
+    if (gpu_id < (int)ctx.oa_done_events.size() && ctx.oa_done_events[gpu_id]) {
+        CUDA_CHECK(cudaEventRecord(ctx.oa_done_events[gpu_id], s));
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(s));
+    }
 }
 
 } // namespace nexus_multi_gpu

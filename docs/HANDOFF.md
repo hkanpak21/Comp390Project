@@ -3,6 +3,12 @@
 **Read this first when picking up the project in a new session.** Self-contained; assumes
 no prior conversation context.
 
+> **Active session note (2026-05-07):** A Ralph-loop session has landed code changes
+> for **T-STRAGGLER, T-OVERLAP, T-TRACE NVTX, T-MODUP, T-LRU, T-12LAYER-BASE** plus a
+> full paper draft (`paper/main.tex`) with `\TODO{}` markers awaiting MN5 numbers.
+> Headline numbers below are the last measured values (Phase 4b, pre-Ralph-loop).
+> See `docs/RALPH_LOOP_HANDOFF.md` for sync command, build, and the 6-step validation order.
+
 ---
 
 ## 1. Project In One Paragraph

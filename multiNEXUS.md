@@ -2,6 +2,12 @@
 
 > **Status**: Strategy phase. Steps marked `[ ]` are pending; `[x]` are complete; `[~]` are in progress.
 > Update this file as implementation proceeds — the "Outcome" columns are left blank intentionally.
+>
+> **Iteration update (2026-05-07):** A Ralph-loop session has landed code for
+> T-STRAGGLER, T-OVERLAP, T-TRACE, T-MODUP, T-LRU, T-12LAYER-BASE plus a paper draft
+> in `paper/main.tex` with `\TODO{}` markers awaiting MN5 measurements. See
+> `docs/RALPH_LOOP_HANDOFF.md` for the validation runbook. The numbers below reflect
+> Phase 4b (the last measured champion); update once MN5 reruns confirm new ones.
 
 ---
 

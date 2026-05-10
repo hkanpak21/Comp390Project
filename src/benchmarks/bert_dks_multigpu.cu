@@ -138,13 +138,20 @@ static LayerTimes run_bert_layer_dks(
     Bootstrapper        &bs,
     GaloisKeyStore      &ks,          // single-GPU key store (for non-DKS ops)
     PhantomCiphertext   &X,           // input CT (on GPU 0)
-    // Weight matrices encoded as plaintexts
-    const vector<vector<double>> &Wq,
-    const vector<vector<double>> &Wk,
-    const vector<vector<double>> &Wv,
-    const vector<vector<double>> &Wo,
-    const vector<vector<double>> &Wf1,
-    const vector<vector<double>> &Wf2)
+    // Operator-evaluator handles preallocated by caller (zero per-layer construction).
+    MMEvaluator      &mme,
+    GELUEvaluator    &ge,
+    SoftmaxEvaluator &se,
+    LNEvaluator      &lne,
+    // Weight matrices encoded as plaintexts. Passed mutable because
+    // matrix_mul_unified takes vector<vector<double>>& — caller hoists the
+    // mutable copies above the layer loop, so we don't reallocate per layer.
+    vector<vector<double>> &Wq,
+    vector<vector<double>> &Wk,
+    vector<vector<double>> &Wv,
+    vector<vector<double>> &Wo,
+    vector<vector<double>> &Wf1,
+    vector<vector<double>> &Wf2)
 {
     LayerTimes times;
     PerfTimer t;
@@ -190,21 +197,18 @@ static LayerTimes run_bert_layer_dks(
         }
     };
 
-    MMEvaluator     mme(eval);
-    GELUEvaluator   ge(eval);
-    SoftmaxEvaluator se(eval);
-    LNEvaluator     lne(eval);
+    // mme/ge/se/lne are preallocated by the caller (no per-layer construction).
+    // (void) silences unused-warnings on dctx/ks for this code path.
+    (void)dctx; (void)ks;
 
     // ─── Self-Attention ───
     t.start();
     // Q, K, V projections via matrix_mul_unified
     // Input: vector<PhantomCiphertext>{X}, weights, n_cols=1, output vector
     vector<PhantomCiphertext> Xi = {X}, Qv, Kv, Vv;
-    // Cast weights to non-const for the API (mutable reference required)
-    auto Wq_nc = Wq; auto Wk_nc = Wk; auto Wv_nc = Wv;
-    mme.matrix_mul_unified(Xi, Wq_nc, 1, Qv);
-    mme.matrix_mul_unified(Xi, Wk_nc, 1, Kv);
-    mme.matrix_mul_unified(Xi, Wv_nc, 1, Vv);
+    mme.matrix_mul_unified(Xi, Wq, 1, Qv);
+    mme.matrix_mul_unified(Xi, Wk, 1, Kv);
+    mme.matrix_mul_unified(Xi, Wv, 1, Vv);
     PhantomCiphertext Q = Qv[0], K = Kv[0], V = Vv[0];
     cudaDeviceSynchronize();
     times.qkv_ms = t.elapsed_ms();
@@ -241,8 +245,7 @@ static LayerTimes run_bert_layer_dks(
     // Output projection
     t.start();
     vector<PhantomCiphertext> AVv = {AV}, projv;
-    auto Wo_nc = Wo;
-    mme.matrix_mul_unified(AVv, Wo_nc, 1, projv);
+    mme.matrix_mul_unified(AVv, Wo, 1, projv);
     PhantomCiphertext proj = projv[0];
     cudaDeviceSynchronize();
     times.out_ms = t.elapsed_ms();
@@ -265,8 +268,7 @@ static LayerTimes run_bert_layer_dks(
     // ─── FFN Block ───
     t.start();
     vector<PhantomCiphertext> ln1v = {ln1_out}, ffnv;
-    auto Wf1_nc = Wf1;
-    mme.matrix_mul_unified(ln1v, Wf1_nc, 1, ffnv);
+    mme.matrix_mul_unified(ln1v, Wf1, 1, ffnv);
     PhantomCiphertext ffn = ffnv[0];
     cudaDeviceSynchronize();
     times.ffn1_ms = t.elapsed_ms();
@@ -279,8 +281,7 @@ static LayerTimes run_bert_layer_dks(
 
     t.start();
     vector<PhantomCiphertext> geluv = {gelu_out}, ffn2v;
-    auto Wf2_nc = Wf2;
-    mme.matrix_mul_unified(geluv, Wf2_nc, 1, ffn2v);
+    mme.matrix_mul_unified(geluv, Wf2, 1, ffn2v);
     PhantomCiphertext ffn_out = ffn2v[0];
     cudaDeviceSynchronize();
     times.ffn2_ms = t.elapsed_ms();
@@ -471,14 +472,71 @@ int main(int argc, char **argv) {
     eval0.encryptor.encrypt(pt_in, X);
     for (int i = 0; i < BS_MOD; i++) eval0.evaluator.mod_switch_to_next_inplace(X);
 
-    printf("\n[BERT Layer] Running 1 head via DKS on %d GPU%s...\n",
+    // ── Number of encoder layers to run end-to-end (T-12LAYER-BASE) ──
+    // BERT_LAYERS env var controls this; default 1 preserves prior single-layer behaviour.
+    int num_layers = 1;
+    if (const char* p = std::getenv("BERT_LAYERS")) {
+        num_layers = std::atoi(p);
+        if (num_layers < 1) num_layers = 1;
+    }
+
+    printf("\n[BERT Layer] Running %d layer%s × 1 head via DKS on %d GPU%s...\n",
+           num_layers, num_layers > 1 ? "s" : "",
            n_gpus, n_gpus > 1 ? "s" : "");
     fflush(stdout);
 
-    // ── Run one layer (1 head, DKS bootstrap) ──
-    LayerTimes times = run_bert_layer_dks(
-        dctx, eval0, bs, ks_cpu, X,
-        Wq, Wk, Wv, Wo, Wf1, Wf2);
+    // ── Preallocate per-layer state OUTSIDE the loop (T-12LAYER-BASE) ──
+    // Constraint: no per-layer allocations inside the layer loop body.
+    //   - Operator evaluators (MM/GELU/Softmax/LN) hold a CKKSEvaluator* and
+    //     are essentially free, but we still hoist them so the loop body
+    //     contains zero new constructions.
+    //   - matrix_mul_unified takes weights by non-const reference. The pre-T-12
+    //     code copied each weight matrix every call (~16 MB × 6 = ~100 MB/layer
+    //     of host allocation). We pass the originals directly; matrix_mul_unified
+    //     does not mutate them in practice (only the API is mutable-ref).
+    MMEvaluator      mme(eval0);
+    GELUEvaluator    ge(eval0);
+    SoftmaxEvaluator se(eval0);
+    LNEvaluator      lne(eval0);
+
+    // ── Run num_layers layers, threading the output of layer i as input to layer i+1 ──
+    // run_bert_layer_dks takes X by reference and assigns X = ln2_out at the end,
+    // so calling it repeatedly with the same X chains the layers naturally.
+    // Each layer's final op is Bootstrap #4, so X is at full level when fed
+    // into the next layer (no extra mid-loop bootstrap call required).
+    // TODO(user): if the chain index is exhausted before BS4 in any layer,
+    // the bs.bootstrap_3 call inside dks_bootstrap will need to be invoked
+    // explicitly here on the loop boundary instead of relying on BS4.
+    LayerTimes times{};                      // accumulator (last layer's per-op breakdown)
+    std::vector<double> per_layer_ms;
+    per_layer_ms.reserve(static_cast<size_t>(num_layers));
+
+    auto wall_t0 = std::chrono::steady_clock::now();
+    for (int layer = 0; layer < num_layers; ++layer) {
+        auto layer_t0 = std::chrono::steady_clock::now();
+        printf("\n[Layer %d/%d] starting (chain_index=%zu, coeff_modulus_size=%zu)...\n",
+               layer + 1, num_layers,
+               (size_t)X.chain_index(),
+               (size_t)X.coeff_modulus_size());
+        fflush(stdout);
+
+        times = run_bert_layer_dks(
+            dctx, eval0, bs, ks_cpu, X,
+            mme, ge, se, lne,
+            Wq, Wk, Wv, Wo, Wf1, Wf2);
+
+        auto layer_t1 = std::chrono::steady_clock::now();
+        double layer_ms = std::chrono::duration<double, std::milli>(layer_t1 - layer_t0).count();
+        per_layer_ms.push_back(layer_ms);
+        printf("[Layer %d/%d] done in %.1f ms (%.2f s); "
+               "output chain_index=%zu, coeff_modulus_size=%zu\n",
+               layer + 1, num_layers, layer_ms, layer_ms / 1000.0,
+               (size_t)X.chain_index(),
+               (size_t)X.coeff_modulus_size());
+        fflush(stdout);
+    }
+    auto wall_t1 = std::chrono::steady_clock::now();
+    double total_wall_ms = std::chrono::duration<double, std::milli>(wall_t1 - wall_t0).count();
 
     // ── Print results ──
     printf("\n════════════════════════════════════════\n");
@@ -502,18 +560,75 @@ int main(int argc, char **argv) {
     printf("  %-25s  %8.1f\n", "LayerNorm #2",     times.ln2_ms);
     printf("  %-25s  %8.1f  ← DKS\n", "Bootstrap #4",    times.bs4_ms);
     printf("  %-25s  %8s\n", "─────────────────────────", "────────");
-    printf("  %-25s  %8.1f\n", "TOTAL (1 head)",   times.total_ms);
+    printf("  %-25s  %8.1f\n", "TOTAL (1 head, last layer)", times.total_ms);
 
     double bootstrap_total = times.bs1_ms + times.bs2_ms + times.bs3_ms + times.bs4_ms;
     double other_total     = times.total_ms - bootstrap_total;
-    printf("\n  Bootstrap total: %.1f ms (%.1f%% of layer)\n",
+    printf("\n  Bootstrap total (last layer): %.1f ms (%.1f%% of layer)\n",
            bootstrap_total, 100.0 * bootstrap_total / times.total_ms);
-    printf("  Other ops:       %.1f ms (%.1f%% of layer)\n",
+    printf("  Other ops      (last layer): %.1f ms (%.1f%% of layer)\n",
            other_total, 100.0 * other_total / times.total_ms);
 
-    // Projected full 12-head BERT
-    double proj_full = times.total_ms * N_HEADS;
-    printf("\n  Projected 12-head BERT layer: %.1f ms = %.1f s\n",
+    // Multi-layer timing summary (T-12LAYER-BASE)
+    printf("\n────────────────────────────────────────\n");
+    printf("  Multi-layer wall-clock summary (%d layer%s, 1 head)\n",
+           num_layers, num_layers > 1 ? "s" : "");
+    printf("────────────────────────────────────────\n");
+    double mean_layer_ms = total_wall_ms / static_cast<double>(num_layers);
+
+    // Per-layer statistics (mean ± std, min, max), matching bootstrapping_bench.cu style.
+    double min_layer_ms = per_layer_ms[0], max_layer_ms = per_layer_ms[0];
+    for (double v : per_layer_ms) {
+        min_layer_ms = std::min(min_layer_ms, v);
+        max_layer_ms = std::max(max_layer_ms, v);
+    }
+    double var_layer_ms = 0.0;
+    for (double v : per_layer_ms) var_layer_ms += (v - mean_layer_ms) * (v - mean_layer_ms);
+    double std_layer_ms = (num_layers > 1) ? std::sqrt(var_layer_ms / num_layers) : 0.0;
+
+    printf("  Total wall time   : %.1f ms = %.2f s\n", total_wall_ms, total_wall_ms / 1000.0);
+    printf("  Mean per-layer    : %.1f ± %.1f ms (= %.2f ± %.2f s)\n",
+           mean_layer_ms, std_layer_ms, mean_layer_ms / 1000.0, std_layer_ms / 1000.0);
+    printf("  Min / Max layer   : %.1f / %.1f ms\n", min_layer_ms, max_layer_ms);
+    printf("  Per-layer time series (ms):\n");
+    for (int i = 0; i < num_layers; ++i) {
+        printf("    layer %2d : %8.1f ms (%.2f s)\n",
+               i + 1, per_layer_ms[i], per_layer_ms[i] / 1000.0);
+    }
+    // Each layer runs 4 DKS bootstraps
+    int bootstraps_total = 4 * num_layers;
+    printf("  Bootstraps executed: %d (4/layer × %d layers)\n",
+           bootstraps_total, num_layers);
+
+    // T-12LAYER-BASE acceptance: measured 12-layer total within ±10% of
+    // 12 × single-layer projection. We use layer 1 as the single-layer
+    // projection seed (fresh-input baseline, matches the original
+    // single-layer benchmark mode), then compare to total wall time.
+    if (num_layers > 1) {
+        double layer1_ms     = per_layer_ms[0];
+        double projection_ms = layer1_ms * static_cast<double>(num_layers);
+        double abs_dev_ms    = total_wall_ms - projection_ms;
+        double rel_dev_pct   = 100.0 * abs_dev_ms / projection_ms;
+        printf("\n  Projection check (T-12LAYER-BASE):\n");
+        printf("    layer-1 single-layer seed : %.1f ms\n", layer1_ms);
+        printf("    projection (%dx layer-1)  : %.1f ms = %.2f s\n",
+               num_layers, projection_ms, projection_ms / 1000.0);
+        printf("    measured total wall       : %.1f ms = %.2f s\n",
+               total_wall_ms, total_wall_ms / 1000.0);
+        printf("    deviation                 : %+.1f ms (%+.2f%%)\n",
+               abs_dev_ms, rel_dev_pct);
+        if (std::fabs(rel_dev_pct) <= 10.0) {
+            printf("    PASS: within ±10%% of projection\n");
+        } else {
+            printf("    FAIL: outside ±10%% of projection — investigate "
+                   "(level budget after %d bootstraps, GPU warm-up, "
+                   "ciphertext chaining overhead)\n", bootstraps_total);
+        }
+    }
+
+    // Projected full 12-head BERT (extrapolation across heads, NOT layers)
+    double proj_full = mean_layer_ms * N_HEADS;
+    printf("\n  Projected 12-head BERT layer (heads × mean per-layer): %.1f ms = %.1f s\n",
            proj_full, proj_full / 1000.0);
     printf("  Reference (CPU streaming, 4-GPU head parallel): ~249,600 ms\n");
     printf("  DKS speedup vs CPU streaming: %.2fx\n",

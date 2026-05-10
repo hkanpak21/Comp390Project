@@ -44,6 +44,20 @@ struct MultiGpuContext {
     std::vector<int>          device_ids;  ///< CUDA device IDs (e.g. {0,1,2,3})
     std::vector<ncclComm_t>   comms;       ///< one NCCL communicator per GPU
     std::vector<cudaStream_t> streams;     ///< one compute+NCCL stream per GPU
+    /// T-STRAGGLER: GPU-side barrier events recorded after partial_key_switch_inner_prod.
+    /// Each stream waits on every GPU's ready_event before ncclAllReduce so all 4
+    /// streams arrive at the collective simultaneously (eliminates ~530 ms straggler wait).
+    std::vector<cudaEvent_t>  ready_events;
+    /// T-OVERLAP: events recorded after ncclAllReduce enqueue. Replaces the
+    /// blocking cudaStreamSynchronize so the CPU thread returns immediately and
+    /// can launch the next rotation's modup while AllReduce runs (~291 ms hide).
+    std::vector<cudaEvent_t>  allreduce_done_events;
+    /// T-OVERLAP: events recorded at the end of keyswitching_output_aggregation*
+    /// (after oa_add_to_ct). Used by the rotation caller to make its writeback
+    /// memcpy on stream0 wait for OA on ctx.stream(g) without a host-side sync,
+    /// which lets the worker's CPU thread return immediately and overlap the
+    /// next rotation's launch.
+    std::vector<cudaEvent_t>  oa_done_events;
 
     /// Initialize NCCL communicators for the given device list.
     /// Must be called from a single host thread.

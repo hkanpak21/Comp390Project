@@ -179,6 +179,10 @@ void dist_rotate_output_aggregation(
     mgctx.device_ids.resize(n_gpus);
     mgctx.comms.resize(n_gpus);
     mgctx.streams.resize(n_gpus);
+    // T-STRAGGLER / T-OVERLAP: shallow-copy persistent events (see inplace variant).
+    mgctx.ready_events          = ctx.ready_events();
+    mgctx.allreduce_done_events = ctx.allreduce_done_events();
+    mgctx.oa_done_events        = ctx.oa_done_events();
     for (int g = 0; g < n_gpus; g++) {
         mgctx.device_ids[g] = g;
         mgctx.comms[g]      = ctx.comm(g);
@@ -224,6 +228,18 @@ void dist_rotate_output_aggregation(
     // (AllReduce guarantees each GPU has the same result).
     // Scatter GPU 0's result to the DistributedCiphertext.
     // =========================================================
+    // T-OVERLAP: keyswitching_output_aggregation_dks no longer host-syncs.
+    // from_single_gpu() issues blocking cudaMemcpyPeer on the default stream
+    // (NOT ctx.stream(0)), so we must wait on GPU 0's OA event before reading
+    // local_cts[0].data(). Host-side wait is acceptable here — this is the
+    // slow scatter path, not the inplace fast path.
+    {
+        const auto &oa_evts = ctx.oa_done_events();
+        if (!oa_evts.empty() && oa_evts[0]) {
+            GAL_CUDA_CHECK(cudaSetDevice(0));
+            GAL_CUDA_CHECK(cudaEventSynchronize(oa_evts[0]));
+        }
+    }
     dct.free_all();
     dct = DistributedCiphertext::from_single_gpu(ctx, local_cts[0], 0);
 
@@ -346,6 +362,13 @@ void dist_rotate_phantom_inplace(
     mgctx.device_ids.resize(n_gpus);
     mgctx.comms.resize(n_gpus);
     mgctx.streams.resize(n_gpus);
+    // T-STRAGGLER / T-OVERLAP: shallow-copy the persistent per-GPU events from
+    // DistributedContext so keyswitching_output_aggregation_dks can use them
+    // as GPU-side barriers around ncclAllReduce, and oa_done_events lets the
+    // writeback memcpy below wait on OA completion without a host sync.
+    mgctx.ready_events          = ctx.ready_events();
+    mgctx.allreduce_done_events = ctx.allreduce_done_events();
+    mgctx.oa_done_events        = ctx.oa_done_events();
     for (int g = 0; g < n_gpus; g++) {
         mgctx.device_ids[g] = g;
         mgctx.comms[g]      = ctx.comm(g);
@@ -374,6 +397,16 @@ void dist_rotate_phantom_inplace(
     {
         NVTX_SCOPE("P4_writeback");
         GAL_CUDA_CHECK(cudaSetDevice(0));
+        // T-OVERLAP: keyswitching_output_aggregation_dks no longer host-syncs
+        // before returning. Its end is signalled via ctx.oa_done_events()[g]
+        // recorded on ctx.stream(g). The writeback runs on stream0 (a different
+        // stream from ctx.stream(0)), so we must gate it with a GPU-side wait
+        // on GPU 0's OA event before queuing the memcpy. Order MUST be:
+        //   cudaStreamWaitEvent(stream0, oa_done_events[0])  THEN  cudaMemcpyAsync(stream0).
+        const auto &oa_evts = ctx.oa_done_events();
+        if (!oa_evts.empty() && oa_evts[0]) {
+            GAL_CUDA_CHECK(cudaStreamWaitEvent(stream0, oa_evts[0], 0));
+        }
         GAL_CUDA_CHECK(cudaMemcpyAsync(ct.data(), local_cts[0].data(),
                                        2 * poly_bytes, cudaMemcpyDeviceToDevice, stream0));
         GAL_CUDA_CHECK(cudaStreamSynchronize(stream0));
