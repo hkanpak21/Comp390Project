@@ -231,7 +231,35 @@ Phase order is: BUG → FIX → PROFILE / MEASURE → WRITE → APPENDIX → MOD
 - §6 carries 8 `[TODO]` markers; §7 is a numerical skeleton.
 - Branch reflects work BEFORE the Bootstrapper sync removal landed in MN5 binaries — every cell in `docs/PER_OP_VS_NEXUS.md` §4.4 will need re-checking once jobs run on the patched build.
 
-### Critical blockers as of 2026-05-12 morning
+### Resolution log (2026-05-12, late afternoon → evening)
+
+All four blockers below are CLEARED. New slices on `paper/multinexus`:
+
+| Slice | Commit | Role |
+|---|---|---|
+| `FIX-BUILD-01` | f011386 | Resolved duplicate `ct_pipeline.cu.o` link error; produced clean binaries via JOBID 40424627 |
+| `RUN-PROFILE-01-RETRY-2` | 391075e | Submitted matmul nsys against the FIX-BUILD-01 binary; surfaced a deeper MAE bug |
+| `FIX-SLURM-04-01` | 61a1d18 | Moved HP throughput wrapper from /tmp to GPFS (unblocks MEASURE-04) |
+| `RUN-MEASURE-04-RETRY` | 2691991 | Resubmitted 16-GPU throughput as JOBID 40424704 |
+| `FIX-BUG-MATMUL-01` | 39935e3 | **Root cause of latent matmul corruption**: stream race in `MMEvaluator::multiply_power_of_x` between `cudaStreamPerThread` cudaMemcpyAsync and Phantom's default-stream NTT kernel. Also applied NEXUS's /2.0 in the MAE gate. MAE: 4.1e+5 → 1.5e-7 |
+| `FIX-BUG-MATMUL-02` | 2f8db5a | Noise-floor-tolerant Phase 2 gate (abs OR rel branch) — fixes false negative when both MAEs are at the scheme noise floor |
+| `RUN-PROFILE-01-FIXED` | e54b701 | First passing PROFILE-01: single-GPU 0.329 s/col, 4-GPU 0.140 s/col (2.35× speedup) — JOBID 40426416 |
+
+**The "FIX-BUG-01-02" commit message in a93ace9 was a misdiagnosis.** It
+attributed the matmul MAE failure to a `set_scale(...)` ordering bug
+before `add_many()`. The actual root cause was a stream synchronization
+race in `multiply_power_of_x` (introduced silently in the port commit
+b4949cb). Both the "pre-set scale" and "no pre-set scale" forms produced
+MAE ≈ 4.1e+5; the reordering changed metadata only, not the polynomial.
+
+**This means every matmul number in `docs/PER_OP_VS_NEXUS.md` §4.4
+predating FIX-BUG-MATMUL-01 is suspect.** Timing data may still be
+representative (the corrupt path still hit the same kernels), but any
+correctness-implying claims need re-validation. The post-fix
+numbers (0.329 s/col single-GPU, 0.140 s/col 4-GPU at logN=13) are
+the first paper-quotable matmul figures.
+
+### Critical blockers as of 2026-05-12 morning (historical — all RESOLVED)
 
 **Problem 1: Binary rebuild failures (JOBID 40422689 and 40422772)**
 
