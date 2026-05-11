@@ -249,7 +249,7 @@ The Ralph loop should pick the **first unblocked slice from this list per iterat
 7. ✅ `RUN-PROFILE-03` — submitted on MN5 as JOBID `40418387`; manifest at `docs/runs/RUN-PROFILE-03_40418387.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
 8. ✅ `RUN-PROFILE-04` — submitted on MN5 as JOBID `40418644`; manifest at `docs/runs/RUN-PROFILE-04_40418644.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
 9. ✅ `RUN-MEASURE-01` — submitted on MN5 as JOBID `40418680`; manifest at `docs/runs/RUN-MEASURE-01_40418680.md`. Saturation check and §7 numerical backfill handled in a later iteration once COMPLETED.
-10. `RUN-MEASURE-03` — submit DP-4 throughput run; commit captures JOBID and aggregate throughput.
+10. ✅ `RUN-MEASURE-03` — submitted on MN5 as JOBID `40418704`; manifest at `docs/runs/RUN-MEASURE-03_40418704.md`. Weak-scaling 4-GPU row in §7 backfilled in a later iteration once COMPLETED.
 11. `RUN-MEASURE-04` — submit DP-16 throughput run; commit captures JOBID and aggregate throughput.
 
 **Phase D — additional FIX slices that don't block MEASURE but tighten the paper:**
