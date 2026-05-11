@@ -19,6 +19,16 @@ Bootstrapper::Bootstrapper(
       new ModularReducer(boundary_K, (double)loge, sin_cos_deg, scale_factor, inverse_deg, ckks);
 }
 
+// FIX-BUG-04-03 (BOOT-RAW-OWN): pair the raw `new ModularReducer` above with
+// an explicit `delete`. `delete nullptr` is well-defined and a no-op, so the
+// member initializer (`mod_reducer = nullptr`) makes this destructor safe to
+// run on a partially-constructed object if any future ctor throws between
+// member-initializer-list and the `new` call.
+Bootstrapper::~Bootstrapper() {
+  delete mod_reducer;
+  mod_reducer = nullptr;
+}
+
 void Bootstrapper::addLeftRotKeys_Linear_to_vector(vector<int> &gal_steps_vector) {
   int split_point = floor(logn / 2.0);
   int totlen1 = (1 << split_point) - 1;

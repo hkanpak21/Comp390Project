@@ -40,7 +40,7 @@ class Bootstrapper {
 
   vector<PhantomPlaintext> fftcoeff_plain1, fftcoeff_plain2, invfftcoeff_plain1, invfftcoeff_plain2;
 
-  ModularReducer *mod_reducer;
+  ModularReducer *mod_reducer = nullptr;
 
   Bootstrapper(
       long _loge,
@@ -53,6 +53,20 @@ class Bootstrapper {
       long _scale_factor,
       long _inverse_deg,
       CKKSEvaluator *ckks);
+
+  // FIX-BUG-04-03 (BOOT-RAW-OWN): explicit destructor + deleted copy/move.
+  // Bootstrapper owns `mod_reducer` via raw `new` in the constructor body
+  // (Bootstrapper.cu:18-19). Without a destructor that leaks each instance;
+  // with the implicit (shallow) copy ctor two Bootstrappers would alias the
+  // same pointer and double-free at scope exit. All in-tree callers use
+  // either stack-allocated `Bootstrapper bs(...)` or `unique_ptr<Bootstrapper>`
+  // — neither needs copy or move, so deleting them is safe and surfaces any
+  // future misuse at compile time. Mirrors CLAUDE.md non-negotiable lesson #3.
+  ~Bootstrapper();
+  Bootstrapper(const Bootstrapper &) = delete;
+  Bootstrapper &operator=(const Bootstrapper &) = delete;
+  Bootstrapper(Bootstrapper &&) = delete;
+  Bootstrapper &operator=(Bootstrapper &&) = delete;
 
   inline void set_final_scale(double _final_scale) {
     final_scale = _final_scale;
