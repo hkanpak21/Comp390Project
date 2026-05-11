@@ -12,8 +12,9 @@
 #SBATCH --output=/gpfs/projects/etur02/hkanpak/logs/softmax_mgpu_nsys_%j.out
 #SBATCH --error=/gpfs/projects/etur02/hkanpak/logs/softmax_mgpu_nsys_%j.err
 
-# Lane MGPU-NSYS / TARGET 2 — Per-op multi-GPU NSYS trace, SOFTMAX.
-# Mirrors slurm_softmax_mgpu_align.sh (1 trial, 100 calls total).
+# PROFILE-03 — Per-op multi-GPU NSYS trace, SOFTMAX.
+# Mirrors slurm_softmax_mgpu_align.sh (1 trial, 100 calls total). Pattern
+# matches slurm_{matmul,gelu,argmax}_mgpu_nsys.sh from PROFILE-01/02/04.
 
 set -e
 
