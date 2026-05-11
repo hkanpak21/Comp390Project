@@ -169,6 +169,19 @@ public:
         compute_done_event_.assign(cache_size_, nullptr);
         slot_to_iter_.assign(cache_size_, lru_order_.end());
 
+        // Seed lru_order_ with all slots in MRU-to-LRU order so that
+        // `lru_order_.back()` on the first prefetch returns a valid slot
+        // (slot cache_size_-1) instead of dereferencing end() — that was
+        // a regression introduced when the 2-slot fixed buffer was
+        // replaced with the N-slot LRU. The slot ordering here is
+        // arbitrary; every slot starts with `slot_resident_idx_[s] = -1`,
+        // so the first miss simply picks the last entry and overwrites it.
+        for (size_t s = 0; s < cache_size_; s++) {
+            lru_order_.push_back(static_cast<int>(s));
+            auto it = std::prev(lru_order_.end());
+            slot_to_iter_[s] = it;
+        }
+
         for (size_t s = 0; s < cache_size_; s++) {
             std::vector<uint64_t *> ptrs(dnum_);
             for (size_t c = 0; c < dnum_; c++) {

@@ -57,8 +57,34 @@ class MMEvaluator {
     return transposed;
   }
 
-  // Evaluation function (original N=8192 compress/decompress path)
+  // Evaluation function (original N=8192 compress/decompress path).
+  // Computes all 64 output columns. Equivalent to matrix_mul_range(x, y, res, 0, 64).
   void matrix_mul(vector<vector<double>> &x, vector<vector<double>> &y, vector<PhantomCiphertext> &res);
+
+  // Output-channel split variant of matrix_mul.
+  //
+  // Computes ONLY output columns [cols_lo, cols_hi) of the 64-column NEXUS
+  // MatMul. The compress + full decompress of all 6 b_cts is still done
+  // (these are setup-cost shared across all output columns and are cheap
+  // relative to the per-column inner loop), but the dominant per-column
+  // multiply_plain + add_many work is restricted to the requested range.
+  //
+  // Used by the multi-GPU output-channel split benchmark
+  // (src/benchmarks/matmul_align_n8k.cu): each std::thread on a different
+  // GPU calls this with its own [cols_lo, cols_hi) so the wall-clock is
+  // approximately (cols_hi - cols_lo) / 64 of the full single-GPU time
+  // (modulo per-thread setup + decompress + scheduling overhead).
+  //
+  // res ends up holding (cols_hi - cols_lo) ciphertexts in column order.
+  // Caller is responsible for concatenating across threads.
+  //
+  // Requires 0 <= cols_lo < cols_hi <= 64.
+  void matrix_mul_range(vector<vector<double>> &x,
+                        vector<vector<double>> &y,
+                        vector<PhantomCiphertext> &res,
+                        int cols_lo,
+                        int cols_hi);
+
   void multiply_power_of_x(PhantomCiphertext &encrypted, PhantomCiphertext &destination, int index);
 
   // Unified N=65536 MatMul — no compress/decompress needed.

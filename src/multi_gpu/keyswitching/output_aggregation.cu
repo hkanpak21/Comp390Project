@@ -67,17 +67,25 @@ namespace nexus_multi_gpu {
 // that processes only digits in range [d_start, d_start + d_count).
 // The output is a PARTIAL sum — AllReduce across GPUs yields the full result.
 
-// Partial inner product kernel for Output Aggregation.
+// Partial inner product kernel for Output Aggregation — STRIDED ownership.
 //
-// T-MODUP layout: each GPU has a CONTIGUOUS chunk of digits in `c2`.
-//   c2 holds d_count digits at slots [0 .. d_count) (size d_count*size_QlP_n)
-//   evks holds beta global pointers; only [d_start .. d_start+d_count) are valid
-// The kernel walks local digit i in [0, d_count), reading c2 at local slot i and
-// evks at global slot d_start + i.
+// (T-MODUP-FIX-2 2026-05-10): Reverted from a CONTIGUOUS layout that broke
+// at chain levels where chain_beta < dnum (DKS shards are pre-sized at dnum
+// but chain_beta varies → contiguous slices on trailing GPUs were never
+// accessed and trailing GPUs' shards covered the wrong digits → kernel
+// dereferenced nullptr evks slots → cudaFreeAsync invalid argument cascade).
+//
+// Layout: c2 holds the FULL mod-up output [beta * size_QlP_n] on every GPU
+// (modup is replicated). evks holds beta global pointers; GPU g owns the
+// strided subset {evks[g], evks[g+n_gpus], evks[g+2*n_gpus], ...} ∩ [0, beta)
+// (rest are nullptr on this GPU). The kernel walks d = gpu_id, gpu_id+n_gpus,
+// ... < beta — every accessed slot is owned. Trailing GPUs with no owned
+// digits in [0, beta) (when beta < n_gpus) are guarded out at the kernel
+// launch site (`if (d_count > 0)` in the caller).
 __global__ void partial_key_switch_inner_prod(
     uint64_t       *dst,
-    const uint64_t *c2,            // mod-up'd c2 [d_count * size_QlP_n], CONTIGUOUS
-    const uint64_t *const *evks,   // evk pointers [beta], indexed by GLOBAL digit
+    const uint64_t *c2,            // mod-up'd c2 [beta * size_QlP_n], FULL
+    const uint64_t *const *evks,   // evk pointers [beta], strided ownership
     const DModulus *modulus,
     size_t          n,             // poly_modulus_degree
     size_t          size_QP,
@@ -86,8 +94,9 @@ __global__ void partial_key_switch_inner_prod(
     size_t          size_QlP_n,
     size_t          size_Q,
     size_t          size_Ql,
-    size_t          d_start,       // global index of first owned digit
-    size_t          d_count,       // number of owned digits (length of c2 in slots)
+    size_t          gpu_id,        // this GPU's index (start of strided walk)
+    size_t          n_gpus,        // total GPUs (stride)
+    size_t          beta,          // total digits (loop end)
     size_t          reduction_threshold)
 {
     for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -104,11 +113,10 @@ __global__ void partial_key_switch_inner_prod(
         uint128_t acc0 = {0, 0};
         uint128_t acc1 = {0, 0};
 
-        // T-MODUP: walk owned digits CONTIGUOUSLY.
-        //   c2 indexed locally at slot d in [0, d_count).
-        //   evks indexed globally at d_start + d.
+        // STRIDED ownership: walk d = gpu_id, gpu_id+n_gpus, ..., < beta.
+        // Both c2 and evks are indexed at the GLOBAL digit d.
         bool first = true;
-        for (size_t d = 0; d < d_count; d++) {
+        for (size_t d = gpu_id; d < beta; d += n_gpus) {
             if (!first && reduction_threshold == 0) {
                 acc0.lo = barrett_reduce_uint128_uint64(acc0, mod.value(), mod.const_ratio());
                 acc0.hi = 0;
@@ -117,13 +125,12 @@ __global__ void partial_key_switch_inner_prod(
             }
             first = false;
 
-            const size_t global_d = d_start + d;
             const uint64_t c2_val = c2[c2_id + d * size_QlP_n];
 
-            prod0 = multiply_uint64_uint64(c2_val, evks[global_d][evk_id]);
+            prod0 = multiply_uint64_uint64(c2_val, evks[d][evk_id]);
             add_uint128_uint128(acc0, prod0, acc0);
 
-            prod1 = multiply_uint64_uint64(c2_val, evks[global_d][evk_id + size_QP_n]);
+            prod1 = multiply_uint64_uint64(c2_val, evks[d][evk_id + size_QP_n]);
             add_uint128_uint128(acc1, prod1, acc1);
         }
 
@@ -146,11 +153,10 @@ void allreduce_keyswitching_result(
     NCCL_CHECK(ncclAllReduce(partial_cx, partial_cx,
                              count, ncclUint64, ncclSum,
                              ctx.comms[gpu_id], ctx.streams[gpu_id]));
-    // T-OVERLAP: replace blocking cudaStreamSynchronize with a recorded event.
-    // Downstream mod-reduce / moddown / add-to-ct kernels run on the SAME stream
-    // and therefore correctly serialize after the AllReduce — no host-side wait
-    // needed. The CPU thread now returns immediately and can launch the next
-    // rotation's modup, overlapping it with this rotation's ~291 ms AllReduce.
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // The event-record below is harmless plumbing kept for future rotation-pipelining
+    // experiments; deployed Phase 4b code does not wait on this event because
+    // rotation N+1 reads rotation N's output, leaving no slack to overlap.
     if (gpu_id < (int)ctx.allreduce_done_events.size() &&
         ctx.allreduce_done_events[gpu_id]) {
         CUDA_CHECK(cudaEventRecord(ctx.allreduce_done_events[gpu_id],
@@ -252,66 +258,72 @@ void keyswitching_output_aggregation(
         rns_tool.scaleAndRound_HPS_Q_Ql(c2, t_cks.get(), s);
     }
 
-    // ---- Step 1: T-MODUP (per-digit mod-up; each GPU computes only its owned digits) ----
-    // CONTIGUOUS ownership: GPU g owns digits [g * d_count, (g+1) * d_count).
-    // The DKS evks shard (in the DKS variant) and the relin_keys path (single-GPU
-    // baseline-style) both treat the evks pointer array as global-indexed.
-    // Uneven contiguous sharding: distribute remainder across the first GPUs so
-    // each GPU owns either floor(beta/n) or floor(beta/n)+1 contiguous digits.
-    // Some keys at smaller chain levels have beta < n_gpus (e.g., beta=3 with 4 GPUs):
-    // the trailing GPUs receive d_count=0 and become no-ops for those keys.
+    // ---- Step 1: mod-up (FULL — replicated on every GPU) ----
+    // (T-MODUP-FIX-2 2026-05-10): Reverted modup_partial → full rns_tool.modup
+    // because the partial code path indexed DKS shards by chain-level beta but
+    // the shards were sized at dnum (= max-chain beta). At lower chain levels
+    // chain_beta < dnum, so trailing GPUs' contiguous shards covered the wrong
+    // global digits and the partial KS kernel dereferenced nullptr evks slots.
+    // STRIDED ownership + FULL modup keeps each GPU's evks coverage of any
+    // prefix [0, chain_beta) intact, at the cost of replicating the modup work
+    // (which was the T-MODUP win). Net effect on Phase 4b: bootstrap is the
+    // same as the May-7 working state (~2,098 ms).
     size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
-    const size_t d_count_min = beta / static_cast<size_t>(n_gpus);
-    const size_t remainder   = beta % static_cast<size_t>(n_gpus);
-    const size_t d_start = static_cast<size_t>(gpu_id) * d_count_min +
-                           std::min(static_cast<size_t>(gpu_id), remainder);
-    const size_t d_count = d_count_min + (static_cast<size_t>(gpu_id) < remainder ? 1 : 0);
 
-    // Layout 1 (CONTIGUOUS): allocate only d_count digits worth of t_mod_up.
-    // At N=65536, beta=36, n_gpus=4 this is ~195 MB instead of ~780 MB per GPU.
-    // Allocate at least 1 element to avoid cudaMallocAsync(0) returning a
-    // sentinel pointer that some downstream sanity checks reject. The kernel
-    // does not read this buffer when d_count == 0, so a 1-element scratch
-    // is sufficient.
-    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(
-        std::max<size_t>(1, d_count * size_QlP_n), s);
+    // Number of strided digits owned by THIS GPU at this chain level.
+    // (beta - gpu_id + n_gpus - 1) / n_gpus, clamped to ≥ 0.
+    size_t d_count = (beta > static_cast<size_t>(gpu_id))
+        ? (beta - static_cast<size_t>(gpu_id) + static_cast<size_t>(n_gpus) - 1)
+              / static_cast<size_t>(n_gpus)
+        : 0;
+
+    // Allocate FULL t_mod_up (sized for all beta digits). At N=65,536, beta=20:
+    // ~220 MB per GPU. Fits comfortably on 64 GB H100s.
+    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
     {
         NVTX_SCOPE("modup");
-        rns_tool.modup_partial(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
-                               key_parms.scheme(), d_start, d_count, s);
+        rns_tool.modup(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
+                       key_parms.scheme(), s);
     }
 
-    // ---- Step 2: partial inner product (CONTIGUOUS owned digits) ----
+    // ---- Step 2: partial inner product (STRIDED owned digits) ----
     auto cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
 
     // Defensive zero-init of cx: even though the kernel writes every output
     // position when d_count > 0, an explicit memset guards against the
     // d_count == 0 path (small chain levels where beta < n_gpus) where the
-    // kernel launch would still be made but contribute nothing meaningful;
-    // also makes ncclAllReduce's contract on the input buffer trivially valid.
+    // kernel launch is skipped and this GPU contributes a zero partial sum.
     CUDA_CHECK(cudaMemsetAsync(cx.get(), 0,
                                2 * size_QlP_n * sizeof(uint64_t), s));
 
     auto reduction_threshold =
         (1 << (bits_per_uint64 - static_cast<uint64_t>(log2(key_modulus.front().value())) - 1)) - 1;
 
-    // Use custom evks shard if provided (DKS), otherwise use relin_keys
+    // Use custom evks shard if provided (DKS), otherwise use relin_keys.
+    // Both are global beta-sized arrays; the kernel only accesses owned (non-null)
+    // entries via the strided pattern.
     const uint64_t *const *evks_ptr = custom_evks
         ? const_cast<const uint64_t *const *>(custom_evks)
         : relin_keys.public_keys_ptr();
 
-    // Kernel walks d in [0, d_count) over CONTIGUOUS local t_mod_up,
-    // and indexes evks at the global digit index d_start + d.
-    // Skip kernel launch entirely when d_count == 0 (this GPU contributes 0).
+    // Kernel walks d = gpu_id, gpu_id+n_gpus, ... < beta over the FULL t_mod_up
+    // (replicated on every GPU) and indexes evks at GLOBAL d (always owned).
+    // Skip kernel launch entirely when d_count == 0 (β < n_gpus and this GPU
+    // owns nothing — happens at the deepest chain levels of bootstrap).
     if (d_count > 0)
     partial_key_switch_inner_prod<<<size_QlP_n / blockDimGlb.x, blockDimGlb, 0, s>>>(
         cx.get(), t_mod_up.get(), evks_ptr,
         modulus_QP, n, size_QP, size_QP * n,
         size_QlP, size_QlP_n, size_Q, size_Ql,
-        d_start, d_count,
+        static_cast<size_t>(gpu_id), static_cast<size_t>(n_gpus), beta,
         reduction_threshold);
 
     // ---- T-STRAGGLER: GPU-side barrier before AllReduce (see DKS variant) ----
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // The ready_events barrier was meant to eliminate the ~530 ms straggler-wait
+    // bucket inside ncclAllReduce. Finer NVTX measurement reclassified that bucket
+    // as AllReduce kernel time (not host-side jitter), so this barrier currently
+    // serializes a non-existent skew. Plumbing left in place for future tracing.
     if (gpu_id < (int)ctx.ready_events.size() && ctx.ready_events[gpu_id]) {
         CUDA_CHECK(cudaEventRecord(ctx.ready_events[gpu_id], s));
         for (int g = 0; g < n_gpus; ++g) {
@@ -350,8 +362,10 @@ void keyswitching_output_aggregation(
             ct_i, cx_i, modulus_QP, n, size_Ql);
     }
 
-    // T-OVERLAP (reverted): host sync. The cross-stream wait at writeback was
-    // buggy under some chain levels — restore the safe sync until investigated.
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // The oa_done_events handoff was reverted (cross-stream wait at writeback was
+    // buggy at some chain levels); the deployed path falls back to the safe host
+    // sync below. Event record kept for symmetry with the DKS variant.
     if (gpu_id < (int)ctx.oa_done_events.size() && ctx.oa_done_events[gpu_id]) {
         CUDA_CHECK(cudaEventRecord(ctx.oa_done_events[gpu_id], s));
     }
@@ -395,36 +409,30 @@ void keyswitching_output_aggregation_dks(
     auto size_Ql_n   = size_Ql * n;
     auto size_QlP_n  = size_QlP * n;
 
-    // ---- Step 1: T-MODUP — per-digit mod-up (only owned digits) ----
-    // CONTIGUOUS ownership: GPU g owns digits [g*d_count .. (g+1)*d_count).
-    // This matches the contiguous layout used by DistGaloisKeyStore so that
-    // evks[d_start + d] is always non-null for d in [0, d_count).
-    // Uneven contiguous sharding (see non-DKS variant for rationale).
+    // ---- Step 1: mod-up (FULL — replicated on every GPU) ----
+    // (T-MODUP-FIX-2 2026-05-10): see non-DKS variant comment for the full
+    // rationale. STRIDED ownership at full key beta means modup must run over
+    // all beta digits because the partial KS kernel walks strided indices that
+    // cover the entire [0, beta) range across all GPUs.
     size_t beta = rns_tool.v_base_part_Ql_to_compl_part_QlP_conv().size();
-    const size_t d_count_min = beta / static_cast<size_t>(n_gpus);
-    const size_t remainder   = beta % static_cast<size_t>(n_gpus);
-    const size_t d_start = static_cast<size_t>(gpu_id) * d_count_min +
-                           std::min(static_cast<size_t>(gpu_id), remainder);
-    const size_t d_count = d_count_min + (static_cast<size_t>(gpu_id) < remainder ? 1 : 0);
 
-    // Layout 1 (CONTIGUOUS): only d_count digits' worth of t_mod_up.
-    // Allocate at least 1 element to avoid cudaMallocAsync(0) returning a
-    // sentinel pointer that some downstream sanity checks reject. The kernel
-    // does not read this buffer when d_count == 0, so a 1-element scratch
-    // is sufficient.
-    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(
-        std::max<size_t>(1, d_count * size_QlP_n), s);
+    size_t d_count = (beta > static_cast<size_t>(gpu_id))
+        ? (beta - static_cast<size_t>(gpu_id) + static_cast<size_t>(n_gpus) - 1)
+              / static_cast<size_t>(n_gpus)
+        : 0;
+
+    auto t_mod_up = make_cuda_auto_ptr<uint64_t>(beta * size_QlP_n, s);
     {
         NVTX_SCOPE("modup");
-        rns_tool.modup_partial(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
-                               key_parms.scheme(), d_start, d_count, s);
+        rns_tool.modup(t_mod_up.get(), c2, phantom_ctx.gpu_rns_tables(),
+                       key_parms.scheme(), s);
     }
 
-    // ---- Step 2: partial inner product (CONTIGUOUS owned digits) ----
+    // ---- Step 2: partial inner product (STRIDED owned digits) ----
     auto cx = make_cuda_auto_ptr<uint64_t>(2 * size_QlP_n, s);
-    // Defensive zero-init: covers the d_count == 0 case (small chain levels)
-    // and gives ncclAllReduce a trivially valid input even if the kernel
-    // is skipped on this GPU.
+    // Defensive zero-init: covers the d_count == 0 case (small chain levels
+    // where beta < n_gpus and this GPU contributes nothing) and gives
+    // ncclAllReduce a trivially valid input even if the kernel is skipped.
     CUDA_CHECK(cudaMemsetAsync(cx.get(), 0,
                                2 * size_QlP_n * sizeof(uint64_t), s));
 
@@ -438,14 +446,16 @@ void keyswitching_output_aggregation_dks(
         const_cast<const uint64_t *const *>(custom_evks),
         modulus_QP, n, size_QP, size_QP * n,
         size_QlP, size_QlP_n, size_Q, size_Ql,
-        d_start, d_count,
+        static_cast<size_t>(gpu_id), static_cast<size_t>(n_gpus), beta,
         reduction_threshold);
 
     // ---- T-STRAGGLER: GPU-side barrier before AllReduce ----
-    // Record this GPU's "ready for AllReduce" event, then make this stream wait
-    // on ALL GPUs' ready events. After this point every stream has reached the
-    // same logical point, so ncclAllReduce starts in lockstep across the 4 GPUs
-    // and the previous ~530 ms straggler wait is eliminated.
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // The "~530 ms straggler wait" this barrier targeted turned out to be
+    // ncclAllReduce kernel time itself (NVTX re-measurement on 2026-04-19), not
+    // host-side launch jitter. The barrier therefore eliminates a non-existent
+    // skew. Plumbing kept correct and harmless; the published null result is
+    // documented in the paper rather than masked by removing the code.
     if (gpu_id < (int)ctx.ready_events.size() && ctx.ready_events[gpu_id]) {
         CUDA_CHECK(cudaEventRecord(ctx.ready_events[gpu_id], s));
         for (int g = 0; g < n_gpus; ++g) {
@@ -482,10 +492,12 @@ void keyswitching_output_aggregation_dks(
             ct_i, cx_i, modulus_QP, n, size_Ql);
     }
 
-    // T-OVERLAP: replace the trailing host sync with a recorded event. The
-    // rotation caller's writeback memcpy (on stream0) will cudaStreamWaitEvent
-    // on this event before issuing its memcpy, preserving GPU-side ordering
-    // without blocking the worker CPU thread.
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // The oa_done_events handoff was meant to let stream0 (rotation writeback)
+    // gate on this event without blocking the worker CPU thread. Deployed Phase
+    // 4b does not exploit it: the worker thread joins after each rotation, so
+    // the alleged CPU-thread savings have no downstream consumer. The trailing
+    // host sync (else branch) remains the actual ordering primitive.
     if (gpu_id < (int)ctx.oa_done_events.size() && ctx.oa_done_events[gpu_id]) {
         CUDA_CHECK(cudaEventRecord(ctx.oa_done_events[gpu_id], s));
     } else {

@@ -161,6 +161,40 @@ vector<PhantomCiphertext> MMEvaluator::decompress_ciphertext(PhantomCiphertext &
 }
 
 void MMEvaluator::matrix_mul(vector<vector<double>> &x, vector<vector<double>> &y, vector<PhantomCiphertext> &res) {
+  // Full 64-column path. Implemented as a thin wrapper over the range
+  // variant so the original code path keeps the same observable behaviour,
+  // and the per-column inner loop has only one definition to audit.
+  matrix_mul_range(x, y, res, 0, 64);
+}
+
+void MMEvaluator::matrix_mul_range(vector<vector<double>> &x,
+                                   vector<vector<double>> &y,
+                                   vector<PhantomCiphertext> &res,
+                                   int cols_lo,
+                                   int cols_hi) {
+  // Output-channel split MatMul. Computes only columns [cols_lo, cols_hi)
+  // of the 64-column NEXUS MatMul. To make this a real (per-thread, per-GPU)
+  // speedup vs single-GPU full-range, BOTH the dominant per-column compute
+  // AND the shared decompress setup are restricted to the column range:
+  //
+  //   • Each output column i uses b_expanded_cts[i*768 + j] for j in [0,768)
+  //   • Each b_compressed_cts[k] decompresses into N expanded ciphertexts
+  //     [k*N, (k+1)*N) for N = ckks->degree (8192 at logN=13)
+  //   • Therefore column i lives in compressed indices [i*768/N, ((i+1)*768)/N]
+  //   • For [cols_lo, cols_hi) we only decompress compressed indices in the
+  //     union of these ranges — at logN=13 with 64 cols across 6 compressed
+  //     this is typically 2–3 of the 6 (a 2-3× setup reduction)
+  //
+  // Compress is cheap (a few ms total), so we run the full compress for all
+  // 6 b_cts to keep the index math identical to single-GPU. Only decompress
+  // is restricted.
+  if (cols_lo < 0)  cols_lo = 0;
+  if (cols_hi > 64) cols_hi = 64;
+  if (cols_lo >= cols_hi) {
+    res.clear();
+    return;
+  }
+
   auto timer = Timer();
 
   // Encode plaintext
@@ -173,10 +207,11 @@ void MMEvaluator::matrix_mul(vector<vector<double>> &x, vector<vector<double>> &
     a_pts.push_back(pt);
   }
 
-  // Ciphertext encoding & compression
+  // Ciphertext encoding & compression (cheap; same as single-GPU full path).
   timer.start();
 
-  int b_cts_count = 768 * 64 / ckks->degree;
+  size_t N_degree = ckks->degree;
+  int b_cts_count = 768 * 64 / (int)N_degree;
   vector<PhantomCiphertext> b_compressed_cts;
   b_compressed_cts.reserve(b_cts_count);
 
@@ -189,24 +224,46 @@ void MMEvaluator::matrix_mul(vector<vector<double>> &x, vector<vector<double>> &
   timer.stop();
   cout << "Compression took: " << timer.duration<chrono::milliseconds>() << " milliseconds" << endl;
 
-  // Ciphertext decompression
+  // Ciphertext decompression — RESTRICTED to compressed indices needed by
+  // the [cols_lo, cols_hi) slice. Index k of compressed[k] expands to the
+  // 768*64/N_degree-aligned chunk of expanded indices [k*N_degree, (k+1)*N_degree),
+  // so we pick the [k_lo, k_hi) range that covers expanded indices
+  // [cols_lo*768, cols_hi*768).
   timer.start();
 
-  vector<PhantomCiphertext> b_expanded_cts;
+  int exp_lo = cols_lo * 768;
+  int exp_hi = cols_hi * 768;
+  int k_lo = exp_lo / (int)N_degree;
+  int k_hi = (exp_hi + (int)N_degree - 1) / (int)N_degree;
+  if (k_hi > b_cts_count) k_hi = b_cts_count;
 
-  for (size_t i = 0; i < b_compressed_cts.size(); i++) {
-    vector<PhantomCiphertext> temp_cts = decompress_ciphertext(b_compressed_cts[i]);
-    cout << "Expanded ciphertext #" << i + 1 << endl;
-    b_expanded_cts.insert(b_expanded_cts.end(), make_move_iterator(temp_cts.begin()), make_move_iterator(temp_cts.end()));
+  // Sparse map from expanded-index → ciphertext (vector of length 64*768
+  // = 49152 at logN=13 worst case, but only the slice we decompressed is
+  // populated). We keep it dense for index-symmetry with the single-GPU
+  // path so the per-column inner loop reads `b_expanded_cts[i*768 + j]`
+  // exactly as before.
+  vector<PhantomCiphertext> b_expanded_cts(64 * 768);
+
+  for (int k = k_lo; k < k_hi; k++) {
+    vector<PhantomCiphertext> temp_cts = decompress_ciphertext(b_compressed_cts[k]);
+    cout << "Expanded ciphertext #" << k + 1 << " (slice)" << endl;
+    int dst = k * (int)N_degree;
+    for (size_t t = 0; t < temp_cts.size() && (size_t)(dst + (int)t) < b_expanded_cts.size(); t++) {
+      b_expanded_cts[dst + (int)t] = std::move(temp_cts[t]);
+    }
   }
 
   timer.stop();
-  cout << "Decompression took: " << timer.duration<chrono::seconds>() << " seconds" << endl;
+  cout << "Decompression took: " << timer.duration<chrono::seconds>() << " seconds"
+       << " (k=[" << k_lo << "," << k_hi << ") of " << b_cts_count << ")" << endl;
 
-  // Perform plain-cipher matrix multiplication
+  // Perform plain-cipher matrix multiplication restricted to [cols_lo, cols_hi).
   timer.start();
 
-  for (int i = 0; i < 64; i++) {
+  res.clear();
+  res.reserve(cols_hi - cols_lo);
+
+  for (int i = cols_lo; i < cols_hi; i++) {
     PhantomCiphertext res_col_ct;
     vector<PhantomCiphertext> temp_cts(768);
 
@@ -228,7 +285,8 @@ void MMEvaluator::matrix_mul(vector<vector<double>> &x, vector<vector<double>> &
   }
 
   timer.stop();
-  cout << "Result calculation time: " << timer.duration<chrono::milliseconds>() << " milliseconds" << endl;
+  cout << "Result calculation time: " << timer.duration<chrono::milliseconds>() << " milliseconds"
+       << " (cols [" << cols_lo << "," << cols_hi << "))" << endl;
 }
 
 void MMEvaluator::matrix_mul_unified(

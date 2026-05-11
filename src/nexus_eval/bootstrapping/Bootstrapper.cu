@@ -3042,23 +3042,33 @@ void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphe
   NVTX_SCOPE("bootstrap_sparse_3");
   fprintf(stderr, "[BOOT] bootstrap_sparse_3 START\n"); fflush(stderr);
   // ModRaise
-  modraise_inplace(cipher);
-  cudaDeviceSynchronize();
+  {
+    NVTX_SCOPE("BS_MOD_RAISE");           // Lane MGPU-NSYS scope: H1 modraise wall time
+    modraise_inplace(cipher);
+    cudaDeviceSynchronize();
+  }
   fprintf(stderr, "[BOOT] modraise done, cipher levels=%zu\n", cipher.coeff_modulus_size()); fflush(stderr);
 
   const auto modulus = ckks->context->first_context_data().parms().coeff_modulus();
   cipher.scale() = ((double)modulus[0].value());
 
   // Subsum (inline, not the subsum() function)
-  PhantomCiphertext rot;
-  for (auto i = logn; i < logNh; i++) {
-    fprintf(stderr, "[BOOT] inline subsum iter i=%ld, step=%d\n", (long)i, (1<<i)); fflush(stderr);
-    ckks->evaluator.rotate_vector(cipher, (1 << i), *(ckks->galois_keys), rot);
-    cudaDeviceSynchronize();
-    fprintf(stderr, "[BOOT] rotate done\n"); fflush(stderr);
-    ckks->evaluator.add_inplace(cipher, rot);
-    cudaDeviceSynchronize();
-    fprintf(stderr, "[BOOT] add done\n"); fflush(stderr);
+  // Lane MGPU-NSYS: BS_SUBSUM = sum of subsum-rotation+add iterations.
+  // Each rotate_vector internally drives the GaloisKeyStore async H->D
+  // prefetch (NVTX scope "prefetch step=*" / "ks_load_*"); BS_SUBSUM
+  // therefore captures the host-driven KEY_FETCH wait + subsum compute.
+  {
+    NVTX_SCOPE("BS_SUBSUM");
+    PhantomCiphertext rot;
+    for (auto i = logn; i < logNh; i++) {
+      fprintf(stderr, "[BOOT] inline subsum iter i=%ld, step=%d\n", (long)i, (1<<i)); fflush(stderr);
+      ckks->evaluator.rotate_vector(cipher, (1 << i), *(ckks->galois_keys), rot);
+      cudaDeviceSynchronize();
+      fprintf(stderr, "[BOOT] rotate done\n"); fflush(stderr);
+      ckks->evaluator.add_inplace(cipher, rot);
+      cudaDeviceSynchronize();
+      fprintf(stderr, "[BOOT] add done\n"); fflush(stderr);
+    }
   }
   fprintf(stderr, "[BOOT] subsum loop done, before coefftoslot_3\n"); fflush(stderr);
 
@@ -3078,7 +3088,7 @@ void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphe
     ckks->evaluator.complex_conjugate(rtn, *(ckks->galois_keys), conjrtn);
     ckks->evaluator.add_inplace_reduced_error(rtn, conjrtn);
   } else {
-    // Coefficient to Slots
+    // Coefficient to Slots — already wraps NVTX_SCOPE("coefftoslot_3")
     fprintf(stderr, "[BOOT] calling coefftoslot_3\n"); fflush(stderr);
     coefftoslot_3(rtn, cipher);
     cudaDeviceSynchronize();
@@ -3086,10 +3096,14 @@ void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphe
   }
 
   // Modular Reduction
+  // Lane MGPU-NSYS: BS_MOD_REDUCTION = sin/cos + arcsin Remez evaluation
   fprintf(stderr, "[BOOT] calling mod_reducer->modular_reduction\n"); fflush(stderr);
   PhantomCiphertext modrtn;
-  mod_reducer->modular_reduction(modrtn, rtn);
-  cudaDeviceSynchronize();
+  {
+    NVTX_SCOPE("BS_MOD_REDUCTION");
+    mod_reducer->modular_reduction(modrtn, rtn);
+    cudaDeviceSynchronize();
+  }
   fprintf(stderr, "[BOOT] modular_reduction done\n"); fflush(stderr);
 
   if (logn == 0) {
@@ -3116,6 +3130,10 @@ void Bootstrapper::bootstrap_sparse_3(PhantomCiphertext &rtncipher, PhantomCiphe
     ckks->evaluator.add_inplace_reduced_error(rtncipher, rotrtncipher);
   } else {
     // Slots to Coefficients
+    // Lane MGPU-NSYS: BS_SLOTTOCOEFF wraps slottocoeff_3 explicitly so we
+    // can attribute the 4th major bootstrap phase even though the
+    // logN=15 sparse path does not have its own outer NVTX scope.
+    NVTX_SCOPE("BS_SLOTTOCOEFF");
     slottocoeff_3(rtncipher, modrtn);
   }
 

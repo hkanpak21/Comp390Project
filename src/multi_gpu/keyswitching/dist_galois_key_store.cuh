@@ -10,19 +10,24 @@
  *   Shard per GPU:           ceil(beta/P) × ... = ~136 MB
  *   50 bootstrap keys total: ~6.8 GB per GPU   (vs ~27 GB full replication)
  *
- * Each GPU holds only its assigned digit shard. After T-MODUP, the layout is
- * CONTIGUOUS: GPU g owns digits [g*(beta/n_gpus) .. (g+1)*(beta/n_gpus)).
- * (Earlier strided layout was d % n_gpus == g; switched to contiguous so that
- * Phantom's modup_partial(d_start, d_count) writes its dst slots contiguously
- * — matching the partial KS kernel's `for (d = 0; d < d_count; ++d)` loop.)
- * Unowned digit slots in the evks pointer array are null — the partial KS
- * kernel only ever indexes evks[d_start + local_d] for local_d in [0, d_count),
- * which always lands on an owned (non-null) slot.
+ * Each GPU holds only its assigned digit shard. The layout is **STRIDED**:
+ * GPU g owns digits {d : d % n_gpus == g}. This is the only layout that is
+ * stable under chain-level changes — at the chain level used by the OA
+ * (chain-level beta = ceil(size_Ql / alpha) ≤ dnum), the GPU walks the same
+ * strided pattern and lands on owned digits regardless of whether beta < dnum.
  *
- * Edge case: if beta % n_gpus != 0, the trailing digits are currently NOT
- * sharded (we assume cleanly divisible). The OA call site asserts this. If
- * future configs need uneven sharding, extend `generate` to assign the
- * remainder to GPU n_gpus-1 and update the OA d_count computation to match.
+ * (T-MODUP-FIX-2 2026-05-10): An earlier CONTIGUOUS layout
+ *   GPU g owns digits [g*(dnum/n_gpus) .. (g+1)*(dnum/n_gpus))
+ * deadlocked the OA at lower chain levels because the OA accesses
+ * evks[0..chain_beta-1] where chain_beta < dnum. Trailing GPUs' contiguous
+ * shards (e.g. evks[18..35]) were never accessed; instead the OA tried to
+ * read evks[8..15] on GPU 1 — those slots were nullptr → kernel OOB
+ * dereference → cudaFreeAsync invalid argument cascade → NCCL P2P fail.
+ * STRIDED ownership avoids this because evks[g, g+n_gpus, g+2n, ...] for
+ * any prefix [0, beta) is always covered by GPU g's shard.
+ * Unowned digit slots in the evks pointer array are null — the partial KS
+ * kernel only ever indexes evks[d] for d ∈ {gpu_id, gpu_id+n_gpus, ...} ∩ [0, beta),
+ * which always lands on an owned (non-null) slot.
  *
  * Usage
  * -----
@@ -140,15 +145,13 @@ public:
                 // Build host-side pointer array (null for unowned digits)
                 std::vector<uint64_t*> host_ptrs(beta, nullptr);
 
-                // T-MODUP: CONTIGUOUS ownership. Distribute remainder across the
-                // first GPUs so each owns floor(beta/n) or floor(beta/n)+1 digits.
-                size_t d_count_min = beta / static_cast<size_t>(n_gpus_);
-                size_t remainder   = beta % static_cast<size_t>(n_gpus_);
-                size_t d_start_g = static_cast<size_t>(g) * d_count_min +
-                                   std::min(static_cast<size_t>(g), remainder);
-                size_t d_count_g = d_count_min + (static_cast<size_t>(g) < remainder ? 1 : 0);
-
-                for (size_t d = d_start_g; d < d_start_g + d_count_g; d++) {
+                // STRIDED ownership: GPU g owns digit d iff d % n_gpus == g.
+                // (T-MODUP-FIX-2 2026-05-10): MUST be strided, not contiguous,
+                // so that owned digits cover any prefix [0, chain_beta) of the
+                // global digit array — not just [0, dnum/n_gpus). See header.
+                for (size_t d = static_cast<size_t>(g);
+                     d < beta;
+                     d += static_cast<size_t>(n_gpus_)) {
                     // Allocate device buffer for this owned digit
                     size_t n_elem = comps[d].size();
                     uint64_t *dptr = nullptr;
@@ -246,15 +249,11 @@ public:
 
                 std::vector<uint64_t*> host_ptrs(beta, nullptr);
 
-                // T-MODUP: CONTIGUOUS ownership across the GLOBAL GPU set with
-                // uneven-remainder distribution (see single-node generate()).
-                size_t d_count_min = beta / static_cast<size_t>(total_gpus);
-                size_t remainder   = beta % static_cast<size_t>(total_gpus);
-                size_t d_start_g = static_cast<size_t>(global_rank) * d_count_min +
-                                   std::min(static_cast<size_t>(global_rank), remainder);
-                size_t d_count_g = d_count_min + (static_cast<size_t>(global_rank) < remainder ? 1 : 0);
-
-                for (size_t d = d_start_g; d < d_start_g + d_count_g; d++) {
+                // STRIDED ownership across the GLOBAL GPU set: global rank r
+                // owns digit d iff d % total_gpus == r. (T-MODUP-FIX-2)
+                for (size_t d = static_cast<size_t>(global_rank);
+                     d < beta;
+                     d += static_cast<size_t>(total_gpus)) {
                     size_t n_elem = comps[d].size();
                     uint64_t *dptr = nullptr;
                     DKS_CUDA_CHECK(cudaMalloc(&dptr, n_elem * sizeof(uint64_t)));

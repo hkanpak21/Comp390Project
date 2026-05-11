@@ -168,11 +168,26 @@ public:
     // barriers around ncclAllReduce in keyswitching_output_aggregation_dks.
     // Created in DistributedContext::create() with cudaEventDisableTiming and
     // shallow-copied into the per-call MultiGpuContext built by galois_oa.cu.
+    //
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // (Also: commit 44c849f / docs/PRD §S28.) T-STRAGGLER barrier was measured
+    // null on H100×4 NVSwitch (NCCL ring already issues launches in lockstep
+    // within ~5 µs); T-OVERLAP cross-stream gate exposed a chain-level
+    // dependent race and was reverted to a host sync. Events are still
+    // allocated and recorded so the dispatch path is unchanged, but they no
+    // longer eliminate the straggler wait. Kept as scaffolding for future
+    // re-enable behind a runtime flag.
     const std::vector<cudaEvent_t>& ready_events()         const { return ready_events_; }
     const std::vector<cudaEvent_t>& allreduce_done_events() const { return allreduce_done_events_; }
     // T-OVERLAP: end-of-OA events recorded after oa_add_to_ct in
     // keyswitching_output_aggregation_dks. Waited on by the rotation caller's
     // writeback memcpy (on stream0) so we can drop the trailing host sync.
+    //
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // (Also: commit 44c849f / docs/PRD §S28.) The cross-stream wait was buggy
+    // under chain levels where size_Ql changed between rotations and was
+    // reverted in favor of the safe cudaStreamSynchronize at line ~358.
+    // Event recording is still emitted but the writeback never waits on it.
     const std::vector<cudaEvent_t>& oa_done_events()        const { return oa_done_events_; }
 
 private:
@@ -187,12 +202,24 @@ private:
     // on before ncclAllReduce. allreduce_done_events_ is recorded after the
     // ncclAllReduce enqueue (replaces the cudaStreamSynchronize that previously
     // blocked the CPU and prevented overlap with the next rotation's modup).
+    //
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // (Also: commit 44c849f / docs/PRD §S28.) Both barrier paths produced null
+    // wins on H100×4 NVSwitch and the OA-done cross-stream gate was unsafe at
+    // chain transitions. Events are still allocated/recorded but the kernel
+    // order on the same stream already enforces the required dependency, and
+    // the host-side sync at line 358 of output_aggregation.cu is what actually
+    // serializes the writeback.
     std::vector<cudaEvent_t> ready_events_;
     std::vector<cudaEvent_t> allreduce_done_events_;
     // T-OVERLAP: per-GPU events recorded at the END of
     // keyswitching_output_aggregation_dks (after oa_add_to_ct), replacing the
     // trailing cudaStreamSynchronize. Used as a cross-stream gate for the
     // rotation caller's writeback memcpy on stream0.
+    //
+    // T-OVERLAP: inert — see docs/HPC_PRIMER.md §6.3 for null-result analysis.
+    // (Also: commit 44c849f / docs/PRD §S28.) Reverted to host sync; events
+    // are still recorded for trace continuity.
     std::vector<cudaEvent_t> oa_done_events_;
     phantom::EncryptionParameters parms_;
     bool destroyed_ = false;
