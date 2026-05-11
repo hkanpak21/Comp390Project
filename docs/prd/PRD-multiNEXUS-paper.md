@@ -244,7 +244,7 @@ The Ralph loop should pick the **first unblocked slice from this list per iterat
 4. ✅ `PROFILE-03` — `scripts/mn5/slurm_softmax_mgpu_nsys.sh` registered under PROFILE-03 framing (commit `1a9f2bd`). Submission still pending as `RUN-PROFILE-03`.
 
 **Phase C — submit jobs on the patched binaries (each is its own slice; one commit per submission, body includes JOBID):**
-5. ✅ `RUN-PROFILE-01` — submitted on MN5 as JOBID `40417847`; manifest at `docs/runs/RUN-PROFILE-01_40417847.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
+5. ✅ `RUN-PROFILE-01` — **resubmitted as JOBID `40420523`** (JOBID `40417847` failed MAE gate); manifest at `docs/runs/RUN-PROFILE-01-RETRY_40420523.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
 6. ✅ `RUN-PROFILE-02` — submitted on MN5 as JOBID `40417947`; manifest at `docs/runs/RUN-PROFILE-02_40417947.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
 7. ✅ `RUN-PROFILE-03` — submitted on MN5 as JOBID `40418387`; manifest at `docs/runs/RUN-PROFILE-03_40418387.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
 8. ✅ `RUN-PROFILE-04` — submitted on MN5 as JOBID `40418644`; manifest at `docs/runs/RUN-PROFILE-04_40418644.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
