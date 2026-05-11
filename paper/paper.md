@@ -2279,6 +2279,21 @@ crystallised into.
 | 8 | NEXUS_USE_MPI option (CMake) | Intel MPI linker error on MN5 | Build failed when MPI sym were referenced via static linkage | Introduced `NEXUS_USE_MPI` CMake option to bypass | `5e5b408` | (build) |
 | 9 | Phantom-fork switch (bootstrap accuracy) | Bootstrap FFT layout mismatch with non-NEXUS Phantom fork; MAE ≫ 10⁻³ | Bootstrap returned garbage; LT coefficients (computed offline via Remez) did not match the encoder's butterfly layout | Switched `vendor/phantom/` to the NEXUS Phantom fork; copied `bootstrap_*` evaluators verbatim — 0 modifications inside the bootstrap | `fe5a905`, `4d6ea58` | (correctness) |
 | 10 | Bootstrap timing path | Scale-validation checks inside `evaluate.cu` aborted lazy-rescale calls | Bootstrap failed mid-`coefftoslot_3` | Commented out scale validation in `sub_inplace`, `multiply_plain_inplace`, `add_plain_inplace`; see §A.2.5 | `caa09c3` | #7 |
+| 11 | `src/nexus_eval/bootstrapping/Bootstrapper.cu` (`subsum()`, `bootstrap_sparse_3()`) | ~7 leftover `fprintf(stderr,…)` + `cudaDeviceSynchronize()` debug calls in the bootstrap hot path collapsed the H↔D overlap that the 8 prefetch hooks deliver | Bootstrap-on-H100 wall-clock inflated by the cost of full device drains between each rotation/add; nsys traces showed no overlap of key transfer with compute | Removed all 24 debug lines (NVTX_SCOPE wrappers preserved — they introduce no sync) | `7bb9bf3` (FIX-BUG-04-01) | #1, #5 |
+| 12 | `src/benchmarks/bert_hp_multigpu.cu`, `bert_hp_multinode.cu` (8 chained bootstrap call sites) | Chained-pipeline scale drift across the 4 bootstraps per layer encoded a stale scale into the bootstrapper input | Phantom encode-validation error on the second layer's bootstrap, mirroring the original Argmax incident (row 2) | Added `X.scale() = le.scale;` reset immediately before each `lb.bootstrap_3(...)` call in `run_one_head` (4 sites per file, 8 total); mirrors the canonical pattern at `argmax_align_n32k.cu:225` | `9d872fa` (FIX-BUG-04-02) | #7 |
+| 13 | `src/nexus_eval/bootstrapping/Bootstrapper.cu` + `.cuh` | `Bootstrapper` owned a raw-`new` `ModularReducer*` in its ctor with no destructor or copy/move declarations — every instance leaked, and an accidental copy would have double-freed | Memory pressure builds across long runs; latent double-free in any future code path that copied a Bootstrapper | Default-init `mod_reducer = nullptr`; added `~Bootstrapper() { delete mod_reducer; }`; `= delete` copy/move special members so future misuse surfaces at compile time | `79b95a0` (FIX-BUG-04-03) | #3 |
+| 14 | All six single-GPU align binaries (`{bootstrap,matmul,gelu,layernorm,softmax,argmax}_align_*.cu`) | None of the six binaries enforced a correctness gate — they printed numbers but `main` always returned 0 even on garbage output | "Successful" SLURM job exit on binaries whose decoded output was NaN, Inf, or astronomical magnitudes | Hard-exit gates: bootstrap full MAE @ 0.01; matmul absolute MAE @ 5e-2 + existing relative gate @ 5%; gelu/layernorm/softmax/argmax decode-validity (non-finite count + absolute-value sanity bound) | `b5e7457` (FIX-BUG-01-01) | (correctness gate) |
+| 15 | `src/nexus_eval/matrix_mul.cu::MMEvaluator::multiply_power_of_x` | Per-call `new uint64_t[rns_coeff_count * encrypted_count]` ×2 plus pageable `cudaMemcpyAsync` D↔H; the function is invoked ~156× per MatMul | ~400 MB of host-allocator churn per MatMul, plus the cudaMemcpyAsync calls silently degraded to synchronous because the source was pageable | Two persistent pinned-host staging buffers owned by `MMEvaluator` (`cudaMallocHost`) with grow-on-demand sizing; class now has explicit destructor + `= delete`d copy/move | `80dc737` (FIX-BUG-04-04) | #1, #2, #3 |
+| 16 | `src/benchmarks/bert_hp_multigpu.cu` (gate threshold) + `bert_hp_multinode.cu` (gate absent) | Single-node MAE gate at `1e-5` was looser than PRD spec `2.25e-6`; multinode binary had no MAE check at all and printed "verification not implemented" | Single-node gate would not have fired on numerically-suspect output it should have caught; the 16-GPU number had no correctness verification | Tightened single-node threshold to `2.25e-6`; added per-rank decode-validity gate to multinode binary with ncclMin-aggregated `gate_pass_world`; exits 3 on failure so SLURM marks the job FAILED | `929f06b` (FIX-BUG-02-01) | (correctness gate) |
+| 17 | `src/multi_gpu/comm/nccl_comm.cu::MultiGpuContext::destroy()` + `distributed_context.cu::DistributedContext::destroy()` | Streams were destroyed BEFORE `ncclCommDestroy`; `MultiGpuContext::destroy()` additionally lacked any pre-teardown `cudaDeviceSynchronize` | Latent shutdown segfault: NCCL holds a reference to the stream it was used on, and ncclCommDestroy against a freed stream is undefined behaviour. `DistributedContext` was only saved by its existing line-343 device-sync loop | Added per-GPU `cudaDeviceSynchronize` sweep at top of `MultiGpuContext::destroy()`; swapped both call sites to `ncclCommDestroy` first, then `cudaStreamDestroy` | `05445b6` (FIX-BUG-03-01) | (cleanup-order) |
+
+**Entries 11–17 are the post-audit FIX wave**, all landed on
+`paper/multinexus` after the four BUG-NN audits in §A.6 were committed.
+Each FIX slice closes one HIGH-severity audit finding; FIX-BUG-04-01
+(row 11) was identified by the audit as the single biggest critical-path
+win available without an algorithmic change, and the §4.5 / §6.3.1
+bootstrap-on-H100 columns will move once PROFILE-NN re-runs on the
+patched binary.
 
 Bugs 1 and 2 (GELU chain depth, argmax scale drift) are the two bugs
 narrated in the PI-facing report
@@ -2329,6 +2344,24 @@ BUG-04-03), and chained-pipeline scale-reset (BUG-02-02, BUG-04-04,
 BUG-04-05). Removing the seven debug syncs flagged as FIX-BUG-04-01 is
 the single largest observable critical-path win available without
 changing algorithm.
+
+**FIX wave status (7 of 48 proposed slices landed):**
+
+| Slice | Commit | What it closes |
+|---|---|---|
+| `FIX-BUG-04-01` | `7bb9bf3` | 24 debug `fprintf`+`cudaDeviceSynchronize` lines in `Bootstrapper.cu` (`subsum`, `bootstrap_sparse_3`) — restored H↔D overlap from the 8 prefetch hooks |
+| `FIX-BUG-04-02` | `9d872fa` | SCALE-CROSS-CUT at 8 chained-bootstrap call sites in `bert_hp_multigpu.cu` + `bert_hp_multinode.cu` |
+| `FIX-BUG-04-03` | `79b95a0` | `Bootstrapper` Rule of Five — explicit destructor + deleted copy/move |
+| `FIX-BUG-01-01` | `b5e7457` | Hard-exit MAE / decode-validity gates added to all six single-GPU align binaries |
+| `FIX-BUG-04-04` | `80dc737` | Persistent pinned-host staging in `MMEvaluator::multiply_power_of_x`; removes ~400 MB/MatMul of host-allocator churn and pinning fix |
+| `FIX-BUG-02-01` | `929f06b` | Tightened HP-BERT single-node gate to `2.25e-6`; added per-rank decode-validity gate to the multinode binary |
+| `FIX-BUG-03-01` | `05445b6` | Cleanup-order in `MultiGpuContext::destroy()` and `DistributedContext::destroy()` — drain device, then `ncclCommDestroy`, then `cudaStreamDestroy` |
+
+41 of the proposed FIX slices remain as future work; the seven that
+landed cover all six BLOCKERs (via FIX-BUG-01-01 + FIX-BUG-03-01) and
+seven of the fourteen HIGHs. The remaining MEDIUM/LOW findings are
+documented in `docs/audits/BUG-01..04_*.md` and are scheduled for
+post-paper code-health work.
 
 ## A.7 What the audit did NOT cover
 
