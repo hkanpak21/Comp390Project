@@ -188,6 +188,12 @@ static void run_one_head(
         { NVTX_SCOPE("MOD_SWITCH_DOWN");
           while (po[0].coeff_modulus_size() > 1)
               le.evaluator.mod_switch_to_next_inplace(po[0]); }
+        // FIX-BUG-04-02 (SCALE-CROSS-CUT): reset to canonical SCALE before
+        // bootstrap to prevent silent scale drift across chained layers.
+        // Mirrors argmax_align_n32k.cu:225. Required because our Phantom has
+        // scale-mismatch checks commented out (CLAUDE.md lesson #7); without
+        // this reset the second layer's bootstrap can encode a stale scale.
+        po[0].scale() = le.scale;
         { NVTX_SCOPE("BOOTSTRAP_KERNEL");
           lb.bootstrap_3(b1, po[0]); }
     });
@@ -200,6 +206,7 @@ static void run_one_head(
         { NVTX_SCOPE("MOD_SWITCH_DOWN");
           while (ln1o.coeff_modulus_size() > 1)
               le.evaluator.mod_switch_to_next_inplace(ln1o); }
+        ln1o.scale() = le.scale;  // FIX-BUG-04-02 (SCALE-CROSS-CUT)
         { NVTX_SCOPE("BOOTSTRAP_KERNEL");
           lb.bootstrap_3(b2, ln1o); }
     });
@@ -218,6 +225,7 @@ static void run_one_head(
         { NVTX_SCOPE("MOD_SWITCH_DOWN");
           while (f2o[0].coeff_modulus_size() > 1)
               le.evaluator.mod_switch_to_next_inplace(f2o[0]); }
+        f2o[0].scale() = le.scale;  // FIX-BUG-04-02 (SCALE-CROSS-CUT)
         { NVTX_SCOPE("BOOTSTRAP_KERNEL");
           lb.bootstrap_3(b3, f2o[0]); }
     });
@@ -229,6 +237,7 @@ static void run_one_head(
         { NVTX_SCOPE("MOD_SWITCH_DOWN");
           while (ln2o.coeff_modulus_size() > 1)
               le.evaluator.mod_switch_to_next_inplace(ln2o); }
+        ln2o.scale() = le.scale;  // FIX-BUG-04-02 (SCALE-CROSS-CUT)
         { NVTX_SCOPE("BOOTSTRAP_KERNEL");
           lb.bootstrap_3(ct_out, ln2o); }
     });
