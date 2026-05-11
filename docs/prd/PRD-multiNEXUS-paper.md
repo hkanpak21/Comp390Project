@@ -1,10 +1,21 @@
 ---
 title: "PRD — multiNEXUS Paper: Per-Op Multi-GPU Typology + End-to-End at uniform logN=15"
-status: needs-triage
+status: in-progress
 owner: hkanpak21
 created: 2026-05-11
-labels: [needs-triage, paper, multi-gpu, fhe]
+last_updated: 2026-05-11 (evening)
+labels: [in-progress, paper, multi-gpu, fhe, ralph-pickup]
+branch: paper/multinexus
 ---
+
+> **Status (2026-05-11 evening):** 25 of ~33 slices have committed work; first FIX
+> commit landed (`FIX-BUG-04-01` removes Bootstrapper debug syncs); both
+> `MODULE-02` and `MODULE-03` from Module Sketches now exist with tests; assembled
+> `paper/paper.md` is 21,334 words across 10 sections. Critical gap: **no
+> PROFILE-NN or MEASURE-NN job has actually run on MN5 yet**, so 8 `[TODO:
+> confirm with PROFILE-NN trace]` markers in §6 and the entire numerical body of
+> §7 are still placeholders. See "Execution Status" and "Pending slices for the
+> Ralph loop" below.
 
 # PRD: multiNEXUS Paper — Per-Op Multi-GPU Typology + End-to-End at uniform logN=15
 
@@ -161,38 +172,115 @@ Explicitly NOT in this PRD:
 
 ## Further Notes
 
-### Vertical slice initial map (with dependencies)
+### Vertical slice map (with status as of 2026-05-11 evening)
 
-Phase order is: BUG → PROFILE / MEASURE → WRITE → APPENDIX. DOC slices have no upstream and can run any time.
+Phase order is: BUG → FIX → PROFILE / MEASURE → WRITE → APPENDIX → MODULE/DOC. DOC slices have no upstream and can run any time. Status legend: ✅ done with commit, 🟡 partial (script committed, job not yet run on MN5), ❌ not started, 📋 placeholder (TODOs to backfill once data lands).
 
-| Slice ID | Description | Depends on |
-|---|---|---|
-| `DOC-01` | Update CLAUDE.md with paper plan, 9-section structure, per-op template, slice convention, commit convention | none |
-| `DOC-02` | Audit MD files; archive `docs/PI_PRESENTATION.md` and `docs/PI_PRESENTATION_SLIDES.md` | none |
-| `DOC-03` | Publish this PRD (the file you are reading) | none |
-| `BUG-01` | Bug audit pass on six align binaries | none |
-| `BUG-02` | Bug audit pass on `bert_hp_multigpu` + `bert_hp_multinode` | none |
-| `BUG-03` | Bug audit pass on `src/multi_gpu/` framework | none |
-| `BUG-04` | Bug audit pass on `src/nexus_eval/` evaluator wrappers | none |
-| `PROFILE-01` | Generate 4-GPU nsys for matmul_align_n8k | BUG-01 (matmul) |
-| `PROFILE-02` | Generate 4-GPU nsys for gelu_mgpu_align | BUG-01 (gelu) |
-| `PROFILE-03` | Generate 4-GPU nsys for softmax_mgpu_align | BUG-01 (softmax) |
-| `PROFILE-04` | Generate 4-GPU nsys for argmax_align_n32k | BUG-01 (argmax) |
-| `MEASURE-01` | Goal 2 unit run: 1-head × 2-layer @ logN=15 on 1 GPU | BUG-02 |
-| `MEASURE-02` | Saturation check from MEASURE-01 output (analyzer) | MEASURE-01 |
-| `MEASURE-03` | Goal 2 data-parallel throughput at 4-GPU | MEASURE-01, BUG-02 |
-| `MEASURE-04` | Goal 2 data-parallel throughput at 16-GPU | MEASURE-03 |
-| `WRITE-S2` | Section 2 (Introduction) draft | DOC-01 |
-| `WRITE-S3` | Section 3 (Background) draft | DOC-01 |
-| `WRITE-S4` | Section 4 (Identifying NEXUS on H100) | none (existing data) |
-| `WRITE-S5` | Section 5 (Multi-GPU strategies — DKS, HP, DP) | none (architectural) |
-| `WRITE-S6.{op}` | Six per-op subsections of Section 6 (Goal 1 typology) | corresponding PROFILE-NN + BUG-01 |
-| `WRITE-S7` | Section 7 (Goal 2 end-to-end) | MEASURE-01..04 |
-| `WRITE-S8` | Section 8 (Discussion) | WRITE-S6, WRITE-S7 |
-| `WRITE-S9` | Section 9 (Conclusion + future work) | WRITE-S8 |
-| `WRITE-Appendix` | Appendix A (NEXUS/Phantom mods + bug log) | BUG-01..04 |
+| Slice ID | Description | Depends on | Status | Commit |
+|---|---|---|---|---|
+| `DOC-01` | Update CLAUDE.md with paper plan, 9-section structure, per-op template, slice convention | none | ✅ | 8e04b14 |
+| `DOC-02` | Archive `docs/PI_PRESENTATION.md` and `docs/PI_PRESENTATION_SLIDES.md` | none | ✅ | 8e04b14 |
+| `DOC-03` | Publish this PRD | none | ✅ | 8e04b14 |
+| `DOC-04` | Assemble `paper/paper.md` from section drafts | WRITE-S1..S9, WRITE-Appendix | ✅ | 2a053fd |
+| `BUG-01` | Bug audit pass on six align binaries | none | ✅ | 19b07c1 |
+| `BUG-02` | Bug audit pass on `bert_hp_multigpu` + `bert_hp_multinode` | none | ✅ | 4ec55b0 |
+| `BUG-03` | Bug audit pass on `src/multi_gpu/` framework | none | ✅ | f2c9087 |
+| `BUG-04` | Bug audit pass on `src/nexus_eval/` evaluator wrappers | none | ✅ | 877c32a |
+| `FIX-BUG-04-01` | Remove debug fprintf+sync from Bootstrapper hot path | BUG-04 | ✅ | 7bb9bf3 |
+| `FIX-BUG-04-02` | SCALE-CROSS-CUT: add `cipher.scale() = SCALE` reset before bootstrap at HP-BERT chained call sites (mirrors `argmax_align_n32k.cu:225`) | BUG-04 | ❌ | — |
+| `FIX-BUG-04-03` | BOOT-RAW-OWN: give `Bootstrapper` an explicit destructor for the raw-`new` `ModularReducer*` (Rule of Five, lesson #3) | BUG-04 | ❌ | — |
+| `FIX-BUG-04-04` | MATMUL-NEW-PER-CALL: hoist `new uint64_t[…]` + `cudaMemcpyAsync` out of `multiply_power_of_x` into a persistent staging buffer | BUG-04 | ❌ | — |
+| `FIX-BUG-01-01` | Add MAE gates to all six single-GPU align binaries (currently none gate) | BUG-01 | ❌ | — |
+| `FIX-BUG-02-01` | Tighten HP-BERT MAE gate to PRD `2.25e-6` target; add gate to multinode binary | BUG-02 | ❌ | — |
+| `FIX-BUG-03-01` | Resolve two HIGH cleanup-order risks in `DistributedContext::destroy()` | BUG-03 | ❌ | — |
+| `PROFILE-01` | 4-GPU nsys for matmul_align_n8k | BUG-01 (matmul), FIX-BUG-04-01 | 🟡 ae54775 (script only — not submitted) | — |
+| `PROFILE-02` | 4-GPU nsys for gelu_mgpu_align | BUG-01 (gelu), FIX-BUG-04-01 | 🟡 867e13f (script only — not submitted) | — |
+| `PROFILE-03` | 4-GPU nsys for softmax_mgpu_align | BUG-01 (softmax), FIX-BUG-04-01 | ❌ **script not yet written** | — |
+| `PROFILE-04` | 4-GPU nsys for argmax_align_n32k | BUG-01 (argmax), FIX-BUG-04-01 | 🟡 cce11c9 (script only — not submitted) | — |
+| `MEASURE-01` | Goal 2 unit run: `bert_hp_multigpu --n-gpus 1 --heads 1 --layers 2 --N 32768` | BUG-02, FIX-BUG-04-01, FIX-BUG-04-02 | 🟡 e7e8e5c (script only — not submitted) | — |
+| `MEASURE-02` | Saturation analyzer (Module Sketch #1) + tests | none (pure module) | ✅ | 43c1753 |
+| `MEASURE-03` | Goal 2 data-parallel throughput at 4-GPU | MEASURE-01, BUG-02 | 🟡 11a6f4e (script only — not submitted) | — |
+| `MEASURE-04` | Goal 2 data-parallel throughput at 16-GPU | MEASURE-03 | 🟡 8d400da (script only — not submitted) | — |
+| `MODULE-02` | Per-op result aggregator (Module Sketch #2) + tests | none (pure module) | ✅ | 1f702e6 |
+| `MODULE-03` | Vertical-slice dependency tracker (Module Sketch #3) + tests | none (pure module) | ✅ | 1f52771 |
+| `WRITE-S1` | Section 1 (Abstract) | WRITE-S6, WRITE-S7 (numerical anchors) | ✅ | 1cb494b — but **needs refresh after backfills** |
+| `WRITE-S2` | Section 2 (Introduction) | DOC-01 | ✅ | 9e12c0a |
+| `WRITE-S3` | Section 3 (Background) | DOC-01 | ✅ | 93fe523 |
+| `WRITE-S4` | Section 4 (Identifying NEXUS on H100) | none (existing data) | ✅ | c3af0ce |
+| `WRITE-S5` | Section 5 (Multi-GPU strategies — DKS, HP, DP) | none (architectural) | ✅ | 41022ce |
+| `WRITE-S6` | Section 6 (Goal 1 per-op typology) — six op subsections | PROFILE-01..04 + BUG-01 | 📋 93d2b71 — **8 `[TODO: confirm with PROFILE-NN trace]` markers awaiting backfill** |
+| `WRITE-S7` | Section 7 (Goal 2 end-to-end) | MEASURE-01..04 | 📋 e3132c1 — **skeleton only, numerical cells empty** |
+| `WRITE-S8` | Section 8 (Discussion) | WRITE-S6, WRITE-S7 | ✅ | 5e9b9fd |
+| `WRITE-S9` | Section 9 (Conclusion + future work) | WRITE-S8 | ✅ | 6205489 |
+| `WRITE-Appendix` | Appendix A (NEXUS/Phantom mods + bug-fix log) | BUG-01..04, FIX-* | ✅ b494963 — **needs refresh as new FIX-* commits land** |
+| `BACKFILL-S6` | Replace 8 `[TODO: PROFILE-NN]` markers in §6 with real trace numbers; re-run MODULE-02 aggregator to refresh §6.4 table | PROFILE-01..04 outputs | ❌ — |
+| `BACKFILL-S7` | Fill §7 numerical cells (unit time, layer-1 vs layer-2, saturation pass/fail, 1/4/16-GPU latency, 4/16-GPU throughput) | MEASURE-01..04 outputs | ❌ — |
+| `REFRESH-S1` | Update Abstract numbers after BACKFILL-S6/S7 | BACKFILL-S6, BACKFILL-S7 | ❌ — |
+| `REFRESH-paper-md` | Re-run `scripts/assemble_paper.sh` after any BACKFILL/REFRESH | any preceding REFRESH | ❌ — |
 
-**Critical path:** DOC-01 → BUG-01..04 → (PROFILE-01..04 + MEASURE-01..04 in parallel) → WRITE-S6.{op} + WRITE-S7 → WRITE-S8 → WRITE-S9.
+**Critical path now:** FIX-BUG-04-02 → MEASURE-01 → MEASURE-03 → MEASURE-04 → BACKFILL-S7. In parallel: PROFILE-03 → submit PROFILE-01..04 → BACKFILL-S6. Then REFRESH-S1 + REFRESH-paper-md.
+
+### Execution status as of 2026-05-11 evening
+
+- 25 commits on local branch `paper/multinexus`. **Branch not yet pushed to origin** — origin still on `multiNEXUS` (~25 commits behind).
+- All 4 BUG audits done (~13.5K words across `docs/audits/BUG-{01..04}_*.md`).
+- 1 of 7 expected FIX slices landed (`FIX-BUG-04-01`, the highest-impact).
+- All 3 PRD module sketches implemented + unit-tested (Sketch #1 as `MEASURE-02`, Sketches #2-3 as `MODULE-02/03`).
+- All 10 paper section drafts exist; `paper/paper.md` assembled (21,334 words).
+- 6 of 7 PROFILE/MEASURE SLURM scripts committed; **0 jobs submitted to MN5** since 10:54 this morning (the argmax-v8192/v30k retry).
+- §6 carries 8 `[TODO]` markers; §7 is a numerical skeleton.
+- Branch reflects work BEFORE the Bootstrapper sync removal landed in MN5 binaries — every cell in `docs/PER_OP_VS_NEXUS.md` §4.4 will need re-checking once jobs run on the patched build.
+
+### Pending slices for the Ralph loop (in dependency-correct order)
+
+The Ralph loop should pick the **first unblocked slice from this list per iteration**, produce one commit (slice ID + `Depends-on` footer), then exit. Promise phrase for completion: `<promise>PRD-RALPH-COMPLETE</promise>` after the final REFRESH-paper-md commit.
+
+**Phase A — push and lock in current work (do first, before any other slice):**
+1. `OPS-push` — push `paper/multinexus` to `origin` so all in-flight work is durable. One-line operation; not a code commit but worth a status note.
+
+**Phase B — FIX slices that block measurements (must land before MEASURE-01 runs):**
+2. `FIX-BUG-04-02` — SCALE-CROSS-CUT for HP-BERT bootstrap call sites. Mirror the `cipher.scale() = SCALE` reset from `argmax_align_n32k.cu:225` at every `bs.bootstrap_3(...)` call site inside `bert_hp_multigpu.cu` (and `bert_hp_multinode.cu` if applicable). Without this, `MEASURE-01` may fail at layer 2 with the same Phantom encode-validation error that broke Argmax before `FIX-ARGMAX`.
+3. `FIX-BUG-01-01` — add MAE gates to the six single-GPU align binaries. Each binary already prints MAE; wrap with `assert(mae < threshold)` style check. Threshold = `1e-5` for non-MatMul; `5%` relative for MatMul.
+4. `PROFILE-03` — write `scripts/mn5/slurm_softmax_mgpu_nsys.sh` mirroring the existing `slurm_gelu_mgpu_nsys.sh` pattern. The only structurally-incomplete PROFILE deliverable.
+
+**Phase C — submit jobs on the patched binaries (each is its own slice; one commit per submission, body includes JOBID):**
+5. `RUN-PROFILE-01` — rebuild + submit matmul nsys on MN5; commit captures JOBID and log path.
+6. `RUN-PROFILE-02` — rebuild + submit gelu nsys; commit captures JOBID and log path.
+7. `RUN-PROFILE-03` — submit softmax nsys (after PROFILE-03 lands); commit captures JOBID and log path.
+8. `RUN-PROFILE-04` — submit argmax nsys; commit captures JOBID and log path.
+9. `RUN-MEASURE-01` — submit HP-BERT 1-head × 2-layer unit run; commit captures JOBID, log path, and the saturation-check output (`MODULE-01` analyzer applied to the layer-1/layer-2 timings).
+10. `RUN-MEASURE-03` — submit DP-4 throughput run; commit captures JOBID and aggregate throughput.
+11. `RUN-MEASURE-04` — submit DP-16 throughput run; commit captures JOBID and aggregate throughput.
+
+**Phase D — additional FIX slices that don't block MEASURE but tighten the paper:**
+12. `FIX-BUG-04-03` — Bootstrapper destructor (BOOT-RAW-OWN).
+13. `FIX-BUG-04-04` — MatMul host-alloc out of `multiply_power_of_x`.
+14. `FIX-BUG-02-01` — tighten HP-BERT MAE gate; add multinode gate.
+15. `FIX-BUG-03-01` — `DistributedContext::destroy()` cleanup-order fixes.
+
+**Phase E — backfill paper sections with the new measured numbers:**
+16. `BACKFILL-S6` — replace each of the 8 `[TODO: PROFILE-NN]` markers in `paper/sections/06_per_op_typology.md` with the corresponding measured number from the RUN-PROFILE-NN logs. Re-run `scripts/MODULE-02-per-op-aggregator` to refresh the §6.4 cross-bucket summary table.
+17. `BACKFILL-S7` — fill the numerical cells in `paper/sections/07_end_to_end.md` from RUN-MEASURE-01..04. Saturation check pass/fail; 1-GPU baseline; 4/16-GPU strong-scaling; 4/16-GPU throughput.
+18. `REFRESH-S1` — update `paper/sections/01_abstract.md` headline numbers if BACKFILL-S6/S7 changed them (likely yes, given the post-FIX-BUG-04-01 baseline shift).
+19. `REFRESH-Appendix` — append the new FIX-* commit hashes to the bug-fix log in `paper/sections/appendix_a.md`.
+20. `REFRESH-paper-md` — re-run `scripts/assemble_paper.sh` to regenerate `paper/paper.md`. Final commit before promise.
+
+**Completion criterion (Ralph promise):**
+After slice 20 (`REFRESH-paper-md`) commits successfully, output:
+
+```
+<promise>PRD-RALPH-COMPLETE</promise>
+```
+
+This signals the loop to terminate.
+
+**Per-iteration constraints:**
+- One slice per iteration, one commit per iteration. Never bundle.
+- Every commit follows the format from "Commit cadence guidance for agents" below: `<slice-id>(<area>): <imperative>` subject; why-then-what-then-where body; `Slice: <id>; Depends-on: <upstream ids>` footer.
+- If the picked slice's upstream dependency is not yet ✅ in this map, skip and pick the next unblocked slice. Update the map entry's status column when the slice lands.
+- For RUN-* slices: the SLURM job may still be PENDING when the iteration ends. In that case, commit the submission record (JOBID + log path) and let a later iteration check the result. Add an inline note in the relevant paper section if numbers will land later.
+- For FIX-* slices: rebuild the binary on MN5 in the same commit body (capture the build log) so RUN-* slices can rely on the patched binary.
+- All commits must be on branch `paper/multinexus`.
 
 ### Estimated wall-clock for SLURM jobs
 - 4 nsys jobs × 5–15 min each, plus MN5 queue priority delay.
