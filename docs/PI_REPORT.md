@@ -63,9 +63,13 @@ For absolute single-GPU numbers, after this semester's work all six operations m
 
 ---
 
-## TODO — to be filled in when measurements land
+## A note on argmax at NEXUS-published vocabulary (30,522)
 
-- **Argmax at vocab=30,522** — NEXUS published 2.48 s on A100 for this vocabulary size (BERT-vocab). We currently have vocab=8 measurements only (their smaller fixture). The vocab=30,522 measurement is queued on MN5 as `JOBID 40388582` (script `scripts/mn5/slurm_argmax_v30k.sh`); single-GPU + 4-GPU configurations. Result will be appended here when the job lands.
+NEXUS published 2.48 s for argmax at the full BERT vocabulary (30,522, padded to 32,768 for QuickMax). We tried to reproduce this comparison on H100 and discovered that NEXUS's `argmax_test` only handles a single sparse-encoded ciphertext — at their `logN=15`, `sparse_slots=8192` setup, that means vocab ≤ 8,192 in one ciphertext. Their 2.48 s number must therefore come from a multi-cipher tournament (argmax-of-argmaxes across multiple ciphertexts), which is not in their open source.
+
+We added an input-validation guard so our binary refuses cleanly when `vocab > sparse_slots` instead of segfaulting. As the largest single-ciphertext comparison we can run honestly, we measured vocab=8,192 (the maximum that fits) — JOBID 40397435, queued. Result table row will be appended once it lands.
+
+A real apples-to-apples comparison to NEXUS's published 2.48 s requires implementing the multi-cipher tournament (split vocab across ciphertexts, run per-cipher argmax in parallel, then combine) — listed in "What is left" below as a follow-up item.
 
 ---
 
@@ -75,7 +79,7 @@ Three follow-ups, in order of impact for the paper:
 
 1. **Slot-axis SIMD packing for HP-BERT** (~2-3 days of work). NEXUS's open source is missing the chained pipeline that gets them their 37.3 s end-to-end number — that number depends on SIMD slot folding (their Algorithm 3) which packs all 12 attention heads into a single ciphertext, so the entire inference does only 4 bootstraps total instead of 4 per head per layer. Without SIMD packing we cannot beat 37.3 s end-to-end on a fair workload, no matter how many GPUs we throw at it. With SIMD packing, projection on our 4× H100 brings the end-to-end below NEXUS's published number even before 16-GPU.
 2. **Per-rank context pooling** (~1 day). The small-op multi-GPU efficiency at 16-GPU is currently capped at 9–22% because each rank rebuilds its PhantomContext per op call. Sharing one context per rank across many calls should lift this to 30–50% for softmax, layernorm, GELU.
-3. **Argmax at vocab=30,522** (already queued, see TODO above). Closes the remaining cell in the headline table.
+3. **Multi-cipher argmax tournament** — required for an apples-to-apples vs NEXUS's published vocab=30,522 number (~1 day). Splits the vocabulary across multiple sparse-encoded ciphertexts, runs per-cipher argmax in parallel, combines the results in a final tournament. NEXUS does not ship this in their open source; the published 2.48 s number is theirs.
 
 ---
 
