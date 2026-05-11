@@ -2,6 +2,8 @@
 
 This document explains the complete system architecture for Halil's Comp 390 project. Read this to understand every component, what it does, where it came from, and what we modified.
 
+> **Note (2026-05-11):** The Layer-3 `CtPipeline` / `MultiNodePipeline` infrastructure described below has been moved to `src/multi_gpu/archive/pipeline/`. The active multi-GPU paths are the per-thread `PhantomContext` pattern (HP-BERT, HP-LLaMA) and the DKS rotation infrastructure under `src/multi_gpu/keyswitching/`. The pipeline-parallel benchmarks that depended on `CtPipeline` (`bert_e2e_multigpu`, `bert_connected_*`, `bert_multinode_e2e`, etc.) are in `src/benchmarks/archive/`. See `docs/PER_OP_VS_NEXUS.md` for the current measurement strategy.
+
 ---
 
 ## Layer 0: The Math (CKKS FHE)
