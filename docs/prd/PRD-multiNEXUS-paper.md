@@ -231,6 +231,83 @@ Phase order is: BUG → FIX → PROFILE / MEASURE → WRITE → APPENDIX → MOD
 - §6 carries 8 `[TODO]` markers; §7 is a numerical skeleton.
 - Branch reflects work BEFORE the Bootstrapper sync removal landed in MN5 binaries — every cell in `docs/PER_OP_VS_NEXUS.md` §4.4 will need re-checking once jobs run on the patched build.
 
+### Critical blockers as of 2026-05-12 morning
+
+**Problem 1: Binary rebuild failures (JOBID 40422689 and 40422772)**
+
+Two consecutive clean-rebuild attempts failed to produce usable binaries on MN5:
+- **JOBID 40422689** (submitted 2026-05-11 evening): Attempted `cmake` + `make -j20 matmul_align_n8k bert_hp_multigpu` after full cache clear. Job completed but binaries do not exist at `/gpfs/projects/etur02/hkanpak/Comp390Project/build/bin/{matmul_align_n8k,bert_hp_multigpu}`.
+- **JOBID 40422772** (submitted after 40422689 failure): Attempted identical clean rebuild strategy (rm -rf build, fresh cmake, parallel make). Job exited queue but binaries still absent.
+
+**Symptoms:**
+- `ls -lh` on build/bin/ shows files missing
+- No stderr/stdout captured to understand failure reason (logs not yet retrieved)
+
+**Impact:** 
+- Blocks PROFILE-01..04 resubmission (need corrected matmul_align_n8k binary)
+- Blocks MEASURE-01..04 resubmission (need corrected bert_hp_multigpu binary with SCALE-CROSS-CUT fix)
+- Cascades to block BACKFILL-S6/S7 (slices 16-17), which then block REFRESH-S1 (slice 18)
+- Ralph loop cannot progress past slice 20 (REFRESH-paper-md was executed as a no-op since BACKFILL slices are unreachable)
+
+**Next session action:**
+1. SSH to MN5 and inspect SLURM job output logs:
+   ```bash
+   cat /gpfs/projects/etur02/hkanpak/logs/{matmul,bert}_mgpu_*.{out,err} 2>/dev/null | tail -100
+   ```
+2. Identify the CMake or linker error (likely same multi-symbol issue as 40422689, or a new linker/NCCL/NTL resolution failure)
+3. If linker symbol duplication: check if `libnexus_multi_gpu.a` has duplicate object files; try `ar t` to list members
+4. If NCCL/NTL missing: verify LD_LIBRARY_PATH setup in CMakeLists.txt or SLURM script wrapper
+5. Once root cause identified, either:
+   - Fix CMakeLists.txt and re-sync src/ to MN5, or
+   - Adjust SLURM rebuild script to work around the issue (e.g., incremental build instead of clean)
+6. Resubmit a new rebuild job with diagnosed fix
+7. Once binaries exist, proceed with PROFILE-01..04 and MEASURE-01..04 resubmission using `resubmit_after_build.sh`
+
+---
+
+**Problem 2: Stale job submissions (JOBID 40420523, 40418716 failed; cannot resubmit until rebuild succeeds)**
+
+Two jobs submitted earlier have failed and are awaiting resubmission:
+- **JOBID 40420523** (RUN-PROFILE-01 matmul nsys): Failed MAE correctness gate. Reason: binary was compiled from source before FIX-BUG-01-02 (ciphertext initialization fix) was applied. The local source code is correct, but the MN5 binary is stale.
+- **JOBID 40418716** (RUN-MEASURE-04 16-GPU throughput): Failed with wrapper script path error. Reason: script attempted to exec `/tmp/hp_throughput_wrap_*` on compute nodes, but /tmp is node-local (not NFS-shared). Wrapper path was fixed in `slurm_bert_hp_throughput_16gpu.sh` to use `${PROJECT}/build/tmp/` instead.
+
+**Symptoms:**
+- 40420523: stdout shows "Phase 1 absolute MAE gate failed: 4.121346e+05 (threshold 5e-2)"
+- 40418716: stderr shows "execve(): /tmp/hp_throughput_wrap_*: No such file or directory"
+
+**Impact:**
+- Cannot extract results for BACKFILL-S6 and BACKFILL-S7 until these jobs complete successfully
+- The wrapper-path fix is already committed, but the binary fix (rebuild) is blocking
+- Ralph loop slices 16-17 (BACKFILL-S6/S7) are unreachable until jobs rerun
+
+**Dependency chain:**
+```
+Rebuild job succeeds → resubmit 40420523 & 40418716 → jobs complete → BACKFILL-S6/S7 possible → REFRESH-S1 possible → REFRESH-paper-md possible
+```
+
+**Next session action:**
+1. Once rebuild produces binaries (Problem 1 resolved):
+   - Execute `/tmp/resubmit_after_build.sh` (or equivalent script that waits for rebuild, checks binaries, syncs script, submits both PROFILE-01 and MEASURE-04)
+   - Capture new JOBIDs for resubmission record
+2. Monitor job completion (wall time: ~20 min each for nsys, ~12 min for throughput)
+3. Once both complete, extract output files via:
+   ```bash
+   scp mn5-gpu:/gpfs/projects/etur02/hkanpak/logs/matmul_mgpu_nsys_*.* \
+       experiments/results/2026-05-11_h100x4_matmul-mgpu-nsys/raw/
+   scp mn5-gpu:/gpfs/projects/etur02/hkanpak/logs/bert_hp_throughput_16gpu_*.log \
+       experiments/results/2026-05-11_h100x16_bert-hp-tput-16gpu/raw/
+   ```
+4. Parse outputs and perform BACKFILL-S6 and BACKFILL-S7 with real numbers
+
+---
+
+**Summary for next session:**
+- **Critical path blocker:** Binary rebuild failure (40422689, 40422772 both failed)
+- **Secondary blocker:** Job resubmission awaits rebuild success
+- **Work to do:** Diagnose CMake/linker error, fix rebuild, resubmit jobs, extract + backfill results
+
+The Ralph loop completed through slice 20 (REFRESH-paper-md) but cannot progress to slices 16-18 (BACKFILL-S6/S7, REFRESH-S1) without resolving Problem 1.
+
 ### Pending slices for the Ralph loop (in dependency-correct order)
 
 The Ralph loop should pick the **first unblocked slice from this list per iteration**, produce one commit (slice ID + `Depends-on` footer), then exit. Promise phrase for completion: `<promise>PRD-RALPH-COMPLETE</promise>` after the final REFRESH-paper-md commit.
