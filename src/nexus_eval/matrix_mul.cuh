@@ -15,11 +15,40 @@ class MMEvaluator {
  private:
   CKKSEvaluator *ckks = nullptr;
 
+  // FIX-BUG-04-04 (MATMUL-NEW-PER-CALL): persistent pinned-host staging
+  // buffers used by multiply_power_of_x for the D2H/CPU-shuffle/H2D round
+  // trip. Replaces the per-call `new uint64_t[rns_coeff_count * encrypted_count]`
+  // allocations the BUG-04 audit flagged (matrix_mul.cu:58-83). Allocated
+  // lazily on the first call that needs them, grown only when a larger
+  // call demands more capacity, and freed in ~MMEvaluator. cudaMallocHost
+  // returns memory that is already pinned, so the cudaMemcpyAsync calls in
+  // multiply_power_of_x are genuinely asynchronous (CLAUDE.md lesson #1).
+  uint64_t *host_stage_a_ = nullptr;
+  uint64_t *host_stage_b_ = nullptr;
+  size_t host_stage_capacity_ = 0;  // measured in uint64_t elements
+
+  // Reserve at least `needed` uint64_t elements in both staging buffers.
+  // Grows by reallocation (cudaFreeHost + cudaMallocHost) only when needed
+  // exceeds current capacity; reuses the existing buffers otherwise.
+  void ensure_host_stage_capacity_(size_t needed);
+
   void enc_compress_ciphertext(vector<double> &values, PhantomCiphertext &ct);
   vector<PhantomCiphertext> decompress_ciphertext(PhantomCiphertext &encrypted);
 
  public:
   MMEvaluator(CKKSEvaluator &ckks) : ckks(&ckks) {}
+
+  // FIX-BUG-04-04 (Rule of Five): MMEvaluator now owns pinned-host buffers
+  // through cudaMallocHost. Copying would alias the same device-pinned
+  // pointers and double-free at destruction; moving would be feasible but
+  // no caller needs it (every benchmark constructs one MMEvaluator per
+  // thread and never copies it). Forbid both; surfaces misuse at compile
+  // time. CLAUDE.md non-negotiable lesson #3.
+  ~MMEvaluator();
+  MMEvaluator(const MMEvaluator &) = delete;
+  MMEvaluator &operator=(const MMEvaluator &) = delete;
+  MMEvaluator(MMEvaluator &&) = delete;
+  MMEvaluator &operator=(MMEvaluator &&) = delete;
 
   // Helper functions
   inline vector<vector<double>> read_matrix(const std::string &filename, int rows, int cols) {

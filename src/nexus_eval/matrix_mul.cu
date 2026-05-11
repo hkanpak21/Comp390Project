@@ -39,6 +39,32 @@ __global__ void kernel_compress_ciphertext(uint64_t *plain_data, size_t plain_sc
   }
 }
 
+MMEvaluator::~MMEvaluator() {
+  // FIX-BUG-04-04: release the pinned-host staging buffers if they were
+  // ever allocated. cudaFreeHost(nullptr) is well-defined and a no-op so
+  // this handles the "MMEvaluator constructed but multiply_power_of_x
+  // never called" case cleanly.
+  if (host_stage_a_ != nullptr) cudaFreeHost(host_stage_a_);
+  if (host_stage_b_ != nullptr) cudaFreeHost(host_stage_b_);
+  host_stage_a_ = nullptr;
+  host_stage_b_ = nullptr;
+  host_stage_capacity_ = 0;
+}
+
+void MMEvaluator::ensure_host_stage_capacity_(size_t needed) {
+  // FIX-BUG-04-04: grow-on-demand for the persistent pinned-host staging
+  // buffers. The needed size in any one multiply_power_of_x call is
+  // (rns_coeff_count * encrypted_count) uint64_t. In practice the matmul
+  // hot path stays at the largest of these across the call sequence, so
+  // reallocation happens at most a handful of times across the whole run.
+  if (needed <= host_stage_capacity_) return;
+  if (host_stage_a_ != nullptr) cudaFreeHost(host_stage_a_);
+  if (host_stage_b_ != nullptr) cudaFreeHost(host_stage_b_);
+  cudaMallocHost(&host_stage_a_, needed * sizeof(uint64_t));
+  cudaMallocHost(&host_stage_b_, needed * sizeof(uint64_t));
+  host_stage_capacity_ = needed;
+}
+
 void MMEvaluator::multiply_power_of_x(PhantomCiphertext &encrypted, PhantomCiphertext &destination, int index) {
   auto context = ckks->context;
   auto coeff_count = ckks->degree;
@@ -55,8 +81,18 @@ void MMEvaluator::multiply_power_of_x(PhantomCiphertext &encrypted, PhantomCiphe
   destination = encrypted;
   ckks->evaluator.transform_from_ntt_inplace(destination);
 
-  auto dest_data = new uint64_t[rns_coeff_count * encrypted_count];
-  auto dest_data_copy = new uint64_t[rns_coeff_count * encrypted_count];
+  // FIX-BUG-04-04 (MATMUL-NEW-PER-CALL): use persistent pinned-host
+  // staging buffers instead of `new uint64_t[…]` per call. The source of
+  // each cudaMemcpyAsync below is now pinned, so the transfers are
+  // genuinely asynchronous (CLAUDE.md lesson #1) and there is zero
+  // host-allocator churn from this call (CLAUDE.md lesson #2). The buffer
+  // grows on demand if a future call needs a larger size; otherwise the
+  // existing capacity is reused.
+  const size_t buf_elems = rns_coeff_count * encrypted_count;
+  ensure_host_stage_capacity_(buf_elems);
+  uint64_t *dest_data = host_stage_a_;
+  uint64_t *dest_data_copy = host_stage_b_;
+
   cudaMemcpyAsync(dest_data, destination.data(), encrypted_count * rns_coeff_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
   std::copy(dest_data, dest_data + rns_coeff_count * encrypted_count, dest_data_copy);
@@ -81,9 +117,7 @@ void MMEvaluator::multiply_power_of_x(PhantomCiphertext &encrypted, PhantomCiphe
 
   cudaMemcpyAsync(destination.data(), dest_data, encrypted_count * rns_coeff_count * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
   cudaStreamSynchronize(stream);
-
-  delete[] dest_data;
-  delete[] dest_data_copy;
+  // Buffers persist — no delete[] here (paired with ~MMEvaluator).
 
   ckks->evaluator.transform_to_ntt_inplace(destination);
 }
