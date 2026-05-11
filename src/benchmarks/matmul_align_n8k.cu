@@ -396,7 +396,17 @@ int main(int argc, char **argv) {
             vector<double> truth = plain_matmul_col0(matrix_4096x768,
                                                     matrix_768x64,
                                                     useful_slots);
-            double mae_single = mae(single_gpu_ref_col0, truth, useful_slots);
+            // FIX-BUG-MATMUL-02: NEXUS's matmul algorithm produces decoded
+            // values that are 2× the algebraic matmul result; the consumer
+            // is responsible for the /2.0. See vendor/nexus/cuda/src/main.cu
+            // MM_test line 103: `fabs(mm_res[i] / 2.0 - matrix_4096x64_T[0][i])`.
+            // We apply the same /2.0 here so MAE is computed against the
+            // algebraic truth.
+            vector<double> decoded_halved(single_gpu_ref_col0.size());
+            for (size_t i = 0; i < single_gpu_ref_col0.size(); i++)
+                decoded_halved[i] = single_gpu_ref_col0[i] / 2.0;
+            double mae_single = mae(decoded_halved, truth, useful_slots);
+
             printf("[Phase 1 gate] single-GPU MAE vs plain truth = %.6e "
                    "(abs tol %.0e: %s)\n",
                    mae_single, ABS_TOL,
@@ -527,8 +537,17 @@ int main(int argc, char **argv) {
             vector<double> truth = plain_matmul_col0(matrix_4096x768,
                                                     matrix_768x64,
                                                     useful_slots);
-            double mae_single = mae(single_gpu_ref_col0, truth, useful_slots);
-            double mae_multi  = mae(mgpu_ref_col0,       truth, useful_slots);
+            // FIX-BUG-MATMUL-02: NEXUS matmul produces 2× truth (see Phase 1
+            // gate comment + vendor/nexus/cuda/src/main.cu:103). Apply /2.0
+            // before MAE comparison against algebraic truth.
+            vector<double> single_halved(single_gpu_ref_col0.size());
+            vector<double> mgpu_halved(mgpu_ref_col0.size());
+            for (size_t i = 0; i < single_gpu_ref_col0.size(); i++)
+                single_halved[i] = single_gpu_ref_col0[i] / 2.0;
+            for (size_t i = 0; i < mgpu_ref_col0.size(); i++)
+                mgpu_halved[i] = mgpu_ref_col0[i] / 2.0;
+            double mae_single = mae(single_halved, truth, useful_slots);
+            double mae_multi  = mae(mgpu_halved,   truth, useful_slots);
             double delta      = std::fabs(mae_multi - mae_single);
             double rel_delta  = (mae_single > 0.0) ? (delta / mae_single)
                                                    : delta;

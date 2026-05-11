@@ -75,8 +75,15 @@ void MMEvaluator::multiply_power_of_x(PhantomCiphertext &encrypted, PhantomCiphe
   auto encrypted_count = encrypted.size();
   auto rns_coeff_count = coeff_count * coeff_mod_count;
 
-  // PORTED: use cudaStreamPerThread instead of global_variables::default_stream
-  const auto &stream = cudaStreamPerThread;
+  // FIX-BUG-MATMUL-01: use Phantom's default stream, matching the NEXUS
+  // reference (vendor/nexus/cuda/src/matrix_mul.cu:93). Earlier port used
+  // cudaStreamPerThread, but Phantom's transform_from_ntt_inplace runs on
+  // its own global default stream — the per-thread cudaMemcpyAsync below
+  // does not synchronize against that NTT kernel, so it reads stale (still
+  // NTT-domain) polynomial coefficients from `destination.data()`. This
+  // produces deterministic ~4.1e+5 MAE corruption that has been latent
+  // since the initial port (commit b4949cb).
+  const auto &stream = phantom::util::global_variables::default_stream->get_stream();
 
   destination = encrypted;
   ckks->evaluator.transform_from_ntt_inplace(destination);
@@ -298,16 +305,16 @@ void MMEvaluator::matrix_mul_range(vector<vector<double>> &x,
   res.reserve(cols_hi - cols_lo);
 
   for (int i = cols_lo; i < cols_hi; i++) {
-    PhantomCiphertext res_col_ct;
     vector<PhantomCiphertext> temp_cts(768);
 
     for (int j = 0; j < 768; j++) {
       ckks->evaluator.multiply_plain(b_expanded_cts[i * 768 + j], a_pts[j], temp_cts[j]);
     }
 
+    // Matches NEXUS reference vendor/nexus/cuda/src/matrix_mul.cu:260-263.
+    PhantomCiphertext res_col_ct;
     res_col_ct.set_scale(temp_cts[0].scale());
     ckks->evaluator.add_many(temp_cts, res_col_ct);
-
     res_col_ct.set_scale(res_col_ct.scale() * 4096);
     res.push_back(res_col_ct);
   }
