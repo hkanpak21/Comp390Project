@@ -245,7 +245,7 @@ The Ralph loop should pick the **first unblocked slice from this list per iterat
 
 **Phase C — submit jobs on the patched binaries (each is its own slice; one commit per submission, body includes JOBID):**
 5. ✅ `RUN-PROFILE-01` — submitted on MN5 as JOBID `40417847`; manifest at `docs/runs/RUN-PROFILE-01_40417847.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
-6. `RUN-PROFILE-02` — rebuild + submit gelu nsys; commit captures JOBID and log path.
+6. ✅ `RUN-PROFILE-02` — submitted on MN5 as JOBID `40417947`; manifest at `docs/runs/RUN-PROFILE-02_40417947.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
 7. `RUN-PROFILE-03` — submit softmax nsys (after PROFILE-03 lands); commit captures JOBID and log path.
 8. `RUN-PROFILE-04` — submit argmax nsys; commit captures JOBID and log path.
 9. `RUN-MEASURE-01` — submit HP-BERT 1-head × 2-layer unit run; commit captures JOBID, log path, and the saturation-check output (`MODULE-01` analyzer applied to the layer-1/layer-2 timings).
