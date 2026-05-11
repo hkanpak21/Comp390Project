@@ -244,7 +244,7 @@ The Ralph loop should pick the **first unblocked slice from this list per iterat
 4. ✅ `PROFILE-03` — `scripts/mn5/slurm_softmax_mgpu_nsys.sh` registered under PROFILE-03 framing (commit `1a9f2bd`). Submission still pending as `RUN-PROFILE-03`.
 
 **Phase C — submit jobs on the patched binaries (each is its own slice; one commit per submission, body includes JOBID):**
-5. `RUN-PROFILE-01` — rebuild + submit matmul nsys on MN5; commit captures JOBID and log path.
+5. ✅ `RUN-PROFILE-01` — submitted on MN5 as JOBID `40417847`; manifest at `docs/runs/RUN-PROFILE-01_40417847.md`. Result `scp` + `BACKFILL-S6` table refresh handled in a later iteration once COMPLETED.
 6. `RUN-PROFILE-02` — rebuild + submit gelu nsys; commit captures JOBID and log path.
 7. `RUN-PROFILE-03` — submit softmax nsys (after PROFILE-03 lands); commit captures JOBID and log path.
 8. `RUN-PROFILE-04` — submit argmax nsys; commit captures JOBID and log path.
