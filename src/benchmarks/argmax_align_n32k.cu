@@ -374,6 +374,24 @@ int main(int argc, char **argv) {
     long logN = 15;
     long logn = logN - 2;          // 13
     long sparse_slots = (1L << logn);  // 8,192
+
+    // Single-ciphertext capacity check. NEXUS's argmax_test fits the entire
+    // input vector in one sparse-encoded ciphertext: at logN=15 with
+    // sparse_slots=8192, that means vocab ≤ 8192. Larger vocabularies (e.g.
+    // their published vocab=30,522 BERT-vocab number) require splitting the
+    // input across multiple ciphertexts and running a multi-cipher tournament,
+    // which our binary does not implement. Refuse cleanly rather than crash
+    // with a vector OOB inside the input-fill loop below.
+    if (cfg.vocab > sparse_slots) {
+        fprintf(stderr,
+            "[FATAL] vocab=%d exceeds single-ciphertext capacity (sparse_slots=%ld at logN=15).\n"
+            "        NEXUS's argmax_test only handles vocab ≤ %ld in a single ciphertext.\n"
+            "        Their published vocab=30,522 number requires multi-ciphertext\n"
+            "        tournament logic which this binary does not implement.\n"
+            "        Re-run with --vocab ≤ %ld, or extend with a multi-cipher path.\n",
+            cfg.vocab, sparse_slots, sparse_slots, sparse_slots);
+        return 2;
+    }
     int  logp = 46;
     int  logq = 51;
     int  log_special_prime = 51;
