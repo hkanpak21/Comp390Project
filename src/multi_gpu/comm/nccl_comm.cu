@@ -68,6 +68,17 @@ MultiGpuContext MultiGpuContext::create(const std::vector<int> &dev_ids) {
 }
 
 void MultiGpuContext::destroy() {
+    // FIX-BUG-03-01: drain pending work on every GPU *before* tearing down
+    // streams or comms. Without this, kernels enqueued on `streams[g]`
+    // (including the AllReduce NCCL operates on) may still be in flight
+    // when cudaStreamDestroy / ncclCommDestroy run — undefined behaviour
+    // ranging from silent leaks to segfaults during shutdown.
+    // BUG-03 audit HIGH-6.
+    for (int g = 0; g < n_gpus; ++g) {
+        cudaSetDevice(device_ids[g]);
+        cudaDeviceSynchronize();
+    }
+
     for (int g = 0; g < n_gpus; ++g) {
         cudaSetDevice(device_ids[g]);
         if (g < (int)ready_events.size() && ready_events[g]) {
@@ -82,8 +93,13 @@ void MultiGpuContext::destroy() {
             cudaEventDestroy(oa_done_events[g]);
             oa_done_events[g] = nullptr;
         }
-        cudaStreamDestroy(streams[g]);
+        // FIX-BUG-03-01: NCCL holds references to the stream it was
+        // created/used on. Destroy the comm BEFORE the stream so the comm
+        // releases its handle while the stream is still valid; reversing
+        // the order leaves NCCL with a dangling stream reference at
+        // ncclCommDestroy time.
         ncclCommDestroy(comms[g]);
+        cudaStreamDestroy(streams[g]);
     }
     ready_events.clear();
     allreduce_done_events.clear();

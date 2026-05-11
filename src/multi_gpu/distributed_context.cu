@@ -387,8 +387,16 @@ void DistributedContext::destroy() {
         if (g < (int)oa_done_events_.size() && oa_done_events_[g]) {
             cudaEventDestroy(oa_done_events_[g]); oa_done_events_[g] = nullptr;
         }
-        if (streams_[g]) { cudaStreamDestroy(streams_[g]); streams_[g] = nullptr; }
+        // FIX-BUG-03-01: NCCL holds references to the stream it was used
+        // on; destroy the comm BEFORE the stream so it releases its handle
+        // while the stream is still valid. Functionally this path was
+        // already saved by the device-wide cudaDeviceSynchronize loop at
+        // line 343, but the reordering removes the fragility — if anyone
+        // ever moves or removes that sync, the previous order would
+        // segfault at ncclCommDestroy. Mirrors the same swap in
+        // MultiGpuContext::destroy() at src/multi_gpu/comm/nccl_comm.cu.
         if (comms_[g])   { ncclCommDestroy(comms_[g]);     comms_[g] = nullptr; }
+        if (streams_[g]) { cudaStreamDestroy(streams_[g]); streams_[g] = nullptr; }
         if (key_sets_[g].relin_key_data) { cudaFree(key_sets_[g].relin_key_data); key_sets_[g].relin_key_data = nullptr; }
         if (key_sets_[g].relin_key_ptrs) { cudaFree(key_sets_[g].relin_key_ptrs); key_sets_[g].relin_key_ptrs = nullptr; }
     }
