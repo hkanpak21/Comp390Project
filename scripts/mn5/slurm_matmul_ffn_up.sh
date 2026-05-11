@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=nexus-bert-dks
+#SBATCH --job-name=nexus-matmul-ffn-up
 #SBATCH --account=etur02
 #SBATCH --partition=acc
 #SBATCH --qos=acc_ehpc
@@ -7,20 +7,23 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=80
 #SBATCH --gres=gpu:4
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --exclusive
-#SBATCH --output=/gpfs/projects/etur02/hkanpak/logs/bert_dks_%j.out
-#SBATCH --error=/gpfs/projects/etur02/hkanpak/logs/bert_dks_%j.err
+#SBATCH --output=/gpfs/projects/etur02/hkanpak/logs/matmul_ffn_up_%j.out
+#SBATCH --error=/gpfs/projects/etur02/hkanpak/logs/matmul_ffn_up_%j.err
+
+# Lane H / F3 — Split FFN-up matmul (768 → 3072) across 4 GPUs.
+# Uses the same matmul_split_smoke binary parameterized with FFN-up
+# dimensions: 3072 output cols × 768 inner_dim. Each GPU produces
+# 3072/4 = 768 output channels.
+# Acceptance: per-column MAE < 1e-6, per-GPU FFN-up time ~12 ms
+# (down from ~50 ms single-GPU).
 
 echo "════════════════════════════════════════════════════════════"
-echo "  multiNEXUS BERT DKS — Full Encoder Layer, N=65536"
+echo "  F3 — Split FFN-up matmul (3072 cols × 768 inner across 4 GPUs)"
 echo "  Job: ${SLURM_JOB_ID}, Node: ${SLURM_NODELIST}"
 echo "  Start: $(date)"
 echo "════════════════════════════════════════════════════════════"
-echo ""
-echo "  Architecture: 12 heads, 4 bootstraps/layer, DKS on 4×H100"
-echo "  Target: layer < 85s on 4×H100 (vs 249s CPU-streaming)"
-echo ""
 
 module purge
 module load cuda/12.8 cmake/3.30.5 nccl/2.24.3-1
@@ -28,30 +31,17 @@ module load cuda/12.8 cmake/3.30.5 nccl/2.24.3-1
 PROJECT=/gpfs/projects/etur02/hkanpak/Comp390Project
 export LD_LIBRARY_PATH=/gpfs/projects/etur02/hkanpak/local/lib:$LD_LIBRARY_PATH
 
-export NCCL_DEBUG=WARN
-export NCCL_P2P_DISABLE=0
-export NCCL_SHM_DISABLE=0
-
-# Phase 4b champion path — distributed key-switching for rotations.
-# This is what T-STRAGGLER, T-OVERLAP, T-MODUP target.
-export DKS_ROTATE=1
-
 cd ${PROJECT}
 
 echo ">>> GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo ""
 
-echo ">>> Running bert_dks_multigpu (1 GPU baseline)..."
-${PROJECT}/build/bin/bert_dks_multigpu 1
-echo ""
+echo ">>> Running matmul_split_smoke (4 GPUs, --cols 3072 --inner 768)..."
+${PROJECT}/build/bin/matmul_split_smoke --n-gpus 4 --cols 3072 --inner 768
 
-echo ">>> Running bert_dks_multigpu (2 GPUs)..."
-${PROJECT}/build/bin/bert_dks_multigpu 2
+EXIT_CODE=$?
 echo ""
-
-echo ">>> Running bert_dks_multigpu (4 GPUs)..."
-${PROJECT}/build/bin/bert_dks_multigpu 4
-
-echo ""
+echo "Exit code: ${EXIT_CODE}"
 echo "End: $(date)"
+exit ${EXIT_CODE}

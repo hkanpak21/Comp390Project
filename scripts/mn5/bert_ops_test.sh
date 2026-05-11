@@ -22,6 +22,9 @@ module load cuda/12.3
 module load nccl/2.20.5-cuda12.3
 module load cmake/3.27.4
 
+# NTL is at /gpfs/projects/etur02/hkanpak/local — needed at runtime by Phantom→NEXUS chain.
+export LD_LIBRARY_PATH=/gpfs/projects/etur02/hkanpak/local/lib:$LD_LIBRARY_PATH
+
 cd "${SLURM_SUBMIT_DIR}"
 
 echo ""

@@ -1,0 +1,22 @@
+{
+    "_comment": "multiNEXUS regression baselines — slice I1. Two top-level keys: 'mae_thresholds' (used by run_correctness.sh) and 'wall_clock_seconds' (used by run_perf.sh). Per-binary entries are read by name. Update these after a deliberate baseline shift; do not relax to silence flapping tests.",
+
+    "_mae_default": 2.25e-6,
+    "bert_dks_multigpu": 2.25e-6,
+    "bert_hp_multigpu": 2.25e-6,
+    "phantom_threadsafe_smoke": 1e-5,
+
+    "mae_thresholds": {
+        "bert_dks_multigpu": 2.25e-6,
+        "bert_hp_multigpu": 2.25e-6,
+        "phantom_threadsafe_smoke": 1e-5
+    },
+
+    "wall_clock_seconds": {
+        "bert_dks_multigpu": 115.7,
+        "bert_hp_multigpu": 370.0,
+        "phantom_threadsafe_smoke": 30.0
+    },
+
+    "perf_regression_pct": 5.0
+}

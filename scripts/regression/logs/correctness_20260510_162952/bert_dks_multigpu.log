@@ -1,0 +1,4 @@
+Some preamble
+  MatMul MAE:         0.000001 PASS
+  GELU MAE 1.5e-7
+All done.
