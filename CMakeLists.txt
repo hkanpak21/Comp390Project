@@ -23,10 +23,15 @@ set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # ── Options ───────────────────────────────────────────────────────────────────
-# Set -DNEXUS_USE_MPI=OFF to disable MPI entirely (avoids Intel-compiled libmpi.so
-# linker errors on MN5 when the default openmpi module is INTEL-compiled).
-# Single-node and multi-GPU benchmarks do NOT need MPI.
-option(NEXUS_USE_MPI "Enable MPI for multi-node support" ON)
+# MPI is DEPRECATED for multi-node — the canonical multi-node path is
+# bert_hp_multinode.cu (NCCL with shared-FS uniqueId bootstrap; see
+# docs/MN5_NCCL_CONFIG.md). Older multi-node binaries (bert_dks_multinode,
+# bert_connected_multinode, bert_encoder_multinode, …) still carry #ifdef
+# USE_MPI guards and degrade to a stub when -DNEXUS_USE_MPI=OFF.
+#
+# Default OFF — set -DNEXUS_USE_MPI=ON only if you need to build those
+# legacy binaries. New work should use NCCL.
+option(NEXUS_USE_MPI "Enable MPI for legacy multi-node binaries" OFF)
 
 # ── Find packages ─────────────────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
@@ -180,6 +185,8 @@ if(NCCL_FOUND)
     file(GLOB_RECURSE MULTI_GPU_SRCS
         src/multi_gpu/*.cu
     )
+    # Exclude src/multi_gpu/archive/** (deprecated pipeline-parallel infra)
+    list(FILTER MULTI_GPU_SRCS EXCLUDE REGEX "src/multi_gpu/archive/")
     # Include keyswitching subdir sources (galois_oa.cu, output_aggregation.cu, etc.)
     file(GLOB_RECURSE KEYSWITCHING_SRCS src/multi_gpu/keyswitching/*.cu)
     list(APPEND MULTI_GPU_SRCS ${KEYSWITCHING_SRCS})
@@ -216,7 +223,7 @@ endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(NCCL_FOUND)
-    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_layer_scaling ct_pipeline_bench multi_node_bench bert_matmul_pipeline bert_ops_test bert_matmul_real bert_e2e_inference bert_e2e_multigpu bert_multinode bert_multinode_e2e bert_connected_pipeline bert_connected_multigpu bert_connected_multinode bootstrap_test bootstrap_test_n65536 bootstrap_distkey_test bootstrap_n65536_streaming rotate_stream_test bert_encoder_n65536 bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 llama_layer_multigpu_n65536 llama_layer_multinode_n65536 bert_encoder_layer bert_encoder_multigpu bert_encoder_multinode dist_bootstrap_bench bert_dks_multigpu bert_dks_multinode llama_dks_multigpu)
+    foreach(bench nccl_bandwidth_test multi_gpu_keyswitch_test dist_bert_layer_bench spmd_keyswitch_bench spmd_oa_bench ks_breakdown_bench bert_ops_test bootstrap_test bootstrap_test_n65536 bootstrap_distkey_test bootstrap_n65536_streaming rotate_stream_test bert_encoder_multigpu_n65536 bert_encoder_multinode_n65536 llama_layer_multigpu_n65536 llama_layer_multinode_n65536 dist_bootstrap_bench bert_dks_multigpu bert_dks_multinode llama_dks_multigpu phantom_threadsafe_smoke bert_hp_multigpu bert_hp_multinode llama_hp_multinode matmul_align_n8k argmax_align_n32k bootstrap_align_pipeline bootstrap_align_n32k bootstrap_diagnose gelu_align_n65k layernorm_align_n65k softmax_align_n65k nexus_mgpu_e2e bootstrap_mgpu_align gelu_mgpu_align layernorm_mgpu_align softmax_mgpu_align)
         if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/${bench}.cu)
             add_executable(${bench} src/benchmarks/${bench}.cu)
             target_link_libraries(${bench} PRIVATE nexus_multi_gpu)
@@ -250,6 +257,198 @@ if(NCCL_FOUND)
             endif()
         endif()
     endforeach()
+endif()
+
+# ── Standalone single-GPU benchmarks ──────────────────────────────────────────
+# llama_layer_baseline (PRD H1): single-GPU LLaMA-7B baseline.
+# Built unconditionally so that in-progress infrastructure work in
+# src/multi_gpu/* (e.g., modup_partial in output_aggregation.cu) does not
+# block the LLaMA single-GPU baseline path.
+#
+# nexus_evaluators references nexus_multi_gpu::dist_rotate_phantom_inplace from
+# its CKKSEvaluator::rotate_vector hooks (DKS rotation path). We satisfy that
+# symbol via the pre-built nexus_multi_gpu archive when available — by linking
+# the .a file directly we sidestep CMake's automatic rebuild dependency on
+# the nexus_multi_gpu target, so a temporary build break in multi_gpu sources
+# cannot stall the H-track baseline.
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/llama_layer_baseline.cu)
+    add_executable(llama_layer_baseline src/benchmarks/llama_layer_baseline.cu)
+
+    # Prefer pre-built archive (avoids rebuild dependency); fall back to the
+    # in-tree target only if the archive is absent.
+    set(_nmg_prebuilt ${CMAKE_BINARY_DIR}/libnexus_multi_gpu.a)
+    if(EXISTS ${_nmg_prebuilt})
+        target_link_libraries(llama_layer_baseline PRIVATE ${_nmg_prebuilt})
+    elseif(TARGET nexus_multi_gpu)
+        target_link_libraries(llama_layer_baseline PRIVATE nexus_multi_gpu)
+    endif()
+    if(NCCL_LIBRARY)
+        target_link_libraries(llama_layer_baseline PRIVATE ${NCCL_LIBRARY})
+    endif()
+    target_link_libraries(llama_layer_baseline PRIVATE CUDA::cuda_driver)
+
+    if(TARGET Phantom)
+        target_link_libraries(llama_layer_baseline PRIVATE Phantom)
+    endif()
+    if(TARGET nexus_evaluators)
+        target_link_libraries(llama_layer_baseline PRIVATE nexus_evaluators)
+    endif()
+    target_link_libraries(llama_layer_baseline PRIVATE CUDA::cudart)
+    target_include_directories(llama_layer_baseline PRIVATE
+        ${PHANTOM_ROOT}/include
+        src
+        src/nexus_eval
+        src/nexus_eval/bootstrapping
+        src/nexus_eval/bootstrapping/common
+        src/util
+        src/multi_gpu
+        src/multi_gpu/keyswitching
+        /gpfs/projects/etur02/hkanpak/local/include
+    )
+    set_target_properties(llama_layer_baseline PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    if(NTL_LIBRARY)
+        target_compile_options(llama_layer_baseline PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-I/gpfs/projects/etur02/hkanpak/local/include>)
+    endif()
+endif()
+
+# llama_hp_multigpu (PRD H2): HP-LLaMA multi-GPU head-parallel layer.
+# Same standalone pattern as llama_layer_baseline. Mirrors bert_hp_multigpu
+# but with LLaMA layer compute (RoPE, SwiGLU, RMSNorm proxy).
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/llama_hp_multigpu.cu)
+    add_executable(llama_hp_multigpu src/benchmarks/llama_hp_multigpu.cu)
+
+    set(_nmg_prebuilt_h2 ${CMAKE_BINARY_DIR}/libnexus_multi_gpu.a)
+    if(EXISTS ${_nmg_prebuilt_h2})
+        target_link_libraries(llama_hp_multigpu PRIVATE ${_nmg_prebuilt_h2})
+    elseif(TARGET nexus_multi_gpu)
+        target_link_libraries(llama_hp_multigpu PRIVATE nexus_multi_gpu)
+    endif()
+    if(NCCL_LIBRARY)
+        target_link_libraries(llama_hp_multigpu PRIVATE ${NCCL_LIBRARY})
+    endif()
+    target_link_libraries(llama_hp_multigpu PRIVATE CUDA::cuda_driver)
+
+    if(TARGET Phantom)
+        target_link_libraries(llama_hp_multigpu PRIVATE Phantom)
+    endif()
+    if(TARGET nexus_evaluators)
+        target_link_libraries(llama_hp_multigpu PRIVATE nexus_evaluators)
+    endif()
+    target_link_libraries(llama_hp_multigpu PRIVATE CUDA::cudart)
+    target_include_directories(llama_hp_multigpu PRIVATE
+        ${PHANTOM_ROOT}/include
+        src
+        src/nexus_eval
+        src/nexus_eval/bootstrapping
+        src/nexus_eval/bootstrapping/common
+        src/util
+        src/multi_gpu
+        src/multi_gpu/keyswitching
+        /gpfs/projects/etur02/hkanpak/local/include
+    )
+    set_target_properties(llama_hp_multigpu PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    if(NTL_LIBRARY)
+        target_compile_options(llama_hp_multigpu PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-I/gpfs/projects/etur02/hkanpak/local/include>)
+    endif()
+endif()
+
+# matmul_qkv_split_smoke (PRD F2): split QKV matmul across 4 GPUs.
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/matmul_qkv_split_smoke.cu)
+    add_executable(matmul_qkv_split_smoke src/benchmarks/matmul_qkv_split_smoke.cu)
+
+    set(_nmg_prebuilt_f2 ${CMAKE_BINARY_DIR}/libnexus_multi_gpu.a)
+    if(EXISTS ${_nmg_prebuilt_f2})
+        target_link_libraries(matmul_qkv_split_smoke PRIVATE ${_nmg_prebuilt_f2})
+    elseif(TARGET nexus_multi_gpu)
+        target_link_libraries(matmul_qkv_split_smoke PRIVATE nexus_multi_gpu)
+    endif()
+    if(NCCL_LIBRARY)
+        target_link_libraries(matmul_qkv_split_smoke PRIVATE ${NCCL_LIBRARY})
+    endif()
+    target_link_libraries(matmul_qkv_split_smoke PRIVATE CUDA::cuda_driver)
+
+    if(TARGET Phantom)
+        target_link_libraries(matmul_qkv_split_smoke PRIVATE Phantom)
+    endif()
+    if(TARGET nexus_evaluators)
+        target_link_libraries(matmul_qkv_split_smoke PRIVATE nexus_evaluators)
+    endif()
+    target_link_libraries(matmul_qkv_split_smoke PRIVATE CUDA::cudart)
+    target_include_directories(matmul_qkv_split_smoke PRIVATE
+        ${PHANTOM_ROOT}/include
+        src
+        src/nexus_eval
+        src/nexus_eval/bootstrapping
+        src/nexus_eval/bootstrapping/common
+        src/util
+        src/multi_gpu
+        src/multi_gpu/keyswitching
+        /gpfs/projects/etur02/hkanpak/local/include
+    )
+    set_target_properties(matmul_qkv_split_smoke PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    if(NTL_LIBRARY)
+        target_compile_options(matmul_qkv_split_smoke PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-I/gpfs/projects/etur02/hkanpak/local/include>)
+    endif()
+endif()
+
+# matmul_split_smoke (PRD F1): MatMul output-channel split smoke test.
+# Same standalone pattern as llama_layer_baseline — sidesteps any
+# in-progress nexus_multi_gpu rebuild dependency. F1 only exercises pure
+# ciphertext × plaintext multiply + add (no DKS, no bootstrap), so the
+# broken T-MODUP path in src/multi_gpu/keyswitching/output_aggregation.cu
+# is not on the critical path.
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/benchmarks/matmul_split_smoke.cu)
+    add_executable(matmul_split_smoke src/benchmarks/matmul_split_smoke.cu)
+
+    set(_nmg_prebuilt_f1 ${CMAKE_BINARY_DIR}/libnexus_multi_gpu.a)
+    if(EXISTS ${_nmg_prebuilt_f1})
+        target_link_libraries(matmul_split_smoke PRIVATE ${_nmg_prebuilt_f1})
+    elseif(TARGET nexus_multi_gpu)
+        target_link_libraries(matmul_split_smoke PRIVATE nexus_multi_gpu)
+    endif()
+    if(NCCL_LIBRARY)
+        target_link_libraries(matmul_split_smoke PRIVATE ${NCCL_LIBRARY})
+    endif()
+    target_link_libraries(matmul_split_smoke PRIVATE CUDA::cuda_driver)
+
+    if(TARGET Phantom)
+        target_link_libraries(matmul_split_smoke PRIVATE Phantom)
+    endif()
+    if(TARGET nexus_evaluators)
+        target_link_libraries(matmul_split_smoke PRIVATE nexus_evaluators)
+    endif()
+    target_link_libraries(matmul_split_smoke PRIVATE CUDA::cudart)
+    target_include_directories(matmul_split_smoke PRIVATE
+        ${PHANTOM_ROOT}/include
+        src
+        src/nexus_eval
+        src/nexus_eval/bootstrapping
+        src/nexus_eval/bootstrapping/common
+        src/util
+        src/multi_gpu
+        src/multi_gpu/keyswitching
+        /gpfs/projects/etur02/hkanpak/local/include
+    )
+    set_target_properties(matmul_split_smoke PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+    if(NTL_LIBRARY)
+        target_compile_options(matmul_split_smoke PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-I/gpfs/projects/etur02/hkanpak/local/include>)
+    endif()
 endif()
 
 # ── Status summary ────────────────────────────────────────────────────────────

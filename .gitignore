@@ -26,6 +26,18 @@ bin/
 *.out
 *.exe
 
+# Archive directories — superseded files kept for provenance only.
+# Tracked already-archived content stays committed; new files dropped here
+# don't show up in `git status`. Force-add with `git add -f` if you need to.
+/docs/archive/
+/paper/archive/
+/notes/archive/
+/experiments/archive/
+/scripts/archive/
+/scripts/mn5/archive/
+/src/benchmarks/archive/
+/src/multi_gpu/archive/
+
 # Profiling outputs
 *.nsys-rep
 *.ncu-rep
@@ -73,7 +85,20 @@ Thumbs.db
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 venv/
+
+# docs/report LaTeX build artifacts (PDF kept since it's the deliverable)
+docs/report/*.aux
+docs/report/*.log
+docs/report/*.out
+docs/report/*.fdb_latexmk
+docs/report/*.fls
+docs/report/*.synctex.gz
+docs/report/*.toc
+
+# experiments/results — per-run raw output dirs are large, keep local only
+experiments/results/2026-*
 
 # AWS credentials / secrets — NEVER commit these
 *.pem

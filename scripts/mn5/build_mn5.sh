@@ -41,10 +41,10 @@ cmake .. \
     -DNTL_DIR=/gpfs/projects/etur02/hkanpak/local
 
 # Single-node and multi-GPU targets (always built)
-SINGLE_NODE_TARGETS="bootstrap_test_n65536 dist_bootstrap_bench bert_dks_multigpu llama_dks_multigpu bert_encoder_multigpu bert_encoder_multigpu_n65536 llama_layer_multigpu_n65536"
+SINGLE_NODE_TARGETS="bootstrap_test_n65536 dist_bootstrap_bench bert_dks_multigpu llama_dks_multigpu bert_encoder_multigpu_n65536 llama_layer_multigpu_n65536 bert_hp_multigpu llama_hp_multigpu bootstrap_align_n32k bootstrap_mgpu_align gelu_align_n65k gelu_mgpu_align layernorm_align_n65k layernorm_mgpu_align softmax_align_n65k softmax_mgpu_align matmul_align_n8k argmax_align_n32k bootstrap_diagnose"
 
 if [[ $WITH_MPI -eq 1 ]]; then
-    MULTINODE_TARGETS="bert_dks_multinode bert_encoder_multinode bert_encoder_multinode_n65536 llama_layer_multinode_n65536"
+    MULTINODE_TARGETS="bert_dks_multinode bert_encoder_multinode_n65536 llama_layer_multinode_n65536 bert_hp_multinode llama_hp_multinode"
     ALL_TARGETS="${SINGLE_NODE_TARGETS} ${MULTINODE_TARGETS}"
 else
     ALL_TARGETS="${SINGLE_NODE_TARGETS}"
