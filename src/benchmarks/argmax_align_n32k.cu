@@ -457,6 +457,7 @@ int main(int argc, char **argv) {
 
     // ═══ Phase 1: Single-GPU argmax measurement (one batch, latency) ═══
     vector<double> single_gpu_trial_ms;
+    vector<double> single_gpu_first_decoded;  // FIX-BUG-01-01: trial 0 decoded
     printf("\n[Phase 1] Single-GPU argmax (1 batch, %d trials on GPU 0)...\n",
            cfg.trials);
     fflush(stdout);
@@ -469,6 +470,7 @@ int main(int argc, char **argv) {
                              total_level, main_mod_count, bs_mod_count, SCALE,
                              all_inputs[0], /*decode=*/(t == 0), tr);
         single_gpu_trial_ms.push_back(tr.argmax_ms);
+        if (t == 0) single_gpu_first_decoded = tr.decoded;
         printf("  trial %d/%d: argmax=%.1f ms (= %.3f s)\n",
                t + 1, cfg.trials, tr.argmax_ms, tr.argmax_ms / 1000.0);
         fflush(stdout);
@@ -478,6 +480,68 @@ int main(int argc, char **argv) {
     printf("[Phase 1] single-GPU median = %.1f ms (σ=%.1f, %.3f s)\n",
            single_med, single_sigma, single_med / 1000.0);
     fflush(stdout);
+
+    // FIX-BUG-01-01 (DECODE-VALIDITY GATE): validate Phase 1 trial-0 output.
+    // Argmax produces a one-hot encoding: all slots ≈ 0 except the predicted
+    // argmax slot ≈ 1.0. Two checks:
+    //   (1) decode-validity — all slots finite, |value| < 2.0
+    //   (2) prediction agreement — slot index of decoded max equals slot index
+    //       of plain max over the [0, vocab) range
+    // Without this gate the binary could report timing on a binary that
+    // produces NaN one-hots or selects the wrong argmax slot.
+    {
+        if (single_gpu_first_decoded.empty()) {
+            fprintf(stderr,
+                    "[FATAL] FIX-BUG-01-01: Phase 1 trial 0 produced no "
+                    "decoded output — argmax binary not reporting state\n");
+            fflush(stderr);
+            return 2;
+        }
+        const double SANITY_BOUND = 2.0;
+        size_t cmp = std::min(single_gpu_first_decoded.size(),
+                              (size_t)cfg.vocab);
+        size_t bad = 0;
+        double dec_abs_max = 0.0;
+        size_t pred_argmax = 0;
+        double pred_max_val = single_gpu_first_decoded[0];
+        for (size_t i = 0; i < cmp; i++) {
+            double v = single_gpu_first_decoded[i];
+            if (!std::isfinite(v)) { bad++; continue; }
+            double a = std::fabs(v);
+            if (a > dec_abs_max) dec_abs_max = a;
+            if (v > pred_max_val) { pred_max_val = v; pred_argmax = i; }
+        }
+        size_t plain_argmax = 0;
+        double plain_max_val = all_inputs[0][0];
+        for (int i = 1; i < cfg.vocab; i++) {
+            if (all_inputs[0][i] > plain_max_val) {
+                plain_max_val = all_inputs[0][i];
+                plain_argmax  = (size_t)i;
+            }
+        }
+        printf("[Phase 1 gate] decode-validity: |max|=%.3f over %zu slots, "
+               "non-finite=%zu (bound |x|<%.0f); predicted argmax=%zu, "
+               "plain argmax=%zu (input value %.3f)\n",
+               dec_abs_max, cmp, bad, SANITY_BOUND,
+               pred_argmax, plain_argmax, plain_max_val);
+        fflush(stdout);
+        if (bad > 0 || dec_abs_max > SANITY_BOUND) {
+            fprintf(stderr,
+                    "[FATAL] FIX-BUG-01-01: argmax decode-validity failed "
+                    "(non-finite=%zu, |max|=%.3e)\n",
+                    bad, dec_abs_max);
+            fflush(stderr);
+            return 2;
+        }
+        if (pred_argmax != plain_argmax) {
+            fprintf(stderr,
+                    "[FATAL] FIX-BUG-01-01: argmax prediction mismatch "
+                    "(predicted slot %zu, plain max at slot %zu)\n",
+                    pred_argmax, plain_argmax);
+            fflush(stderr);
+            return 2;
+        }
+    }
 
     // ═══ Phase 2: Multi-GPU throughput (batches in parallel) ═══
     if (cfg.n_gpus >= 2 && cfg.batches >= 2) {

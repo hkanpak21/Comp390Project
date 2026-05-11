@@ -259,6 +259,20 @@ int main(int argc, char **argv) {
         printf("[Warmup] bootstrap=%.1f ms, MAE=%.6e (threshold 0.01: %s)\n",
                ms, mae, mae < 0.01 ? "PASS" : "FAIL");
         fflush(stdout);
+        // FIX-BUG-01-01 (MAE-GATE): hard-exit on warmup MAE failure so the
+        // measurement loop never reports timing on a binary that produced
+        // garbage output. Threshold 0.01 matches the existing PASS/FAIL
+        // print and NEXUS's own bootstrap-MAE tolerance for sparse-packed
+        // inputs at logN=15. Tighter thresholds (e.g. 1e-5) are unrealistic
+        // for CKKS bootstrap output noise.
+        if (!(mae < 0.01)) {
+            fprintf(stderr,
+                    "[FATAL] FIX-BUG-01-01: warmup bootstrap MAE %.6e "
+                    ">= 0.01 — output is corrupt, refusing to time loop\n",
+                    mae);
+            fflush(stderr);
+            return 2;
+        }
     }
 
     // ═══ Measurement loop: N calls of isolated bootstrap_3 ═══

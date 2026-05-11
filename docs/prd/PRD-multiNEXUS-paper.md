@@ -187,15 +187,15 @@ Phase order is: BUG → FIX → PROFILE / MEASURE → WRITE → APPENDIX → MOD
 | `BUG-03` | Bug audit pass on `src/multi_gpu/` framework | none | ✅ | f2c9087 |
 | `BUG-04` | Bug audit pass on `src/nexus_eval/` evaluator wrappers | none | ✅ | 877c32a |
 | `FIX-BUG-04-01` | Remove debug fprintf+sync from Bootstrapper hot path | BUG-04 | ✅ | 7bb9bf3 |
-| `FIX-BUG-04-02` | SCALE-CROSS-CUT: add `cipher.scale() = SCALE` reset before bootstrap at HP-BERT chained call sites (mirrors `argmax_align_n32k.cu:225`) | BUG-04 | ❌ | — |
-| `FIX-BUG-04-03` | BOOT-RAW-OWN: give `Bootstrapper` an explicit destructor for the raw-`new` `ModularReducer*` (Rule of Five, lesson #3) | BUG-04 | ❌ | — |
+| `FIX-BUG-04-02` | SCALE-CROSS-CUT: add `cipher.scale() = SCALE` reset before bootstrap at HP-BERT chained call sites (mirrors `argmax_align_n32k.cu:225`) | BUG-04 | ✅ | 9d872fa |
+| `FIX-BUG-04-03` | BOOT-RAW-OWN: give `Bootstrapper` an explicit destructor for the raw-`new` `ModularReducer*` (Rule of Five, lesson #3) | BUG-04 | ✅ | 79b95a0 |
 | `FIX-BUG-04-04` | MATMUL-NEW-PER-CALL: hoist `new uint64_t[…]` + `cudaMemcpyAsync` out of `multiply_power_of_x` into a persistent staging buffer | BUG-04 | ❌ | — |
-| `FIX-BUG-01-01` | Add MAE gates to all six single-GPU align binaries (currently none gate) | BUG-01 | ❌ | — |
+| `FIX-BUG-01-01` | Add MAE gates / decode-validity gates to all six single-GPU align binaries | BUG-01 | ✅ | (this commit) |
 | `FIX-BUG-02-01` | Tighten HP-BERT MAE gate to PRD `2.25e-6` target; add gate to multinode binary | BUG-02 | ❌ | — |
 | `FIX-BUG-03-01` | Resolve two HIGH cleanup-order risks in `DistributedContext::destroy()` | BUG-03 | ❌ | — |
 | `PROFILE-01` | 4-GPU nsys for matmul_align_n8k | BUG-01 (matmul), FIX-BUG-04-01 | 🟡 ae54775 (script only — not submitted) | — |
 | `PROFILE-02` | 4-GPU nsys for gelu_mgpu_align | BUG-01 (gelu), FIX-BUG-04-01 | 🟡 867e13f (script only — not submitted) | — |
-| `PROFILE-03` | 4-GPU nsys for softmax_mgpu_align | BUG-01 (softmax), FIX-BUG-04-01 | ❌ **script not yet written** | — |
+| `PROFILE-03` | 4-GPU nsys for softmax_mgpu_align | BUG-01 (softmax), FIX-BUG-04-01 | ✅ 1a9f2bd (script registered; submission still RUN-PROFILE-03) | — |
 | `PROFILE-04` | 4-GPU nsys for argmax_align_n32k | BUG-01 (argmax), FIX-BUG-04-01 | 🟡 cce11c9 (script only — not submitted) | — |
 | `MEASURE-01` | Goal 2 unit run: `bert_hp_multigpu --n-gpus 1 --heads 1 --layers 2 --N 32768` | BUG-02, FIX-BUG-04-01, FIX-BUG-04-02 | 🟡 e7e8e5c (script only — not submitted) | — |
 | `MEASURE-02` | Saturation analyzer (Module Sketch #1) + tests | none (pure module) | ✅ | 43c1753 |
@@ -236,12 +236,12 @@ Phase order is: BUG → FIX → PROFILE / MEASURE → WRITE → APPENDIX → MOD
 The Ralph loop should pick the **first unblocked slice from this list per iteration**, produce one commit (slice ID + `Depends-on` footer), then exit. Promise phrase for completion: `<promise>PRD-RALPH-COMPLETE</promise>` after the final REFRESH-paper-md commit.
 
 **Phase A — push and lock in current work (do first, before any other slice):**
-1. `OPS-push` — push `paper/multinexus` to `origin` so all in-flight work is durable. One-line operation; not a code commit but worth a status note.
+1. ✅ `OPS-push` — `paper/multinexus` pushed through `9d872fa`; subsequent FIX commits push as they land.
 
 **Phase B — FIX slices that block measurements (must land before MEASURE-01 runs):**
-2. `FIX-BUG-04-02` — SCALE-CROSS-CUT for HP-BERT bootstrap call sites. Mirror the `cipher.scale() = SCALE` reset from `argmax_align_n32k.cu:225` at every `bs.bootstrap_3(...)` call site inside `bert_hp_multigpu.cu` (and `bert_hp_multinode.cu` if applicable). Without this, `MEASURE-01` may fail at layer 2 with the same Phantom encode-validation error that broke Argmax before `FIX-ARGMAX`.
-3. `FIX-BUG-01-01` — add MAE gates to the six single-GPU align binaries. Each binary already prints MAE; wrap with `assert(mae < threshold)` style check. Threshold = `1e-5` for non-MatMul; `5%` relative for MatMul.
-4. `PROFILE-03` — write `scripts/mn5/slurm_softmax_mgpu_nsys.sh` mirroring the existing `slurm_gelu_mgpu_nsys.sh` pattern. The only structurally-incomplete PROFILE deliverable.
+2. ✅ `FIX-BUG-04-02` — SCALE-CROSS-CUT applied at all 8 chained-bootstrap call sites in `bert_hp_multigpu.cu` and `bert_hp_multinode.cu`. Commit `9d872fa`.
+3. ✅ `FIX-BUG-01-01` — Hard-exit MAE / decode-validity gates added to all six single-GPU align binaries (bootstrap full MAE @ 0.01; matmul absolute MAE @ 5e-2 + existing relative gate @ 5%; gelu/layernorm/softmax/argmax decode-validity @ NaN-Inf + sanity bound). Commit (this one).
+4. ✅ `PROFILE-03` — `scripts/mn5/slurm_softmax_mgpu_nsys.sh` registered under PROFILE-03 framing (commit `1a9f2bd`). Submission still pending as `RUN-PROFILE-03`.
 
 **Phase C — submit jobs on the patched binaries (each is its own slice; one commit per submission, body includes JOBID):**
 5. `RUN-PROFILE-01` — rebuild + submit matmul nsys on MN5; commit captures JOBID and log path.
@@ -253,7 +253,7 @@ The Ralph loop should pick the **first unblocked slice from this list per iterat
 11. `RUN-MEASURE-04` — submit DP-16 throughput run; commit captures JOBID and aggregate throughput.
 
 **Phase D — additional FIX slices that don't block MEASURE but tighten the paper:**
-12. `FIX-BUG-04-03` — Bootstrapper destructor (BOOT-RAW-OWN).
+12. ✅ `FIX-BUG-04-03` — Bootstrapper destructor (BOOT-RAW-OWN). Commit `79b95a0`.
 13. `FIX-BUG-04-04` — MatMul host-alloc out of `multiply_power_of_x`.
 14. `FIX-BUG-02-01` — tighten HP-BERT MAE gate; add multinode gate.
 15. `FIX-BUG-03-01` — `DistributedContext::destroy()` cleanup-order fixes.

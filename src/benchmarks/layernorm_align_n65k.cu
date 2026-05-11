@@ -191,6 +191,42 @@ int main(int argc, char **argv) {
         double ms = chrono::duration<double, milli>(t1 - t0).count();
         printf("[Warmup] layer_norm=%.1f ms\n", ms);
         fflush(stdout);
+        // FIX-BUG-01-01 (DECODE-VALIDITY GATE): decode the warmup output and
+        // refuse to enter the measurement loop on NaN/Inf or out-of-range
+        // values. LayerNorm output should be approximately mean-0, unit-variance
+        // per row; |value| ≤ ~5 covers the 5-sigma tail. SANITY_BOUND = 10.0
+        // catches catastrophic failures (modulus exhaustion in the Newton sqrt
+        // iteration, scale drift) without flagging legitimate output noise.
+        {
+            PhantomCiphertext check_in = base_cipher;
+            PhantomCiphertext check_out;
+            ln_evaluator.layer_norm(check_in, check_out, cfg.len);
+            PhantomPlaintext pt;
+            secret_key.decrypt(context, check_out, pt);
+            vector<double> dec;
+            encoder.decode(context, pt, dec);
+            const double SANITY_BOUND = 10.0;
+            size_t cmp = std::min(dec.size(), (size_t)(16 * 768));
+            size_t bad = 0;
+            double dec_abs_max = 0.0;
+            for (size_t i = 0; i < cmp; i++) {
+                if (!std::isfinite(dec[i])) { bad++; continue; }
+                double a = std::fabs(dec[i]);
+                if (a > dec_abs_max) dec_abs_max = a;
+            }
+            printf("[Warmup] decode-validity: |max|=%.3f over %zu slots, "
+                   "non-finite=%zu (bound |x|<%.0f)\n",
+                   dec_abs_max, cmp, bad, SANITY_BOUND);
+            fflush(stdout);
+            if (bad > 0 || dec_abs_max > SANITY_BOUND) {
+                fprintf(stderr,
+                        "[FATAL] FIX-BUG-01-01: warmup LayerNorm output failed "
+                        "decode-validity gate (non-finite=%zu, |max|=%.3e)\n",
+                        bad, dec_abs_max);
+                fflush(stderr);
+                return 2;
+            }
+        }
     }
 
     // ═══ Measurement loop: N calls of isolated layer_norm ═══

@@ -381,6 +381,36 @@ int main(int argc, char **argv) {
                "(NEXUS reports 1.31 s on A100)\n",
                med_ms / 1000.0 / 64.0);
         fflush(stdout);
+
+        // FIX-BUG-01-01 (MAE-GATE, single-GPU absolute): in addition to the
+        // Phase 2 multi-vs-single relative gate (REL_TOL=5e-2), reject runs
+        // where the single-GPU absolute MAE vs plain truth is unreasonable.
+        // ABS_TOL = 5e-2 is the empirical CKKS scheme noise floor for this
+        // workload (compress + matmul + decode); see comments at line 505 in
+        // the Phase 2 gate. The pre-existing Phase 2 relative gate only runs
+        // when n_gpus >= 2, so single-GPU-only invocations need their own
+        // absolute gate to catch a corrupt build.
+        if (!single_gpu_ref_col0.empty()) {
+            const size_t useful_slots = 4096;
+            const double ABS_TOL = 5e-2;
+            vector<double> truth = plain_matmul_col0(matrix_4096x768,
+                                                    matrix_768x64,
+                                                    useful_slots);
+            double mae_single = mae(single_gpu_ref_col0, truth, useful_slots);
+            printf("[Phase 1 gate] single-GPU MAE vs plain truth = %.6e "
+                   "(abs tol %.0e: %s)\n",
+                   mae_single, ABS_TOL,
+                   mae_single < ABS_TOL ? "PASS" : "FAIL");
+            fflush(stdout);
+            if (!(mae_single < ABS_TOL)) {
+                fprintf(stderr,
+                        "[FATAL] FIX-BUG-01-01: single-GPU MAE %.6e >= "
+                        "%.0e — single-GPU matmul output is corrupt\n",
+                        mae_single, ABS_TOL);
+                fflush(stderr);
+                return 2;
+            }
+        }
     }
 
     // ═══ Multi-GPU output-channel split measurement ═══
