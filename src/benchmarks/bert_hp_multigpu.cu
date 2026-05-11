@@ -654,7 +654,13 @@ int main(int argc, char **argv) {
 
     // ═══ Verification ═══
     bool overall_pass = true;
-    double mae_threshold = 1e-5;
+    // FIX-BUG-02-01: tighten MAE gate from 1e-5 to the PRD spec 2.25e-6
+    // (docs/prd/PRD-multiNEXUS-paper.md, Testing Decisions). The looser
+    // 1e-5 was inherited from earlier per-op work; for the chained HP-BERT
+    // pipeline at logN=15/16 the post-FIX-BUG-04-{01,02} reference run
+    // produces MAE well within the tighter bound, so this is the floor the
+    // paper should actually be gating on.
+    double mae_threshold = 2.25e-6;
     int  cmp_n = static_cast<int>(sparse_slots_val);   // sparse-slot range
     if (skip_ref) {
         printf("\n[verify] --skip-ref set; skipping correctness check.\n");

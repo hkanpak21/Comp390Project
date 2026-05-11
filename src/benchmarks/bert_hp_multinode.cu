@@ -712,6 +712,17 @@ int main(int argc, char **argv) {
     compute_timer.start();
     double compute_ms_local = 0;
 
+    // FIX-BUG-02-01: per-rank decode-validity gate. The multinode binary
+    // has no apples-to-apples MAE-vs-single-GPU reference (each rank holds
+    // a different head's ciphertext and the cross-rank reduction is on
+    // timings, not values), so a full MAE check the way bert_hp_multigpu
+    // does is out of reach without a multi-day refactor. Instead each
+    // active rank decrypts its own final ct and checks for NaN/Inf and
+    // a generous absolute-value sanity bound. This catches the
+    // catastrophic failure modes the BUG-02 audit flagged (modulus
+    // exhaustion, scale-drift cascades, key-switch corruption) without
+    // requiring a coordinated reference run.
+    bool local_gate_pass = true;
     if (is_active) {
         PhantomCiphertext ct = ct_in;
         PhantomCiphertext ct_out;
@@ -729,6 +740,35 @@ int main(int argc, char **argv) {
             }
         }
         cudaDeviceSynchronize();
+
+        // Decode-validity check on this rank's final post-bs4 ciphertext.
+        if (!skip_ref) {
+            PhantomPlaintext pt;
+            sk->decrypt(*ctx, ct, pt);
+            vector<double> dec;
+            eval->encoder.decode(*ctx, pt, dec);
+            const double SANITY_BOUND = 10.0;
+            size_t cmp = dec.size();
+            size_t bad = 0;
+            double dec_abs_max = 0.0;
+            for (size_t i = 0; i < cmp; i++) {
+                if (!std::isfinite(dec[i])) { bad++; continue; }
+                double a = std::fabs(dec[i]);
+                if (a > dec_abs_max) dec_abs_max = a;
+            }
+            printf("[rank %d head %d] decode-validity: |max|=%.3f over %zu slots, "
+                   "non-finite=%zu (bound |x|<%.0f)\n",
+                   rank, head_id, dec_abs_max, cmp, bad, SANITY_BOUND);
+            fflush(stdout);
+            if (bad > 0 || dec_abs_max > SANITY_BOUND) {
+                fprintf(stderr,
+                        "[FATAL rank %d] FIX-BUG-02-01: multinode HP-BERT output "
+                        "failed decode-validity gate (non-finite=%zu, |max|=%.3e)\n",
+                        rank, bad, dec_abs_max);
+                fflush(stderr);
+                local_gate_pass = false;
+            }
+        }
     }
     compute_ms_local = compute_timer.elapsed_ms();
     if (!is_active) {
@@ -769,6 +809,13 @@ int main(int argc, char **argv) {
     int hbuf[1] = { times.heads };
     nccl_allreduce_ints(world_comm, world_stream, hbuf, 1, ncclSum);
     int sum_h = hbuf[0];
+
+    // FIX-BUG-02-01: aggregate per-rank decode-validity result across all
+    // ranks. ncclMin on a {0,1} bitfield gives 0 if any rank failed, 1 if
+    // all passed (treating inactive ranks as passing).
+    int gate_buf[1] = { local_gate_pass ? 1 : 0 };
+    nccl_allreduce_ints(world_comm, world_stream, gate_buf, 1, ncclMin);
+    bool gate_pass_world = (gate_buf[0] != 0);
 
     if (rank == 0) {
         // Total bootstrap instances = n_active_heads × n_layers × 4 bootstraps
@@ -823,8 +870,13 @@ int main(int argc, char **argv) {
         if (skip_ref) {
             printf("  HP-BERT verification SKIPPED (--skip-ref)\n");
         } else {
-            printf("  HP-BERT verification not implemented in multinode binary "
-                   "(use bert_hp_multigpu --heads N for verification)\n");
+            // FIX-BUG-02-01: report aggregated decode-validity result. The
+            // per-rank flag was reduced via ncclAllReduce(min) above (any
+            // single FAIL flips the world result). This is not a full MAE
+            // gate (see comment near the per-rank decode block) but it does
+            // catch the catastrophic failure modes BUG-02 flagged.
+            printf("  HP-BERT decode-validity gate: %s\n",
+                   gate_pass_world ? "PASS (all ranks)" : "FAIL (one or more ranks)");
         }
         printf("══════════════════════════════════════════════\n");
         fflush(stdout);
@@ -839,5 +891,12 @@ int main(int argc, char **argv) {
     // unused now
     (void)n_trials;
 
+    // FIX-BUG-02-01: non-zero exit when the decode-validity gate fails
+    // (so SLURM marks the job as FAILED and downstream Phase-E backfills
+    // know not to consume the numbers). skip_ref bypasses the gate by
+    // design, in which case we exit 0 regardless.
+    if (!skip_ref && !gate_pass_world) {
+        return 3;
+    }
     return 0;
 }
