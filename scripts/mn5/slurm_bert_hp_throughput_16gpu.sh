@@ -44,7 +44,9 @@ echo ""
 
 # Wrapper script — pins each rank to its local GPU and runs one
 # independent bert_hp_multigpu instance.
-WRAPPER=$(mktemp /tmp/hp_throughput_wrap_${SLURM_JOB_ID}_XXXX.sh)
+# Write to shared NFS location so compute nodes can execute it.
+mkdir -p ${PROJECT}/build/tmp
+WRAPPER=${PROJECT}/build/tmp/hp_throughput_wrap_${SLURM_JOB_ID}.sh
 cat > ${WRAPPER} <<'WRAP'
 #!/bin/bash
 set -e
