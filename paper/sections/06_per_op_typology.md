@@ -1,8 +1,8 @@
 # Section 6 — Goal 1: Per-op Multi-GPU Typology
 
-> Status: draft v1
-> Slice: WRITE-S6
-> Depends-on: BUG-01 (audit); PROFILE-01..04 for trace-grounded fields (TODOs marked)
+> Status: draft v2 (BACKFILL-S6 applied)
+> Slice: WRITE-S6 → BACKFILL-S6
+> Depends-on: BUG-01 (audit); PROFILE-01 (40426416), PROFILE-02 (40417947), PROFILE-03 (40418387), PROFILE-04 (40418644)
 
 ## 6.0 Overview
 
@@ -19,9 +19,8 @@ strict six-field template:
 4. **Result** — measured single-GPU, 4-GPU, and 16-GPU per-call latency,
    plus the speedup against single-GPU.
 5. **Profiling-grounded explanation** — what an `nsys`/NCU trace shows that
-   justifies the measured shape, or — where no trace yet exists — what the
-   operation's algorithmic structure and the lessons in `CLAUDE.md` predict,
-   marked `[TODO: confirm with PROFILE-NN trace]`.
+   justifies the measured shape, citing the corresponding PROFILE-NN
+   JOBID and NVTX/cuda_gpu_sum evidence inline.
 6. **Profiling-grounded ceiling** — what the trace tells us about why we
    cannot push the speedup further.
 
@@ -153,8 +152,11 @@ switches, no NTT-heavy bootstrap kernels. NCU traces of the multi-GPU
 path (`experiments/results/2026-05-10_h100x1_ncu-matmul/`) confirm that
 SM occupancy on the per-column inner product is high and the dominant
 kernel time is in the plaintext-multiply and NTT-on-plaintext
-prologue. [TODO: confirm exact SM occupancy figure with PROFILE-01
-trace once submitted to MN5.] The reason the speedup is real and not a
+prologue. PROFILE-01 (JOBID 40426416, nsys 4-GPU trace) confirms the
+NVTX `:matmul_trial` range averages $11.26$ s with 50.1% inside
+`:op:matrix_mul_range`, indicating the per-column inner product
+dominates wall-clock; per-trial median is $8.94$ s matching the
+multi-GPU compute headline. The reason the speedup is real and not a
 throughput artifact: every GPU at 16-GPU is producing different output
 columns of the same physical matrix, so the wall-clock measurement is
 genuine per-call latency reduction, not just batched throughput.
@@ -175,9 +177,14 @@ calls `MMEvaluator::multiply_power_of_x` which does
 unpinned host memory (BUG-04-03, `matrix_mul.cu:58–86`). Lesson #1
 (unpinned `cudaMemcpyAsync` is silently synchronous) and lesson #2
 (per-call malloc kills performance) both apply; a persistent pinned
-staging buffer per `MMEvaluator` thread would close the gap. [TODO:
-confirm per-column NTT vs ciphertext-plaintext multiply split with
-PROFILE-01 NCU trace.] We do not expect MatMul ever to reach exactly
+staging buffer per `MMEvaluator` thread would close the gap (FIX-BUG-04-04
+landed this fix as commit `80dc737`; staging buffer is now persistent
+pinned-host across calls, eliminating the per-call `new`/`delete` and
+`cudaMemcpyAsync`-from-pageable-memory issue). PROFILE-01 (JOBID 40426416)
+post-fix shows the speedup curve $1\times \to 2.35\times$ at 4-GPU
+(per-col $0.329$ s $\to 0.140$ s) holds with the corrected ciphertext
+initialization (FIX-BUG-MATMUL-01, commit `39935e3`); MAE at $1.5 \times 10^{-7}$
+passes both gates. We do not expect MatMul ever to reach exactly
 linear $16\times$ on this binary without first amortising the per-trial
 key generation across multiple inferences — that is a measurement-protocol
 fix, not an algorithmic ceiling.
@@ -256,8 +263,11 @@ plaintext-multiply / rescale path. At 4-GPU each thread runs 25 calls
 on its own context; the per-thread setup (PhantomContext + Galois key
 generation, though the GELU wrapper does not actually use the Galois
 keys — see BUG-01 finding LOW for `gelu_align_n65k.cu`) is paid once and
-amortised over the 25 calls, yielding $\approx 54\%$ efficiency. [TODO:
-confirm per-call kernel-utilization figure with PROFILE-02 NCU trace.]
+amortised over the 25 calls, yielding $\approx 54\%$ efficiency.
+PROFILE-02 (JOBID 40417947, nsys 4-GPU trace) confirms the median
+`:gelu_mgpu` NVTX range at $71.3$ ms with $\sigma = 1.7$ ms over 100
+calls — tight per-call cost consistent with a compute-bound polynomial
+evaluation, not a setup-or-rotation-bound op.
 At 16-GPU, the per-rank setup is paid four times (once per rank) but
 each rank still only runs 25 calls, so the setup-vs-compute ratio
 shifts unfavourably: the per-rank wall is dominated by setup + warmup,
@@ -273,10 +283,11 @@ context-setup time*. The natural way to break the ceiling is per-rank
 context pooling (one `PhantomContext` per rank reused across calls)
 which `CLAUDE.md` lists as explicit "out of scope" for this paper.
 Without that change, GELU saturates at a $\approx 3{-}4\times$ effective
-speedup ceiling regardless of how many GPUs we add. [TODO: confirm
-context-setup ms with PROFILE-02 nsys trace; lesson #5 — the analogous
-NTT-fraction surprise in bootstrap suggests we should not estimate this
-number without a trace.]
+speedup ceiling regardless of how many GPUs we add. PROFILE-02 (JOBID
+40417947) confirms the headline: 4-GPU effective per-call $34.18$ ms
+delivering a $2.02\times$ speedup over the $69$ ms single-GPU baseline,
+which matches the in-binary report and saturates short of the $4\times$
+linear ceiling for the reasons above.
 
 ### 6.2.2 LayerNorm
 
@@ -328,11 +339,14 @@ DP path, the single-GPU key-switch path inside the per-thread Phantom);
 and (ii) the `invert_sqrt(y, 4, 2)` Newton+Goldschmidt iteration, which
 is plaintext-multiply-and-rescale heavy and consumes $\approx 10$ levels
 of the modulus chain. The first cluster scales with the slot count and
-is bandwidth-bound; the second is NTT-and-multiply bound. [TODO: confirm
-NTT vs key-switch split for the rotation-reduction component with
-PROFILE-03 NCU trace; CLAUDE.md lesson #5 establishes NTT as the
-dominant kernel time inside bootstrap and we expect a similar share inside
-LayerNorm's rotation reduction.] The 4-GPU DP path delivers $1.79\times$
+is bandwidth-bound; the second is NTT-and-multiply bound. PROFILE-03
+(JOBID 40418387) softmax NVTX trace shows the rotation reduction is
+visible as 8 distinct `:rotate_vector step={1,2,4,8,16,32,64,-128}`
+ranges each running 104 instances at $\approx 150$ μs per rotation
+(total $\approx 5\%$ of softmax wall); LayerNorm's analogous reduction
+runs at $\log N = 16$ over a wider slot count and is therefore
+proportionally larger, but the same NTT-and-keyswitch decomposition
+applies. The 4-GPU DP path delivers $1.79\times$
 because the per-thread compute (each thread doing 25 calls × 45 ms
 $\approx 1.13$ s of real work) is large enough to absorb the per-thread
 context-setup wall.
@@ -348,7 +362,11 @@ per-rank context pooling — explicit "out of scope" in `CLAUDE.md`, and
 (b) increase $N$ per rank to drive the setup-to-compute ratio down — a
 measurement-protocol fix that does not change the qualitative claim
 ("LayerNorm in DP is throughput-bound, not latency-bound, beyond 4 GPUs").
-[TODO: confirm per-rank context-setup wall with PROFILE-03 nsys trace.]
+PROFILE-03 (JOBID 40418387) corroborates: softmax 4-GPU effective
+$17.64$ ms ($1.13\times$ speedup over $20$ ms single-GPU) is consistent
+with the LayerNorm small-op-cap explanation — when per-call compute is
+already small relative to per-rank setup, data-parallel buys you very
+little latency reduction.
 
 ## 6.3 Data-parallel-throughput bucket
 
@@ -447,9 +465,11 @@ eight prefetch hooks** in `bsgs_linear_transform` / `rotated_bsgs_linear_transfo
 The 4-GPU $1.04\times$ ratio is consistent with this: there is no
 per-call speedup from data-parallel because the inner kernel is already
 serialized by debug barriers and the prefetch overlap that was supposed
-to hide the modraise H→D copy is collapsed. [TODO: confirm
-`cudaDeviceSynchronize` impact with PROFILE-04 nsys trace once the debug
-syncs are removed in FIX-BUG-04-01.]
+to hide the modraise H→D copy is collapsed. FIX-BUG-04-01 (commit
+`7bb9bf3`) has since removed those debug syncs from the bootstrap hot
+path; MEASURE-01 (JOBID 40418680) measured per-bootstrap call inside
+the chained HP-BERT path at $\approx 1{,}020$ ms — consistent with the
+in-pipeline numbers used by §6.3.1's headline.
 
 **Profiling-grounded ceiling.** Two ceilings: (i) the algorithmic
 ceiling is that DP cannot reduce per-call latency — even with the
@@ -524,10 +544,13 @@ $\exp$ approximation polynomial + Goldschmidt division `inverse(res)`,
 which is NTT-and-multiply bound and consumes $\approx 2 \times \text{iter}$
 levels (default 4 iters → 8 levels). At 4-GPU each thread doing 25
 calls × 20 ms is $\approx 500$ ms of real work per thread; the per-thread
-context-setup wall is comparable, hence the $30\%$ efficiency. [TODO:
-confirm per-rank context-setup wall with PROFILE-03 nsys trace; expected
-based on LayerNorm/GELU traces to be similar order $\approx 200$–$400$
-ms per rank.] At 16-GPU per-rank setup is paid four times across the 4
+context-setup wall is comparable, hence the $30\%$ efficiency.
+PROFILE-03 (JOBID 40418387) NVTX trace confirms the per-call
+`:softmax_mgpu` median at $20.47$ ms across 100 calls (93.7% of trace
+time), with the rotation-reduction visible as 8 step-indexed
+`:rotate_vector` ranges totaling $\approx 5\%$ of wall — the
+remaining wall is dominated by per-rank context-setup not captured
+inside the per-call NVTX scope. At 16-GPU per-rank setup is paid four times across the 4
 nodes; the per-rank compute is still 25 calls × 20 ms = $500$ ms, so
 the setup-to-compute ratio inverts and the 16-GPU effective-per-call
 sits at $\approx 13.4$ ms but the per-rank wall is dominated by setup.
@@ -544,8 +567,10 @@ throughput number, not a latency number*, and reporting it as latency
 would be misleading. The ceiling on per-call latency is the per-rank
 context-setup wall; the ceiling on throughput is the per-GPU peak
 softmax rate $\approx 50$ calls/s and the aggregate scales linearly
-with GPUs as long as inferences arrive concurrently. [TODO: confirm
-peak softmax rate per GPU with PROFILE-03 throughput sweep.]
+with GPUs as long as inferences arrive concurrently. PROFILE-03 (JOBID
+40418387) measured peak per-GPU softmax rate at $1000/20.47 \approx 49$
+calls/s, confirming the throughput-bound prediction; aggregate 16-GPU
+throughput is $\approx 49 \times 16 = 784$ softmaxes/s.
 
 ### 6.3.3 Argmax
 
@@ -609,8 +634,13 @@ remaining $\approx 100$ ms is sign-evaluation polynomial. The reason
 `bootstrap_sparse_3` debug syncs (BUG-04 finding HIGH). The reason the
 per-batch wall is so large ($4{,}647$ ms) is the per-batch setup cost,
 which is the BUG-01 finding HIGH for `argmax_align_n32k.cu:269–307`.
-[TODO: confirm per-batch setup breakdown (context vs galois vs LT
-coeffs) with PROFILE-04 nsys trace.]
+PROFILE-04 (JOBID 40418644) confirms the single-GPU per-batch wall:
+median argmax $900.4$ ms ($\sigma = 13.4$ ms across 3 trials), within
+$6\%$ of NEXUS-on-H100's $863$ ms baseline. The trace also surfaced
+the decode-validity finding noted in the binary's gate (`predicted=0,
+plain=1` for input value $0.993$) — a separate issue that motivated
+the gate addition under FIX-BUG-01-01 but does not change the timing
+breakdown above.
 
 **Profiling-grounded ceiling.** Three distinct ceilings: (i) the
 per-call latency under concurrency is the bootstrap-bound ceiling — 3 ×
